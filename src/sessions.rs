@@ -367,9 +367,13 @@ impl Store {
     /// shadow). The slot the outgoing sequence leaves, or None when there is none to move.
     fn swap_in(&mut self, m: &mut Box<dyn Engine>, s: u32, id: u64) -> Result<Option<u32>> {
         let t = Instant::now();
-        let Some(bi) = self.entries.iter().enumerate()
-            .filter(|(_, e)| e.id != id && matches!(e.at, Place::Slot(x, _) if x != s))
-            .min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { return Ok(None) };
+        let Some(bi) = self.outgoing(s, id) else { return Ok(None) };
+        // not when the device's room and the outgoing sequence's memory do not hold the incoming one (the running
+        // requests hold the rest)
+        let Place::Host(a) = &self.entries[self.find(id).unwrap()].at else { unreachable!() };
+        if m.cache_room().is_some_and(|r| r + m.slot_bytes(self.entries[bi].held.tokens.len()) < m.slot_bytes(a.len)) {
+            return Ok(None);
+        }
         let bid = self.entries[bi].id;
         // the outgoing sequence: settled, its state, the whole chunks its shadow holds already
         let Place::Slot(bslot, bshadow) = &mut self.entries[bi].at else { unreachable!() };
@@ -468,8 +472,16 @@ impl Store {
         Ok(Some(bslot))
     }
 
+    /// The sequence in a slot (other than `s`, not entry `id`) that swap_in moves out: the least recently used
+    fn outgoing(&self, s: u32, id: u64) -> Option<usize> {
+        self.entries.iter().enumerate()
+            .filter(|(_, e)| e.id != id && matches!(e.at, Place::Slot(x, _) if x != s))
+            .min_by_key(|(_, e)| e.used).map(|(i, _)| i)
+    }
+
     /// Entry `id` (on the host) into a slot: a free one or one an idle sequence leaves; loaded at once when the
-    /// device has room, else swapped in as another sequence in a slot moves out (Store::swap_in)
+    /// device has room, else swapped in as another sequence in a slot moves out (Store::swap_in), others moving to
+    /// the host first when that one's memory is not enough
     fn bring_in(&mut self, m: &mut Box<dyn Engine>, id: u64, free: &mut Vec<u32>) -> Result<Bring> {
         let s = match free.pop() {
             Some(s) => s,
@@ -478,6 +490,18 @@ impl Store {
                 None => return Ok(Bring::Wait),
             },
         };
+        loop {
+            let Some(i) = self.find(id) else { return Ok(Bring::Gone(s)) };
+            let Place::Host(img) = &self.entries[i].at else { unreachable!() };
+            let out = self.outgoing(s, id).map_or(0, |b| m.slot_bytes(self.entries[b].held.tokens.len()));
+            if m.cache_room().is_none_or(|r| r + out >= m.slot_bytes(img.len)) {
+                break;
+            }
+            match self.park_one(m, Some(s), true)? {
+                Some(x) => free.push(x),
+                None => break,
+            }
+        }
         let t = Instant::now();
         let Some(i) = self.find(id) else { return Ok(Bring::Gone(s)) };
         let Place::Host(img) = &self.entries[i].at else { unreachable!() };
