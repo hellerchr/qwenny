@@ -92,6 +92,9 @@ pub fn load_image(m: &mut Box<dyn Engine>, slot: u32, img: &Image) -> Result<boo
 pub struct Held {
     /// the tokens of positions [0, len): their KV cache, and the recurrent state after them
     pub tokens: Vec<u32>,
+    /// computed with the LoRA adapter (Engine::set_adapter), else with the base model: only a request for the same
+    /// model continues it or shares its prefix
+    pub adapter: bool,
     /// the slot's state ran past the end (its last step's rejected drafts): settled before it is saved
     pub dirty: bool,
     /// recurrent states at earlier positions (Engine::save_state), oldest first, at most SNAPS: where the
@@ -293,6 +296,9 @@ impl Store {
     /// Settle a dirty slot: its last token again, so the slot's state ends exactly at its sequence's end
     fn settle(m: &mut Box<dyn Engine>, slot: u32, held: &mut Held) -> Result<()> {
         if held.dirty && !held.tokens.is_empty() {
+            if m.has_adapter() {
+                m.set_adapter(slot, held.adapter)?;
+            }
             let pos = held.tokens.len() - 1;
             m.run(&[Tok { id: held.tokens[pos], slot, pos: pos as u32 }], &[])?;
             held.dirty = false;
@@ -300,9 +306,10 @@ impl Store {
         Ok(())
     }
 
-    /// Whether `prompt` continues a cached sequence (takes it over; a copy needs room as a new session does)
-    pub fn continues(&self, prompt: &[u32]) -> bool {
-        self.entries.iter().any(|e| !e.parked && reuse(&e.held, prompt).is_some_and(|(_, copy)| !copy))
+    /// Whether `prompt` (for the adapter or the base model) continues a cached sequence (takes it over; a copy needs
+    /// room as a new session does)
+    pub fn continues(&self, prompt: &[u32], adapter: bool) -> bool {
+        self.entries.iter().any(|e| !e.parked && e.held.adapter == adapter && reuse(&e.held, prompt).is_some_and(|(_, copy)| !copy))
     }
 
     /// Move the least recently used sequence in a slot (other than `keep`) to the host; its slot, if any. `must`: when
@@ -494,10 +501,11 @@ impl Store {
         }
     }
 
-    /// A request that gives way: what its slot held (`tokens`, `img`) kept as an entry; the id it comes back by
-    pub fn keep_parked(&mut self, tokens: Vec<u32>, img: Image) -> u64 {
+    /// A request that gives way: what its slot held (`tokens`, `img`, computed with the adapter or not) kept as an
+    /// entry; the id it comes back by
+    pub fn keep_parked(&mut self, tokens: Vec<u32>, adapter: bool, img: Image) -> u64 {
         let used = self.touch();
-        let held = Held { tokens, dirty: false, snaps: Vec::new() };
+        let held = Held { tokens, adapter, dirty: false, snaps: Vec::new() };
         self.entries.push(Entry { id: used, held, at: Place::Host(img), used, parked: true });
         used
     }
@@ -532,12 +540,12 @@ impl Store {
         self.entries.iter().position(|e| e.id == id)
     }
 
-    /// The request for `prompt`: the sequence it continues (in its slot, or loaded from the host), else a fresh slot
-    /// at 0. None: no slot, or no device memory for the sequence (the request waits)
-    /// `running`: the sessions of the running requests (and of those that gave way)
-    pub fn take(&mut self, m: &mut Box<dyn Engine>, prompt: &[u32], free: &mut Vec<u32>, running: usize)
+    /// The request for `prompt`: the sequence it continues (in its slot, or loaded from the host; one computed with
+    /// the same model: the adapter or the base), else a fresh slot at 0. None: no slot, or no device memory for the
+    /// sequence (the request waits). `running`: the sessions of the running requests (and of those that gave way)
+    pub fn take(&mut self, m: &mut Box<dyn Engine>, prompt: &[u32], adapter: bool, free: &mut Vec<u32>, running: usize)
                 -> Result<Option<Resume>> {
-        let best = self.entries.iter().filter(|e| !e.parked)
+        let best = self.entries.iter().filter(|e| !e.parked && e.held.adapter == adapter)
             .filter_map(|e| reuse(&e.held, prompt).map(|(at, copy)| (e.id, at, copy, matches!(e.at, Place::Slot(..)))))
             .max_by_key(|&(_, at, _, in_slot)| (at, in_slot));
         let Some((id, at, copy, in_slot)) = best else {
@@ -642,9 +650,9 @@ impl Store {
         Ok(Some((s, at, snaps)))
     }
 
-    /// The slot holding the sequence `prompt` would continue, if one does
-    pub fn slot_for(&self, prompt: &[u32]) -> Option<u32> {
-        self.entries.iter().filter(|e| !e.parked).filter_map(|e| resume_at(&e.held, prompt).map(|at| (at, &e.at)))
+    /// The slot holding the sequence `prompt` (for the adapter or the base model) would continue, if one does
+    pub fn slot_for(&self, prompt: &[u32], adapter: bool) -> Option<u32> {
+        self.entries.iter().filter(|e| !e.parked && e.held.adapter == adapter).filter_map(|e| resume_at(&e.held, prompt).map(|at| (at, &e.at)))
             .max_by_key(|&(at, p)| (at, matches!(p, Place::Slot(..))))
             .and_then(|(_, p)| match p { Place::Slot(s, _) => Some(*s), Place::Host(_) => None })
     }
@@ -655,7 +663,7 @@ mod tests {
     use super::*;
 
     fn held(tokens: &[u32], pe: Option<usize>) -> Held {
-        Held { tokens: tokens.to_vec(), dirty: false, snaps: pe.map(|p| (p, Vec::new())).into_iter().collect() }
+        Held { tokens: tokens.to_vec(), adapter: false, dirty: false, snaps: pe.map(|p| (p, Vec::new())).into_iter().collect() }
     }
 
     #[test]
@@ -667,7 +675,7 @@ mod tests {
         assert_eq!(resume_at(&h, &[1, 2, 9]), None);  // the prompt itself changed
         assert_eq!(resume_at(&h, &[1, 2, 3, 4, 5, 6]), Some(3));  // the same as held: back to the saved state
         assert_eq!(resume_at(&held(&[1, 2], None), &[1, 3]), None);
-        let h = Held { tokens: vec![1, 2, 3, 4, 5, 6], dirty: false, snaps: vec![(2, vec![]), (4, vec![])] };
+        let h = Held { tokens: vec![1, 2, 3, 4, 5, 6], adapter: false, dirty: false, snaps: vec![(2, vec![]), (4, vec![])] };
         assert_eq!(resume_at(&h, &[1, 2, 3, 4, 9]), Some(4));  // the latest state on the shared prefix
         assert_eq!(resume_at(&h, &[1, 2, 3, 9]), Some(2));
         assert_eq!(resume_at(&h, &[1, 2, 3, 4]), Some(2));  // a state must leave a token to read
@@ -676,7 +684,7 @@ mod tests {
     #[test]
     fn takes_over_its_own_turns_and_copies_shared_beginnings() {
         // states where the first message ends (3) and where the last turn begins (7)
-        let h = Held { tokens: (1..=10).collect(), dirty: false, snaps: vec![(3, vec![]), (7, vec![])] };
+        let h = Held { tokens: (1..=10).collect(), adapter: false, dirty: false, snaps: vec![(3, vec![]), (7, vec![])] };
         assert_eq!(reuse(&h, &(1..=12).collect::<Vec<_>>()), Some((10, false)));  // the next turn
         assert_eq!(reuse(&h, &[1, 2, 3, 4, 5, 6, 7, 99]), Some((7, false)));  // the last turn edited
         assert_eq!(reuse(&h, &[1, 2, 3, 50, 51]), Some((3, true)));  // another conversation, same system prompt

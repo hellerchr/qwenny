@@ -21,7 +21,8 @@ pub fn check_model(dir: &Path) -> Result<()> {
     check_config(&config).with_context(|| format!("{}", dir.display()))
 }
 
-/// The model in `dir` on the GPU: `int8` weights (else 16-bit), `adapter` merged in
+/// The model in `dir` on the GPU: `int8` weights (else 16-bit), `adapter` served unmerged for the slots that use it
+/// (Engine::set_adapter)
 pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>) -> Result<Box<dyn Engine>> {
     check_model(dir)?;
     if let Some(a) = adapter {
@@ -78,6 +79,15 @@ pub trait Engine {
     }
     /// Wait for the device (timing)
     fn sync(&self) -> Result<()>;
+    /// Whether a LoRA adapter is loaded (served unmerged beside the base model: set_adapter)
+    fn has_adapter(&self) -> bool {
+        false
+    }
+    /// Whether slot `slot`'s next steps use the adapter (else the base model); a slot's cached state is the model's
+    /// it was computed with (sessions.rs keeps them apart)
+    fn set_adapter(&mut self, _slot: u32, _on: bool) -> Result<()> {
+        bail!("no adapter loaded")
+    }
     /// Whether the model has a draft layer for speculative decoding (Qwen's MTP)
     fn has_draft(&self) -> bool {
         false

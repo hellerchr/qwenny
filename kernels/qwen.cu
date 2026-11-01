@@ -48,6 +48,9 @@ MARLIN_SET(2, 16, 4)
 MARLIN_SET(3, 16, 4)
 MARLIN_SET(4, 16, 4)
 
+// a LoRA adapter served unmerged (src/cuda/qwen/lora.rs)
+#include "lora.cuh"
+
 // Residual step: h += the sum of `splits` partial products x [split][n][H]; then y = w_next * h / rms(h) (the next
 // layer's input norm, or the final norm). One block of AN threads per token.
 #define AN 512

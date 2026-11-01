@@ -51,7 +51,8 @@ tools/checks.sh all                         # qwen-infer, chat, qwen-train: ever
 tools/checks.sh qwen-train-27b              # the 27B, on the 3090 only (from the dev box: tools/vm.sh tools/checks.sh qwen-train-27b)
 ```
 
-- Areas: `qwen-infer` (logits vs. Transformers for int8 and 16-bit, layercheck of layers 0 and 3, speccheck with MTP,
+- Areas: `qwen-infer` (logits vs. Transformers for int8 and 16-bit; with a LoRA vs. PEFT for int4, int8 and 16-bit,
+  and adaptercheck: adapter and base requests in the same steps; layercheck of layers 0 and 3, speccheck with MTP,
   samplecheck with sampled drafts, longcheck, cachecheck, swapcheck, mtpcheck as INFO), `chat` (template and tokenizer
   vs. Transformers), `qwen-train` (LoRA gradients vs. PEFT for bf16 and int4, Unsloth's masks), `qwen-train-27b`.
   `areas_of` in the script maps changed files to areas.
@@ -59,14 +60,16 @@ tools/checks.sh qwen-train-27b              # the 27B, on the 3090 only (from th
   16-bit) and `RedHatAI/Qwen3.5-4B-quantized.w4a16` (int4), from the Hugging Face cache.
 - `QWENNY_BIN` and `QWENNY_PY` override the binary and the Python.
 - The single checks, for a quick look while working: `qwenny check <ref>`, `layercheck <ref> --layer=N`,
-  `speccheck`, `samplecheck`, `longcheck`, `cachecheck`, `swapcheck`, `mtpcheck <ref>`, `tokcheck`, `chatcheck`,
-  `traincheck`, `datacheck` (all take `--model=`; `src/main.rs` lists their options).
+  `speccheck`, `samplecheck`, `longcheck`, `cachecheck`, `swapcheck`, `mtpcheck <ref>`, `adaptercheck <ref>
+  --adapter=<dir>`, `tokcheck`, `chatcheck`, `traincheck`, `datacheck` (all take `--model=`; `src/main.rs` lists their
+  options; `check` and `bench` take `--adapter=` too).
 
 ## Measure speed
 
 ```bash
 qwenny bench --model=<m>                    # decode, round trip, with logits, 1+2 / 1+4 draft steps, decode x4..x16, prompt
 qwenny bench --model=<m> --pos=32000        # the same after a 32k context
+qwenny bench --model=<m> --adapter=<dir>    # base requests with a LoRA loaded, then the LoRA's requests
 python3 tools/decode_bench.py <url>         # a running server, one stream: 8 seeded prompts, tok/s after the first token
 python3 tools/decode_bench.py <url> '{"temperature": 0}'   # the same greedy
 python3 tools/serve_bench.py                # a running server with 1, 4, 8 and 16 concurrent replies
@@ -169,5 +172,7 @@ The page is at `http://192.168.31.153:18024/`. A restart reloads the 27B and tak
 - `src/server.rs`, `src/sessions.rs` (slots, saved states, host swap), `src/chat.rs` (template, tool calls),
   `src/decide.rs`, `src/sample.rs`, `src/ui.html`.
 - `src/training.rs`, `src/lora.rs`, `src/cuda/learn.rs`, `src/cuda/qwen/train.rs`, `kernels/qwen_train.cu`: LoRA.
+- `src/cuda/qwen/lora.rs`, `kernels/lora.cuh`: a LoRA served unmerged, per request (`Engine::set_adapter` per slot;
+  sessions keep the base model's and the adapter's states apart).
 - `src/checkpoint.rs`, `src/hub.rs`: loading weights (formats, quantization), Hugging Face downloads.
 - `src/checks.rs`: the checks and `bench`.

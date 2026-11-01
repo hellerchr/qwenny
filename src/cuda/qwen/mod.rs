@@ -6,6 +6,7 @@
 mod attn;
 mod deltanet;
 mod draft;
+mod lora;
 pub mod train;
 
 use super::core::{self, Epi, Gemm, Graphs, MAX_OUT, MAX_TOK, Mat, SPEC_TOK, Step, cfg};
@@ -21,7 +22,7 @@ use crate::cuda::vmm::{HostMapped, Pool};
 
 /// Device memory left to other allocations (CUDA graphs, the driver) when the per-slot caches take the rest
 const PAGE_RESERVE: usize = 512 << 20;
-use std::{fs, path::Path, sync::Arc};
+use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
 /// Full attention: key/value heads and head dim; Gated DeltaNet: key heads, key and value head dims (all sizes)
 const NKV: usize = 4;
@@ -144,17 +145,21 @@ struct Layer {
     /// [gate_proj; up_proj], packed for the SwiGLU epilogue
     gate_up: Mat,
     down: Mat,
+    /// a LoRA adapter's part of the layer, applied to the tokens of adapter slots (Step::lora)
+    lora: Option<lora::LayerLora>,
 }
+
+/// The adapter given to Layer::load, and the names of its matrices taken so far
+type Lora<'a> = Option<(&'a Adapter, &'a mut HashSet<String>)>;
 
 impl Layer {
     /// The layer whose tensors start with `p` (model.language_model.layers.{i}, or mtp.layers.0), of kind `kind`
     /// (config.json layer_types)
     #[allow(clippy::too_many_arguments)]
     fn load(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, d: &Dims, p: &str, kind: &str, slots: usize,
-            max_ctx: usize, int8: bool, adapter: Option<&Adapter>) -> Result<Self> {
-        let mat = |a: &str, ns: &[&str], silu: bool| {
-            Mat::stack(s, w, &ns.iter().map(|n| format!("{p}.{a}.{n}.weight")).collect::<Vec<_>>(), silu, int8, adapter)
-        };
+            max_ctx: usize, int8: bool, adapter: Lora) -> Result<Self> {
+        let names = |a: &str, ns: &[&str]| ns.iter().map(|n| format!("{p}.{a}.{n}.weight")).collect::<Vec<_>>();
+        let mat = |a: &str, ns: &[&str], silu: bool| Mat::stack(s, w, &names(a, ns), silu, int8);
         let in_ba = match kind {
             "linear_attention" => Some(mat("linear_attn", &["in_proj_b", "in_proj_a"], false)?),
             _ => None,
@@ -176,6 +181,34 @@ impl Layer {
         };
         ensure!(in_proj.tiles * 16 == rows && out_proj.cols == d.mix(), "{p}: in-projection of {} rows", in_proj.tiles * 16);
         let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(w, &format!("{p}.{n}.weight"))?)?) };
+        // the adapter's A and B of the layer's products, in their row order
+        let lora = match adapter {
+            Some((ad, used)) => {
+                let st = |a: &str, ns: &[&str], rows: &[usize], silu: bool| lora::Stacked { names: names(a, ns), rows: rows.to_vec(), silu };
+                let (lv, kv) = (d.lv_heads, NKV * HD);
+                let (inp, ba, out) = match kind {
+                    "linear_attention" => (st("linear_attn", &["in_proj_qkv", "in_proj_z"], &[d.lqkv(), lv * LVD], false),
+                                           Some(st("linear_attn", &["in_proj_b", "in_proj_a"], &[lv, lv], false)),
+                                           st("linear_attn", &["out_proj"], &[d.h], false)),
+                    _ => (st("self_attn", &["q_proj", "k_proj", "v_proj"], &[2 * d.nh * HD, kv, kv], false), None,
+                          st("self_attn", &["o_proj"], &[d.h], false)),
+                };
+                let stacks: Vec<lora::Stacked> = std::iter::once(inp).chain(ba).collect();
+                let inp = lora::load(s, ad, &stacks, d.h, used)?.map(|(a, mut b)| {
+                    let ba = if b.len() > 1 { b.pop().flatten() } else { None };
+                    (a, b.pop().flatten(), ba)
+                });
+                let l = lora::LayerLora {
+                    inp,
+                    out: lora::single(s, ad, out, d.mix(), used)?,
+                    gate_up: lora::single(s, ad, st("mlp", &["gate_proj", "up_proj"], &[d.ff, d.ff], true), d.h, used)?,
+                    down: lora::single(s, ad, st("mlp", &["down_proj"], &[d.h], false), d.ff, used)?,
+                };
+                let any = l.mats().next().is_some();
+                any.then_some(l)
+            }
+            None => None,
+        };
         Ok(Layer {
             mixer,
             in_proj,
@@ -185,6 +218,7 @@ impl Layer {
             post_norm: fl("post_attention_layernorm")?,
             gate_up: mat("mlp", &["gate_proj", "up_proj"], true)?,
             down: mat("mlp", &["down_proj"], false)?,
+            lora,
         })
     }
 }
@@ -203,6 +237,8 @@ pub struct Bufs {
     /// mixer output [n][mix], the out-projection's input
     pub mix: CudaSlice<u16>,
     mid: CudaSlice<u16>,
+    /// split-K partial products of a LoRA's A (lora.rs)
+    lpart: CudaSlice<f32>,
     attn: attn::Scratch,
     /// delta_conv output [MAX_TOK][deltanet::cv_width]
     cv: CudaSlice<f32>,
@@ -225,6 +261,9 @@ struct Stack {
     pool: Arc<Pool>,
     k: Kernels,
     mm: Gemm,
+    lk: lora::Kernels,
+    /// per slot: the LoRA's scale (alpha / r) for a slot that uses the adapter, else 0 (Model::set_adapter)
+    scales: CudaSlice<f32>,
     /// the step's tokens and the sampler
     st: Step,
     d: Dims,
@@ -233,9 +272,9 @@ struct Stack {
 }
 
 impl Stack {
-    /// `int8`: int8 weights (else f16); `only`: just this layer; `adapter`: a LoRA merged into the weights. Also
+    /// `int8`: int8 weights (else f16); `only`: just this layer; `adapter`: a LoRA served unmerged (lora.rs). Also
     /// returns the checkpoint.
-    fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, only: Option<usize>, adapter: Option<&Adapter>)
+    fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, only: Option<usize>, mut adapter: Lora)
     -> Result<(Self, Checkpoint)> {
         let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
         let tc = config.get("text_config").unwrap_or(&config);
@@ -251,7 +290,7 @@ impl Stack {
         let types = tc["layer_types"].as_array().context("layer_types")?;
         let layers = types.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i))
             .map(|(i, kind)| Layer::load(&s, &pool, &w, &d, &format!("model.language_model.layers.{i}"), kind.as_str().unwrap_or("?"), slots,
-                                max_ctx, int8, adapter))
+                                max_ctx, int8, adapter.as_mut().map(|(a, u)| (*a, &mut **u))))
             .collect::<Result<Vec<_>>>()?;
         ensure!(!layers.is_empty(), "no layer {only:?}");
         let z = |n: usize| s.alloc_zeros::<f32>(n);
@@ -259,16 +298,22 @@ impl Stack {
         let b = Bufs {
             h: z(MAX_TOK * d.h)?,
             xn: zh(MAX_TOK * d.h)?,
-            part: z(core::part_len(layers.iter().flat_map(|l| [&l.in_proj, &l.out_proj, &l.down])))?,
+            // [gate; up] too when a LoRA changes it (a plain product then, lora.rs)
+            part: z(core::part_len(layers.iter().flat_map(|l| {
+                let gu = l.lora.as_ref().and_then(|x| x.gate_up.as_ref()).map(|_| &l.gate_up);
+                [&l.in_proj, &l.out_proj, &l.down].into_iter().chain(gu)
+            })))?,
             ba: z(core::part_len(layers.iter().filter_map(|l| l.in_ba.as_ref())).max(1))?,
             o: z(MAX_TOK * d.mix())?,
             mix: zh(MAX_TOK * d.mix())?,
             mid: zh(MAX_TOK * d.ff)?,
+            lpart: z(core::part_len(layers.iter().filter_map(|l| l.lora.as_ref()).flat_map(|l| l.mats())).max(1))?,
             attn: attn::Scratch::new(&s, &d)?,
             cv: z(MAX_TOK * deltanet::cv_width(&d))?,
         };
         let st = Step::new(&s, &m, slots, max_ctx, d.vocab, attn::segments(d.nh / NKV))?;
-        let x = Stack { mm: Gemm::load(&s, &m, true, d.h)?, k, st, d, layers, b, s, pool };
+        let x = Stack { mm: Gemm::load(&s, &m, true, d.h)?, lk: lora::Kernels::load(&m)?, scales: z(slots)?, k, st, d,
+                        layers, b, s, pool };
         x.set_budget()?;
         Ok((x, w))
     }
@@ -326,20 +371,70 @@ impl Stack {
         Ok(())
     }
 
+    /// Layer `l`'s LoRA if the step has adapter tokens
+    fn lora<'a>(&self, l: &'a Layer) -> Option<&'a lora::LayerLora> {
+        l.lora.as_ref().filter(|_| self.st.lora)
+    }
+
+    /// xa = A x into `lpart`, then y += s B xa (lora.rs); returns xa's split
+    fn lora_add(&self, a: &lora::LoraA, b: Option<&lora::LoraB>, x: &CudaSlice<u16>, y: &CudaSlice<f32>) -> Result<usize> {
+        let xs = a.run(&self.mm, &self.s, &self.st, x, &self.b.lpart)?;
+        if let Some(b) = b {
+            a.add(&self.lk, &self.s, &self.st, &self.scales, &self.b.lpart, xs, b, y)?;
+        }
+        Ok(xs)
+    }
+
     /// The mixer of layer `l` and its projections: xn -> part (in_proj) -> mix (mixer) -> part (out_proj).
     /// Returns the out_proj split factor.
     fn mix(&self, l: &Layer) -> Result<usize> {
         let b = &self.b;
+        let lo = self.lora(l);
         let sp = self.gemm(&l.in_proj, &b.xn, &b.part, Epi::Plain)?;
+        let inp = lo.and_then(|x| x.inp.as_ref());
+        let xs = match inp {
+            Some((a, bi, _)) => self.lora_add(a, bi.as_ref(), &b.xn, &b.part)?,
+            None => 0,
+        };
         let c = Ctx { s: &self.s, st: &self.st, b, k: &self.k, d: &self.d };
         match &l.mixer {
             Mixer::Delta(d) => {
                 let bsp = self.gemm(l.in_ba.as_ref().context("DeltaNet layer without in_proj_b/a")?, &b.xn, &b.ba, Epi::Plain)?;
+                if let Some((a, _, Some(bb))) = inp {
+                    a.add(&self.lk, &self.s, &self.st, &self.scales, &b.lpart, xs, bb, &b.ba)?;
+                }
                 d.run(&c, sp, bsp)?
             }
             Mixer::Attn(a) => a.run(&c, sp)?,
         }
-        self.gemm(&l.out_proj, &b.mix, &b.part, Epi::Plain)
+        let sp = self.gemm(&l.out_proj, &b.mix, &b.part, Epi::Plain)?;
+        if let Some((a, bo)) = lo.and_then(|x| x.out.as_ref()) {
+            self.lora_add(a, Some(bo), &b.mix, &b.part)?;
+        }
+        Ok(sp)
+    }
+
+    /// The MLP of layer `l` on xn (after add_rmsnorm): [gate; up] with SwiGLU -> mid -> part (down). With a LoRA on
+    /// [gate; up] the product runs plain (without split K: the epilogue's values) and lora_silu adds the delta before
+    /// SwiGLU. Returns down's split factor.
+    fn mlp(&self, l: &Layer) -> Result<usize> {
+        let b = &self.b;
+        let lo = self.lora(l);
+        match lo.and_then(|x| x.gate_up.as_ref()) {
+            Some((a, bg)) => {
+                self.mm.run_split(&self.s, &self.st, &l.gate_up, &b.xn, &b.part, Epi::Plain, true)?;
+                let xs = a.run(&self.mm, &self.s, &self.st, &b.xn, &b.lpart)?;
+                a.silu(&self.lk, &self.s, &self.st, &self.scales, &b.lpart, xs, bg, &b.part, &b.mid)?;
+            }
+            None => {
+                self.gemm(&l.gate_up, &b.xn, &b.mid, Epi::Silu)?;
+            }
+        }
+        let sp = self.gemm(&l.down, &b.mid, &b.part, Epi::Plain)?;
+        if let Some((a, bd)) = lo.and_then(|x| x.down.as_ref()) {
+            self.lora_add(a, Some(bd), &b.mid, &b.part)?;
+        }
+        Ok(sp)
     }
 }
 
@@ -379,8 +474,9 @@ impl Embed {
     }
 }
 
-/// CUDA graph key: the step's shape and the attention's key splits (decode, prompt tiles)
-type Key = ([usize; 6], (usize, usize, usize, usize));
+/// CUDA graph key: the step's shape, the attention's key splits (decode, prompt tiles) and whether the step has
+/// adapter tokens (Step::lora)
+type Key = ([usize; 6], (usize, usize, usize, usize), bool);
 
 /// The MTP layer (multi-token prediction; the draft model of speculative decoding), as vLLM's
 /// Qwen3_5MultiTokenPredictor: x = fc([pre_e(embed(t_{q+1})); pre_h(h_q)]), one full-attention layer over the MTP's own
@@ -412,14 +508,17 @@ pub struct Model {
     final_norm: CudaSlice<f32>,
     graphs: Graphs<Key>,
     mtp: Option<Mtp>,
+    /// per slot: whether it uses the adapter (set_adapter); None: no adapter loaded
+    adapter: Option<(Vec<bool>, f32)>,
 }
 
 impl Model {
-    /// `int8`: int8 weights (else f16); `adapter`: a LoRA merged into the weights (stored int4 matrices it changes
-    /// are dequantized).
+    /// `int8`: int8 weights (else f16); `adapter`: a LoRA served unmerged, for the slots that use it (set_adapter;
+    /// none at first).
     pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>)
     -> Result<Self> {
-        let (x, w) = Stack::load(dir, max_ctx, slots, int8, None, adapter)?;
+        let mut used = HashSet::new();
+        let (x, w) = Stack::load(dir, max_ctx, slots, int8, None, adapter.map(|a| (a, &mut used)))?;
         let e = "model.language_model.embed_tokens.weight".to_string();
         let head = if w.has("lm_head.weight") { "lm_head.weight".to_string() } else { e.clone() };
         let mtp = match w.has("mtp.fc.weight") {
@@ -427,8 +526,10 @@ impl Model {
                 let (s, d) = (&x.s, &x.d);
                 let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(&w, &format!("mtp.{n}.weight"))?)?) };
                 Some(Mtp {
-                    layer: Layer::load(s, &x.pool, &w, d, "mtp.layers.0", "full_attention", x.st.slots, x.st.max_ctx, int8, None)?,
-                    fc: Mat::stack(s, &w, &["mtp.fc.weight".to_string()], false, int8, None)?,
+                    // unadapted: drafts are checked by the adapted model (an adapter of the MTP layer: refused below)
+                    layer: Layer::load(s, &x.pool, &w, d, "mtp.layers.0", "full_attention", x.st.slots, x.st.max_ctx, int8,
+                                       None)?,
+                    fc: Mat::stack(s, &w, &["mtp.fc.weight".to_string()], false, int8)?,
                     pre_e: fl("pre_fc_norm_embedding")?,
                     pre_h: fl("pre_fc_norm_hidden")?,
                     norm: fl("norm")?,
@@ -441,9 +542,16 @@ impl Model {
             false => None,
         };
         let embed = Embed::load(&x.s, &w, &e)?;
-        let lm_head = Mat::stack(&x.s, &w, &[head], false, int8, None)?;
+        if let Some(a) = adapter {
+            let mut left: Vec<&String> = a.names().filter(|n| !used.contains(*n)).collect();
+            left.sort();
+            ensure!(left.is_empty(), "the adapter changes {} matrices served without it here (e.g. {}): only the \
+                     language model's linear modules are (qwenny merge folds it into a bf16 model)", left.len(), left[0]);
+        }
+        let lm_head = Mat::stack(&x.s, &w, &[head], false, int8)?;
         let final_norm = x.s.clone_htod(&norm(&w, "model.language_model.norm.weight")?)?;
-        let model = Model { embed, lm_head, final_norm, graphs: Graphs::new(), x, mtp };
+        let adapter = adapter.map(|a| (vec![false; x.st.slots], a.scale()));
+        let model = Model { embed, lm_head, final_norm, graphs: Graphs::new(), x, mtp, adapter };
         // the whole model loaded: the caches' pages made at once (Pool::fill)
         model.x.set_budget()?;
         model.x.pool.fill()?;
@@ -467,8 +575,7 @@ impl Model {
         for (i, l) in x.layers.iter().enumerate() {
             let sp = x.mix(l)?;
             x.add_rmsnorm(sp, &l.post_norm)?;
-            x.gemm(&l.gate_up, &b.xn, &b.mid, Epi::Silu)?;
-            let sp = x.gemm(&l.down, &b.mid, &b.part, Epi::Plain)?;
+            let sp = x.mlp(l)?;
             x.add_rmsnorm(sp, x.layers.get(i + 1).map_or(&self.final_norm, |l| &l.input_norm))?;
         }
         if st.n_out > 0 {
@@ -500,8 +607,7 @@ impl Model {
         let l = &m.layer;
         let sp = x.mix(l)?;
         x.add_rmsnorm(sp, &l.post_norm)?;
-        x.gemm(&l.gate_up, &b.xn, &b.mid, Epi::Silu)?;
-        let sp = x.gemm(&l.down, &b.mid, &b.part, Epi::Plain)?;
+        let sp = x.mlp(l)?;
         x.add_rmsnorm(sp, &m.norm)?;
         if st.n_out > 0 {
             x.gemm(m.head.as_ref().map_or(&self.lm_head, |h| &h.mat), &b.xn, &st.logits, Epi::Argmax)?;
@@ -577,7 +683,9 @@ impl Model {
         if device_ids {
             x.st.ids_from_drafts(&x.s)?;
         }
-        let key = ((x.st.shape(), Attn::graph_key(&x.k.attn, &x.st)), own);
+        // the MTP layer is not adapted
+        x.st.lora = false;
+        let key = ((x.st.shape(), Attn::graph_key(&x.k.attn, &x.st), false), own);
         let m = self.mtp.as_ref().unwrap();
         m.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_mtp(m, own))
     }
@@ -773,7 +881,8 @@ impl Engine for Model {
             }
         }
         self.x.st.upload(&self.x.s, toks, out, marks)?;
-        let key = (self.x.st.shape(), Attn::graph_key(&self.x.k.attn, &self.x.st));
+        self.x.st.lora = self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]));
+        let key = (self.x.st.shape(), Attn::graph_key(&self.x.k.attn, &self.x.st), self.x.st.lora);
         self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_step())
     }
 
@@ -807,6 +916,22 @@ impl Engine for Model {
 
     fn has_draft(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    fn has_adapter(&self) -> bool {
+        self.adapter.is_some()
+    }
+
+    fn set_adapter(&mut self, slot: u32, on: bool) -> Result<()> {
+        let (flags, scale) = self.adapter.as_mut().context("no adapter loaded")?;
+        let slot = slot as usize;
+        ensure!(slot < flags.len(), "slot {slot}");
+        if flags[slot] != on {
+            flags[slot] = on;
+            let v = [if on { *scale } else { 0.0 }];
+            self.x.s.memcpy_htod(&v, &mut self.x.scales.slice_mut(slot..slot + 1))?;
+        }
+        Ok(())
     }
 
     /// 4: a step of 5 tokens is still two tiles of the 27B's decode attention, which reads the cache once for all of

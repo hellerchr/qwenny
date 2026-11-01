@@ -142,6 +142,10 @@ pub async fn decisions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json>) 
     if rows.is_empty() {
         return bad_request("no questions".into());
     }
+    let model = match app.model(&req) {
+        Ok(m) => m.1,
+        Err(e) => return bad_request(format!("{e:#}")),
+    };
     // "think": true (or a token budget): each such question is thought about first, all at once
     let mut thoughts = std::collections::HashMap::new();
     let mut thinking = Vec::new();
@@ -184,11 +188,11 @@ pub async fn decisions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json>) 
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let mut out = match many {
-        Some(_) => json!({"object": "decisions", "model": app.name, "answers": answers,
+        Some(_) => json!({"object": "decisions", "model": model, "answers": answers,
                           "usage": {"prompt_tokens": tokens, "completion_tokens": 0}}),
         None => answers.into_iter().next().unwrap().1,
     };
-    out["model"] = json!(app.name);
+    out["model"] = json!(model);
     out["ms"] = json!(ms);
     if let Some(id) = body.get("id") {
         out["id"] = id.clone();
@@ -260,17 +264,19 @@ fn ask(app: &App, mut row: Json) -> Result<(Asked, UnboundedReceiver<Msg>), Stri
     let (keys, texts) = decision_options(&kind, &row)?;
     row["options"] = json!(texts);
     let item = build(&app.chat, &row).map_err(|e| format!("{e:#}"))?;
-    send_decision(app, item, Asked { kind, keys, row })
+    let adapter = app.model(&row).map_err(|e| format!("{e:#}"))?.0;
+    send_decision(app, item, Asked { kind, keys, row }, adapter)
 }
 
 /// Send a built decision to the engine.
-fn send_decision(app: &App, item: Item, asked: Asked) -> Result<(Asked, UnboundedReceiver<Msg>), String> {
+fn send_decision(app: &App, item: Item, asked: Asked, adapter: bool) -> Result<(Asked, UnboundedReceiver<Msg>), String> {
     if item.ids.len() + 1 >= app.max_ctx {
         return Err(format!("prompt of {} tokens does not fit the context of {}", item.ids.len(), app.max_ctx));
     }
     let (tx, rx) = unbounded_channel();
     let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
-    let job = Job { prompt: item.ids, params, max_tokens: 1, stop: vec![], ignore_eos: false, decide: Some(item.cands), tx };
+    let job = Job { prompt: item.ids, params, max_tokens: 1, stop: vec![], ignore_eos: false, decide: Some(item.cands), adapter,
+                    tx };
     app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
     Ok((asked, rx))
 }
@@ -284,18 +290,19 @@ async fn think_first(app: &App, row: &mut Json, budget: usize) -> Result<String,
     open["options"] = json!(texts);
     open["thought"] = json!(true);
     let item = build(&app.chat, &open).map_err(|e| format!("{e:#}"))?;
-    let thought = think(app, item.ids, budget).await?;
+    let adapter = app.model(row).map_err(|e| format!("{e:#}"))?.0;
+    let thought = think(app, item.ids, budget, adapter).await?;
     row["thought"] = json!(thought);
     Ok(thought)
 }
 
 /// The model's thinking after a prompt that opens a think block, at most `budget` tokens (greedy, up to
 /// `</think>`; cut off, it is told to decide now)
-async fn think(app: &App, prompt: Vec<u32>, budget: usize) -> Result<String, String> {
+async fn think(app: &App, prompt: Vec<u32>, budget: usize, adapter: bool) -> Result<String, String> {
     let (tx, mut rx) = unbounded_channel();
     let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
     let max_tokens = budget.min(app.max_ctx.saturating_sub(prompt.len() + 64)).max(1);
-    let job = Job { prompt, params, max_tokens, stop: vec!["</think>".into()], ignore_eos: false, decide: None, tx };
+    let job = Job { prompt, params, max_tokens, stop: vec!["</think>".into()], ignore_eos: false, decide: None, adapter, tx };
     app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
     let mut thought = String::new();
     while let Some(m) = rx.recv().await {

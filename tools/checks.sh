@@ -22,6 +22,7 @@ VREF=$HOME/qref                        # Qwen3.8-27B (VM)
 FJ=$HOME/.cache/qwenny/fjordhaus-data/data   # Fjordhaus train.jsonl / dev.jsonl
 Q27=/opt/qwen38/models/Qwen3.8-27B-W4A16-AutoRound
 W4A16=RedHatAI/Qwen3.5-4B-quantized.w4a16
+LORA=$QREF/lora-adapter               # the LoRA references' adapter (rank 16, every linear layer, random B)
 
 snapshot() { "$PY" -c "from huggingface_hub import snapshot_download as s; print(s('$1', local_files_only=True))"; }
 
@@ -34,6 +35,10 @@ make_ref() {
         $QREF/data-ref.safetensors) echo "$PY tools/make_train_reference.py data Qwen/Qwen3.5-4B $FJ $1" ;;
         $QREF/reference.safetensors) echo "$PY tools/make_reference_qwen.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         $QREF/mtp-ref.safetensors) echo "$PY tools/make_reference_mtp.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
+        # the LoRA references share one random adapter ($LORA, written by the first one made): remake all together
+        $QREF/lora-ref-w4a16.safetensors)
+            echo "$PY tools/make_reference_lora.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1 $LORA --weights=\$(snapshot $W4A16)" ;;
+        $QREF/lora-ref.safetensors) echo "$PY tools/make_reference_lora.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1 $LORA" ;;
         $VREF/train-grads-27b-4l.safetensors) echo "$PY tools/make_train_reference.py grads $Q27 $FJ $1 3 4 --weights=$Q27" ;;
         *) echo "no recipe for $1" ;;
     esac
@@ -165,6 +170,22 @@ selfchecks() {
     fi
 }
 
+# adaptercheck <reference> <max mean |diff|> <args...>: a LoRA served unmerged and its base model in the same steps:
+# every logit row identical to the steps with one model, and each within the limit of its reference (PEFT / base)
+adaptercheck() {
+    local ref=$1 max=$2; shift 2
+    need "$ref" || return
+    local out; out=$($BIN adaptercheck "$ref" "$@" 2>&1)
+    local worst; worst=$(grep -oP 'mean \|logit diff\| \K[0-9.]+' <<<"$out" | sort -g | tail -1)
+    local line; line=$(grep -oP 'mixed steps: \K\d+/\d+' <<<"$out")
+    if [[ $line =~ ^([0-9]+)/([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ] && [ -n "$worst" ] \
+        && awk -v e="$worst" -v m="$max" 'BEGIN { exit !(e < m) }'; then
+        ok "adaptercheck $*: mixed base + adapter steps: $line rows identical to one-model steps, mean |logit diff| at most $worst (< $max)"
+    else
+        fail "adaptercheck $*: rows identical ${line:-?}, mean |logit diff| ${worst:-?} (limit $max): $(grep -E 'Error' <<<"$out" | head -1)"
+    fi
+}
+
 # sessions <command> <pass line> <args...>: a slot saved, loaded or moved to host memory continues with the logits
 # and tokens it has when it never leaves its slot (cachecheck, swapcheck)
 sessions() {
@@ -196,6 +217,14 @@ area() {
         qwen-infer)
             logits "Qwen3.5-4B int8" "$QREF/reference.safetensors" 0.12 --model=Qwen/Qwen3.5-4B
             logits "Qwen3.5-4B 16-bit" "$QREF/reference.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --bf16
+            # a LoRA served unmerged (the int4 matrices as stored), decode steps and prompt chunks of 64; on int8 and
+            # 16-bit weights; mixed with base requests in the same steps. The adapter moves the logits by ~0.3-0.5 on
+            # average, so these limits are an order of magnitude tighter than its effect
+            logits "Qwen3.5-4B int4 + LoRA" "$QREF/lora-ref-w4a16.safetensors" 0.05 --model=$W4A16 --adapter=$LORA
+            logits "Qwen3.5-4B int4 + LoRA, chunks of 64" "$QREF/lora-ref-w4a16.safetensors" 0.05 64 --model=$W4A16 --adapter=$LORA
+            logits "Qwen3.5-4B int8 + LoRA" "$QREF/lora-ref.safetensors" 0.12 --model=Qwen/Qwen3.5-4B --adapter=$LORA
+            logits "Qwen3.5-4B 16-bit + LoRA" "$QREF/lora-ref.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --bf16 --adapter=$LORA
+            adaptercheck "$QREF/lora-ref-w4a16.safetensors" 0.05 --model=$W4A16 --adapter=$LORA
             layercheck 0
             layercheck 3
             speccheck --model=Qwen/Qwen3.5-4B
@@ -213,8 +242,8 @@ area() {
 areas_of() {
     case $1 in
         kernels/qwen_train.cu|kernels/train_common.cuh|src/cuda/qwen/train.rs|src/cuda/qwen/train/*|src/cuda/learn.rs\
-        |src/training.rs|src/lora.rs|tools/make_train_reference.py) echo qwen-train ;;
-        src/checkpoint.rs|build.rs|src/backend.rs|src/hub.rs|src/cuda/qwen/mod.rs) echo qwen-train qwen-infer ;;
+        |src/training.rs|tools/make_train_reference.py) echo qwen-train ;;
+        src/checkpoint.rs|build.rs|src/backend.rs|src/hub.rs|src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-infer ;;
         src/chat.rs) echo chat qwen-train ;;
         kernels/*|src/cuda/*|src/sample.rs|src/sessions.rs|src/checks.rs) echo qwen-infer ;;
         tools/make_reference*.py|tools/make_tokref.py|tools/tokref-*.json) echo chat qwen-infer ;;

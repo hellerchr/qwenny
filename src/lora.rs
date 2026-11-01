@@ -1,5 +1,5 @@
-//! A PEFT LoRA adapter merged into the bf16 base weights on load (W += alpha / r * B A), and `qwenny merge`, which
-//! writes the merged model as a model directory.
+//! A PEFT LoRA adapter: served unmerged (src/cuda/qwen/lora.rs: y = W x + alpha / r * B A x, per request), and
+//! `qwenny merge`, which writes the model with it merged into the bf16 base weights (W += alpha / r * B A).
 use crate::training::{bf16_to_f32, f32s};
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
@@ -30,6 +30,8 @@ impl Adapter {
         let r = cfg["r"].as_f64().context("r")?;
         let alpha = cfg["lora_alpha"].as_f64().context("lora_alpha")?;
         ensure!(cfg["use_rslora"].as_bool() != Some(true) && cfg["use_dora"].as_bool() != Some(true), "rsLoRA/DoRA adapter");
+        let empty = |k: &str| cfg[k].is_null() || cfg[k].as_object().is_some_and(|o| o.is_empty());
+        ensure!(empty("rank_pattern") && empty("alpha_pattern"), "an adapter with a rank_pattern or alpha_pattern");
         let bytes = fs::read(dir.join("adapter_model.safetensors"))?;
         let st = SafeTensors::deserialize(&bytes)?;
         let mut pairs = HashMap::new();
@@ -37,7 +39,7 @@ impl Adapter {
             let Some(stem) = name.strip_suffix(".lora_A.weight") else { continue };
             let (a, sa) = floats(&st, name)?;
             let (b, sb) = floats(&st, &format!("{stem}.lora_B.weight"))?;
-            ensure!(sa.len() == 2 && sb.len() == 2 && sa[0] == sb[1], "{stem}: shapes {sa:?} {sb:?}");
+            ensure!(sa.len() == 2 && sb.len() == 2 && sa[0] == sb[1] && sa[0] as f64 == r, "{stem}: shapes {sa:?} {sb:?} (r {r})");
             let base = stem.strip_prefix("base_model.model.").unwrap_or(stem).to_string() + ".weight";
             pairs.insert(base, (a, b, sa[0]));
         }
@@ -58,6 +60,21 @@ impl Adapter {
     /// Matrices the adapter changes
     pub fn len(&self) -> usize {
         self.pairs.len()
+    }
+
+    /// alpha / r
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// The names of the base weights it changes
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.pairs.keys()
+    }
+
+    /// lora_A [r][in], lora_B [out][r] and r of base weight `name`, if the adapter changes it
+    pub fn get(&self, name: &str) -> Option<(&[f32], &[f32], usize)> {
+        self.pairs.get(name).map(|(a, b, r)| (&a[..], &b[..], *r))
     }
 
     /// Fold the adapter into weight `name` (bf16 [rows][cols], rows = len / cols) if it targets it.

@@ -36,6 +36,8 @@ pub struct Job {
     pub ignore_eos: bool,
     /// a decision: no generation, the logits of these candidate tokens at the prompt's last position
     pub decide: Option<Vec<u32>>,
+    /// run with the LoRA adapter (App::model), else the base model
+    pub adapter: bool,
     pub tx: UnboundedSender<Msg>,
 }
 
@@ -182,6 +184,11 @@ fn give_way(m: &mut Box<dyn Engine>, s: &mut Seq, shadow: Option<Image>) -> Resu
     Ok(img)
 }
 
+/// Slot `slot`'s next steps with the adapter or the base model (an engine without an adapter: the base)
+fn use_adapter(m: &mut Box<dyn Engine>, slot: u32, adapter: bool) -> Result<()> {
+    if m.has_adapter() { m.set_adapter(slot, adapter) } else if adapter { bail!("no adapter loaded") } else { Ok(()) }
+}
+
 /// `spec`: draft tokens per step at most (0: no speculative decoding)
 fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize) {
     // drafts per step from the model's draft layer (MTP); an n-gram chain drafts up to `spec`
@@ -219,6 +226,11 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             match st.bring_back(&mut m, id, &mut free) {
                 Ok(Some(slot)) => {
                     let (mut seq, _) = parked.pop_front().unwrap();
+                    if let Err(e) = use_adapter(&mut m, slot, seq.job.adapter) {
+                        let _ = seq.job.tx.send(Msg::Error(format!("engine: {e}")));
+                        free.push(slot);
+                        continue;
+                    }
                     eprintln!("cache: a request resumes in slot {slot} at {} tokens", seq.valid);
                     (seq.slot, seq.dirty) = (slot, false);
                     seq.drafts.clear();
@@ -253,9 +265,9 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             // a request that continues a cached session takes it in by itself (Store::take: from its slot, or
             // swapped in from host memory); a new one starts when the device has room, idle sequences moving to
             // host memory as it holds them
-            let continues = store.as_ref().is_some_and(|st| st.continues(&job.prompt));
+            let continues = store.as_ref().is_some_and(|st| st.continues(&job.prompt, job.adapter));
             if !(continues || active.is_empty() || room(&m, 0)) {
-                let keep = store.as_ref().and_then(|st| st.slot_for(&job.prompt));
+                let keep = store.as_ref().and_then(|st| st.slot_for(&job.prompt, job.adapter));
                 match store.as_mut().map(|st| st.park_one(&mut m, keep, false)) {
                     Some(Ok(Some(slot))) => { free.push(slot); continue }
                     _ => break,
@@ -268,9 +280,16 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 continue;
             }
             let got = match &mut store {
-                Some(st) => st.take(&mut m, &job.prompt, &mut free, active.len()),
+                Some(st) => st.take(&mut m, &job.prompt, job.adapter, &mut free, active.len()),
                 None => Ok(free.pop().map(|s| (s, 0, Vec::new()))),
             };
+            // the slot's next steps under the request's model (its cached state, if any, is that model's)
+            let got = got.and_then(|g| {
+                if let Some((slot, ..)) = &g {
+                    use_adapter(&mut m, *slot, job.adapter)?;
+                }
+                Ok(g)
+            });
             let (slot, at, snaps) = match got {
                 Ok(Some(x)) => x,
                 Ok(None) => break,
@@ -438,7 +457,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                             Ok(img) => {
                                 eprintln!("cache: a request ({} tokens) gives way in slot {}", seq.valid, seq.slot);
                                 free.push(seq.slot);
-                                let id = st.keep_parked(seq.history[..seq.valid].to_vec(), img);
+                                let id = st.keep_parked(seq.history[..seq.valid].to_vec(), seq.job.adapter, img);
                                 parked.push_back((seq, id));
                             }
                             Err(e) => {
@@ -573,7 +592,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 match &mut store {
                     Some(st) if keep => {
                         let snaps = s.snaps.into_iter().filter(|p| p.0 <= s.valid).collect();
-                        st.put(s.slot, Held { tokens: s.history[..s.valid].to_vec(), dirty: s.dirty, snaps });
+                        st.put(s.slot, Held { tokens: s.history[..s.valid].to_vec(), adapter: s.job.adapter, dirty: s.dirty, snaps });
                     }
                     _ => {
                         if let Err(e) = m.release(s.slot) {
@@ -598,6 +617,8 @@ pub struct App {
     pub jobs: UnboundedSender<Job>,
     pub name: String,
     pub max_ctx: usize,
+    /// the name the LoRA adapter is served under, if one is loaded (`"model"` of a request; the base is `name`)
+    pub adapter: Option<String>,
     /// named decision tasks (question, options, threshold, ...) for the page and for requests with "preset"
     pub presets: Json,
     /// pages from the chat (`POST /v1/artifacts`), newest last
@@ -639,6 +660,19 @@ async fn get_artifact(State(app): State<Arc<App>>, Path(id): Path<String>) -> Re
     }
 }
 
+impl App {
+    /// The model a request names (`"model"`): whether it is the adapter, and the name to answer with. Without an
+    /// adapter any name is the base model; with one, a name that is neither is an error.
+    pub fn model(&self, body: &Json) -> Result<(bool, String)> {
+        let asked = body.get("model").and_then(Json::as_str);
+        match (&self.adapter, asked) {
+            (Some(a), Some(m)) if m == a => Ok((true, a.clone())),
+            (Some(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
+            _ => Ok((false, self.name.clone())),
+        }
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -659,6 +693,8 @@ fn sampling_defaults(thinking: bool) -> Params {
 /// A rendered, tokenized request; `thinking`: the prompt opened a think block, so output starts as reasoning.
 struct Prepared {
     job: Job,
+    /// the model's name (the base or the adapter)
+    model: String,
     rx: UnboundedReceiver<Msg>,
     parser: OutputParser,
     thinking: bool,
@@ -689,6 +725,7 @@ fn template_kwargs(body: &Json) -> serde_json::Map<String, Json> {
 }
 
 fn prepare(app: &App, body: &Json) -> Result<Prepared> {
+    let (adapter, model) = app.model(body)?;
     let messages = body.get("messages").filter(|m| m.is_array()).context("messages must be an array")?;
     let tools = body.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
     let kwargs = template_kwargs(body);
@@ -718,7 +755,8 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
     let (tx, rx) = unbounded_channel();
     Ok(Prepared {
         job: Job { prompt, params, max_tokens, stop, ignore_eos: body.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
-                   decide: None, tx },
+                   decide: None, adapter, tx },
+        model,
         rx,
         parser: app.chat.parser(thinking, tools),
         thinking,
@@ -741,12 +779,12 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
         Ok(p) => p,
         Err(e) => return bad_request(format!("{e:#}")),
     };
-    let Prepared { job, mut rx, mut parser, thinking, stream, include_usage } = p;
+    let Prepared { job, model, mut rx, mut parser, thinking, stream, include_usage } = p;
     if app.jobs.send(job).is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, "engine stopped").into_response();
     }
     let id = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    let (created, model) = (now(), app.name.clone());
+    let created = now();
 
     if !stream {
         let mut pieces = Vec::new();
@@ -857,6 +895,8 @@ pub struct ServeOpts {
     pub host: String,
     pub port: u16,
     pub name: String,
+    /// the name the LoRA adapter (if one is loaded) is served under
+    pub adapter: Option<String>,
     /// draft tokens per step at most (speculative decoding; 0: off)
     pub spec: usize,
     /// the sessions (--slots) asked for, each promised the whole context; None: as many as fit
@@ -1087,18 +1127,17 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     let auth = Arc::new(Auth::open(&opts.db)?);
     let chat = Arc::new(chat);
     let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.spec, opts.sessions, opts.fit_ctx)?;
-    let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, presets: opts.presets.clone(),
-                             artifacts: Mutex::default(), auth: auth.clone() });
-    let name = opts.name.clone();
+    let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
+                             presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
+    // the base model first (the page shows the first), then the adapter
+    let names: Vec<String> = std::iter::once(opts.name.clone()).chain(opts.adapter.clone()).collect();
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/decisions", post(crate::decide::decisions))
         .route("/v1/decisions/presets", get(|State(app): State<Arc<App>>| async move { AxJson(app.presets.clone()) }))
         .route("/v1/models", get(move || {
-            let name = name.clone();
-            async move {
-                AxJson(json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "qwenny"}]}))
-            }
+            let data: Vec<Json> = names.iter().map(|n| json!({"id": n, "object": "model", "owned_by": "qwenny"})).collect();
+            async move { AxJson(json!({"object": "list", "data": data})) }
         }))
         .route("/health", get(|| async { "ok" }))
         .route("/auth/login", post(auth_login))
@@ -1122,7 +1161,8 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await?;
-        println!("serving {} on http://{}:{} (context {max_ctx}{}{})", opts.name, opts.host, opts.port,
+        println!("serving {}{} on http://{}:{} (context {max_ctx}{}{})", opts.name,
+                 opts.adapter.as_ref().map_or(String::new(), |a| format!(" and its adapter {a}")), opts.host, opts.port,
                  if opts.ui { ", web page at /" } else { "" },
                  if auth.require_key()? { ", the API requires a key" } else { "" });
         axum::serve(listener, router).await?;
@@ -1237,7 +1277,7 @@ mod tests {
             engine(Box::new(m), None, engine_chat, rx, spec)
         });
         let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
-        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, presets: json!([]), artifacts: Mutex::default(),
+        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: None, presets: json!([]), artifacts: Mutex::default(),
                                  auth: Arc::new(Auth::open(&db).unwrap()) });
         // the scripted engine only takes the argmax: greedy, and no presence penalty (Qwen's default would sample)
         body["temperature"] = json!(0);

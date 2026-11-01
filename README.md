@@ -47,14 +47,16 @@ curl -s localhost:18023/v1/chat/completions -H 'Content-Type: application/json' 
 ```
 
 Every command takes `--model=<directory or Hugging Face id>` (default `Qwen/Qwen3.5-4B`, downloaded once to the
-Hugging Face cache; `HF_HOME`, `HF_TOKEN` and `HF_HUB_OFFLINE` apply), `--adapter=<dir>` (a PEFT LoRA, merged on load)
-and `--bf16` (16-bit weights instead of int8; pre-quantized checkpoints keep their format).
+Hugging Face cache; `HF_HOME`, `HF_TOKEN` and `HF_HUB_OFFLINE` apply), `--adapter=[<name>=]<dir>` (a PEFT LoRA,
+served unmerged: see Server) and `--bf16` (16-bit weights instead of int8; pre-quantized checkpoints keep their
+format).
 
 ```bash
 qwenny train data/                        # LoRA on data/train.jsonl (+ dev.jsonl), rows {"messages": [...]}
-qwenny serve --adapter=runs/data-1/adapter
-qwenny merge runs/data-1/adapter merged/  # write the merged model
+qwenny serve --adapter=runs/data-1/adapter  # "model": "data-1" with the adapter, "qwenny" without
+qwenny merge runs/data-1/adapter merged/  # write the merged model (bf16 checkpoints)
 qwenny bench --pos=32000                  # decode, verify steps and prefill after a 32k context
+qwenny bench --adapter=<dir>              # the same for base requests with the adapter loaded, then adapter requests
 ```
 
 ## Server
@@ -62,13 +64,18 @@ qwenny bench --pos=32000                  # decode, verify steps and prefill aft
 `qwenny serve` options: `--host=0.0.0.0 --port=18023 --name=qwenny`, `--ctx=<tokens>` (default: the model's native
 context, or the longest one session can hold on the GPU if that is less), `--slots=16` (concurrent sessions at most),
 `--spec=7` (drafts per step at most; 0 turns drafting off), `--ui` (the web page), `--decisions=<presets.json>[,...]`,
-`--db=<file>` (where the password and keys are kept; default `~/.local/share/qwenny/qwenny.db`).
+`--db=<file>` (where the password and keys are kept; default `~/.local/share/qwenny/qwenny.db`),
+`--adapter=[<name>=]<dir>` (a LoRA served beside the base model under `<name>`; default the directory's name, or its
+parent's for `qwenny train`'s `runs/<data>-N/adapter`).
 
-**API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`. Request fields: `messages`,
+**API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`. Request fields: `model`,
+`messages`,
 `tools`, `chat_template_kwargs`, `enable_thinking`, `reasoning_effort` (or `reasoning.effort`), `max_tokens`,
 `temperature`, `top_p`, `top_k` (at most 1024), `repetition_penalty`, `presence_penalty`, `seed`, `stop`, `stream`,
 `stream_options.include_usage`, `ignore_eos`.
 
+- `model`: with an adapter loaded, its name runs the request (chat or decision) with the adapter and `--name` (or no
+  `model`) without it; any other name is an error. `/v1/models` lists both. Without an adapter the field is ignored.
 - Thinking follows the model's chat template (on unless `enable_thinking` is false). `reasoning_effort`: `none` and
   `minimal` turn it off, `high` maps to the template's `xhigh`. The thinking is returned in `reasoning_content`.
 - Tool calls use Qwen's XML format; parameter values are typed by the request's tool schema.
@@ -112,6 +119,19 @@ and head. Matrix products use tensor cores (`mma.m16n8k16`, f16 inputs, f32 accu
 CUDA graphs. Sampling (repetition and presence penalty, temperature, top-k, top-p) runs on the GPU. Prompts are built
 from the model's `chat_template.jinja` and `tokenizer.json`.
 
+**LoRA adapters** are served unmerged, so one server answers the base model and the adapter side by side, in the same
+steps: the base matrices stay as stored (int4, int8, 16-bit) and every adapted product adds alpha / r · B (A x) for
+the tokens of requests that use the adapter. The modules that read the same input share one stacked A (a 16-bit
+tensor-core product of the step); a kernel adds B's part to the product's partial sums, and for gate / up it adds it
+before SwiGLU (the product then runs without its fused SwiGLU epilogue). Base requests get exactly the base model's
+values, and steps without adapter requests skip the adapter's kernels. A and B are f16 on the GPU (exact for a bf16
+adapter, 11 bits for an f32 one, as the base's 16-bit weights; f32 accumulation); rank 16 on all linear layers of the
+27B takes ~230 MB, and the plain [gate; up] product of a 2,048-token step ~150 MB more. A session's cached state
+belongs to the model it was computed with: a request for the other model reads its prompt again. The draft layer
+(MTP) and the output layer stay unadapted: drafts are verified by the adapted model, so only acceptance can change.
+Supported: ranks 8, 16, 32, 64 (PEFT, no rsLoRA / DoRA / rank or alpha patterns) on the language model's linear
+layers (an adapter of the MTP or output layer is refused).
+
 **Speculative decoding.** The checkpoint's MTP layer drafts up to 4 tokens per step; the target model checks all of
 them in one step.
 
@@ -143,14 +163,15 @@ uncommitted changes need), `all`, or one area (`qwen-infer`, `chat`, `qwen-train
 | Check | Compared with |
 |---|---|
 | `check`, `layercheck`, `longcheck` | Transformers fp32 logits and layer outputs |
+| `check --adapter`, `adaptercheck` | Transformers + PEFT fp32 logits with a LoRA; adapter and base requests in the same steps vs. each in steps of one model |
 | `speccheck` | the same model without drafts (one token per step) |
 | `samplecheck` | a host reference sampler, draw for draw, including sampled drafts |
 | `cachecheck`, `swapcheck` | the same sequence without saving or swapping |
 | `chatcheck`, `tokcheck` | Transformers' chat template and tokenizer |
 | `traincheck`, `datacheck` | PEFT's LoRA gradients and AdamW step; Unsloth's loss masks |
 
-The references are made by `tools/make_reference_qwen.py`, `make_reference_mtp.py`, `make_train_reference.py` and
-`make_tokref.py`; `make_reference_vllm.py` takes top-k log-probabilities from a vLLM server for int4 checkpoints.
+The references are made by `tools/make_reference_qwen.py`, `make_reference_mtp.py`, `make_reference_lora.py`,
+`make_train_reference.py` and `make_tokref.py`; `make_reference_vllm.py` takes top-k log-probabilities from a vLLM server for int4 checkpoints.
 `tools/decode_bench.py` (one stream) and `tools/serve_bench.py` (1 to 16 streams) measure a running server.
 
 ## Layout
@@ -163,7 +184,7 @@ src/chat.rs, src/decide.rs      chat template and tool calls; decisions
 src/sample.rs                   sampling parameters, host reference sampler
 src/checkpoint.rs, src/hub.rs   weight loading and formats; Hugging Face downloads
 src/cuda/                       device code: products, steps, graphs (core.rs), the model (qwen/), training runtime
-src/training.rs, src/lora.rs    LoRA training and merging
+src/training.rs, src/lora.rs    LoRA training, loading and merging (served: src/cuda/qwen/lora.rs, kernels/lora.cuh)
 kernels/                        CUDA kernels: products (gemm, Marlin), attention, DeltaNet, sampling, training
 tools/                          checks, reference scripts, benchmarks
 docs/exl3-plan.md               plan: EXL3 checkpoints (higher quality at ~4 bits)

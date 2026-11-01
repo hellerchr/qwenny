@@ -4,7 +4,6 @@
 //! own module, which instantiates the shared ones.
 use crate::engine::Tok;
 use crate::checkpoint::{Checkpoint, Quant};
-use crate::lora::Adapter;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, sys};
 use cudarc::nvrtc::Ptx;
@@ -103,7 +102,7 @@ pub struct Mat {
 
 /// Rows of a stacked matrix in the order they are packed: `silu`: [w1; w3] (gate; up), so that each tile holds 8 rows
 /// of each for the SwiGLU epilogue
-fn row_order(rows: usize, silu: bool) -> Vec<usize> {
+pub fn row_order(rows: usize, silu: bool) -> Vec<usize> {
     if silu {
         (0..rows).map(|i| (i / 16) * 8 + i % 8 + if i % 16 >= 8 { rows / 2 } else { 0 }).collect()
     } else {
@@ -127,6 +126,14 @@ impl Mat {
         ensure!(rows % 16 == 0 && cols % 256 == 0 && rows * cols == src.len(), "matrix of {rows} x {cols}");
         let (w, sc) = pack(src, cols, &row_order(rows, silu), int8);
         Mat::upload(s, &w, &sc, rows, cols, if int8 { Wt::I8 } else { Wt::F16 })
+    }
+
+    /// Pack `src` [rows][cols] (f32) as f16, rows in order (a LoRA's A)
+    pub fn f16(s: &Arc<CudaStream>, src: &[f32], cols: usize) -> Result<Self> {
+        let rows = src.len() / cols;
+        ensure!(rows % 16 == 0 && cols % 256 == 0 && rows * cols == src.len(), "matrix of {rows} x {cols}");
+        let (w, sc) = pack(src, cols, &row_order(rows, false), false);
+        Mat::upload(s, &w, &sc, rows, cols, Wt::F16)
     }
 
     /// Rows `rows` (whole tiles) of a stored int4 matrix that Mat::marlin takes, in a matrix of `cap` rows (a multiple
@@ -190,14 +197,13 @@ impl Mat {
     }
 
     /// Matrices `names` (`.weight`) of the checkpoint with the same column count, stacked by rows: stored int4 in
-    /// Marlin's layout (Mat::marlin; an error where it does not fit), stored int8 as it is, unless a LoRA adapter is
-    /// merged in; else dense (dequantized when stored quantized), the adapter merged, int8 or f16. The 16-bit
-    /// matrices of a pre-quantized checkpoint stay f16: its maker kept them precise (RedHatAI's Qwen3.5 w4a16: the
-    /// DeltaNet projections; requantized to int8 they cost as much as all the int4 matrices). `silu`: see row_order.
-    pub fn stack(s: &Arc<CudaStream>, ck: &Checkpoint, names: &[String], silu: bool, int8: bool,
-                 adapter: Option<&Adapter>) -> Result<Self> {
+    /// Marlin's layout (Mat::marlin; an error where it does not fit), stored int8 as it is; else dense (dequantized
+    /// when stored quantized), int8 or f16. The 16-bit matrices of a pre-quantized checkpoint stay f16: its maker kept
+    /// them precise (RedHatAI's Qwen3.5 w4a16: the DeltaNet projections; requantized to int8 they cost as much as all
+    /// the int4 matrices). `silu`: see row_order.
+    pub fn stack(s: &Arc<CudaStream>, ck: &Checkpoint, names: &[String], silu: bool, int8: bool) -> Result<Self> {
         let bases: Vec<&str> = names.iter().filter_map(|n| n.strip_suffix(".weight")).collect();
-        if adapter.is_none() && bases.len() == names.len() && bases.iter().all(|b| ck.is_quant(b)) {
+        if bases.len() == names.len() && bases.iter().all(|b| ck.is_quant(b)) {
             let parts = bases.iter().map(|b| ck.quant_matrix(b)).collect::<Result<Vec<_>>>()?;
             let q = Quant::stack(parts)?;
             if q.bits == 4 {
@@ -211,10 +217,7 @@ impl Mat {
         }
         let (mut v, mut cols) = (Vec::new(), 0);
         for n in names {
-            let (mut w, shape) = ck.bf16(n)?;
-            if let Some(a) = adapter {
-                a.apply(n, &mut w);
-            }
+            let (w, shape) = ck.bf16(n)?;
             v.extend(w);
             cols = shape[1];
         }
@@ -294,16 +297,33 @@ pub fn part_len<'a>(mats: impl IntoIterator<Item = &'a Mat>) -> usize {
     mats.into_iter().map(|m| rows(m) * m.tiles * 16).max().unwrap_or(0)
 }
 
-/// Pack the rows `order` (16 per tile) of `src` [rows][cols] (bf16).
-fn pack(src: &[u16], cols: usize, order: &[usize], int8: bool) -> (Vec<u8>, Vec<f32>) {
+/// A matrix element as stored on the host: bf16 bits or f32
+trait Val: Copy + Sync {
+    fn f(self) -> f32;
+}
+
+impl Val for u16 {
+    fn f(self) -> f32 {
+        f32::from_bits((self as u32) << 16)
+    }
+}
+
+impl Val for f32 {
+    fn f(self) -> f32 {
+        self
+    }
+}
+
+/// Pack the rows `order` (16 per tile) of `src` [rows][cols] (bf16 or f32).
+fn pack<V: Val>(src: &[V], cols: usize, order: &[usize], int8: bool) -> (Vec<u8>, Vec<f32>) {
     let tiles = order.len() / 16;
     let groups = cols / QG;
     let tile_bytes = 16 * cols * if int8 { 1 } else { 2 };
     let mut w = vec![0u8; tiles * tile_bytes];
     let mut s = vec![0f32; tiles * groups * 16];
-    let f = |b: u16| f32::from_bits((b as u32) << 16);
+    let f = |b: V| b.f();
     let work = |tile: usize, wt: &mut [u8], st: &mut [f32]| {
-        let rows: Vec<&[u16]> = (0..16).map(|r| &src[order[tile * 16 + r] * cols..][..cols]).collect();
+        let rows: Vec<&[V]> = (0..16).map(|r| &src[order[tile * 16 + r] * cols..][..cols]).collect();
         // int8: q[r][c] + 128 with a scale per row and group
         let mut q = vec![0u8; if int8 { 16 * cols } else { 0 }];
         if int8 {
@@ -440,6 +460,13 @@ impl Gemm {
     /// partial products for decode-sized steps. Returns the split factor.
     pub fn run<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, st: &Step, w: &Mat, x: &CudaSlice<X>,
                                             y: &CudaSlice<Y>, epi: Epi) -> Result<usize> {
+        self.run_split(s, st, w, x, y, epi, false)
+    }
+
+    /// run; `whole`: a plain product without split K, accumulated as the SwiGLU epilogue's (the same values)
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_split<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, st: &Step, w: &Mat, x: &CudaSlice<X>,
+                                                  y: &CudaSlice<Y>, epi: Epi, whole: bool) -> Result<usize> {
         if matches!(w.wt, Wt::Marlin | Wt::MarlinZ) {
             if epi == Epi::Argmax {
                 // the logit rows of the step's tokens, gathered: Marlin reads A rows contiguously
@@ -463,7 +490,7 @@ impl Gemm {
         let n = if lm { st.n_out } else { st.n };
         let tile = DEC_TILES.iter().position(|&t| n <= t);
         let split = match tile {
-            Some(v) if epi == Epi::Plain => w.split[v],
+            Some(v) if epi == Epi::Plain && !whole => w.split[v],
             _ => 1,
         };
         let variant = tile.unwrap_or(DEC_TILES.len());
@@ -650,6 +677,8 @@ pub struct Step {
     pub slots: usize,
     pub max_ctx: usize,
     layout: Segments,
+    /// the step has tokens of slots that use a LoRA adapter (set by the model after upload; cuda::qwen::lora)
+    pub lora: bool,
 }
 
 impl Step {
@@ -694,6 +723,7 @@ impl Step {
             slots,
             max_ctx,
             layout,
+            lora: false,
         })
     }
 
