@@ -116,6 +116,8 @@ pub struct DraftHead {
     /// the output layer as stored (the rows come from it) and its zero points
     q: Quant,
     zeros: Vec<u8>,
+    /// put_block's staging buffers
+    stage: (CudaSlice<u32>, CudaSlice<u16>),
     path: Option<PathBuf>,
     dirty: bool,
     saved: Instant,
@@ -148,7 +150,8 @@ impl DraftHead {
         let mat = Mat::marlin_rows(s, &q, &zeros, &order, DRAFT_ROWS)?;
         let mut ids = s.alloc_zeros(DRAFT_ROWS)?;
         s.memcpy_htod(&rows.ids.iter().map(|&t| t as i32).collect::<Vec<_>>(), &mut ids.slice_mut(0..rows.ids.len()))?;
-        Ok(Some(DraftHead { mat, ids, rows, q, zeros, path, dirty: false, saved: Instant::now() }))
+        let stage = Gemm::block_stage(s, &mat)?;
+        Ok(Some(DraftHead { mat, ids, rows, q, zeros, stage, path, dirty: false, saved: Instant::now() }))
     }
 
     /// Take in the tokens a step commits; whether the head grew (the MTP's graphs launch it with its row count)
@@ -156,7 +159,7 @@ impl DraftHead {
         let valid = self.mat.valid;
         for t in self.rows.take(toks) {
             let order: Vec<usize> = self.rows.ids[16 * t..16 * t + 16].iter().map(|&t| t as usize).collect();
-            mm.put_block(s, &mut self.mat, &self.q, &self.zeros, t, &order)?;
+            mm.put_block(s, &mut self.mat, &self.q, &self.zeros, t, &order, &mut self.stage)?;
             let ids: Vec<i32> = order.iter().map(|&t| t as i32).collect();
             s.memcpy_htod(&ids, &mut self.ids.slice_mut(16 * t..16 * t + 16))?;
             self.dirty = true;

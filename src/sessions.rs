@@ -11,7 +11,7 @@
 //! session least recently used. A request never fails for memory: idle sequences go to the host or are dropped,
 //! running ones give way (server.rs).
 use crate::engine::{Engine, Tok};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::time::Instant;
 
 /// Positions per chunk of an Image's KV cache: whole chunks below a sequence's resume point stay valid
@@ -63,10 +63,10 @@ pub fn save_image(m: &mut Box<dyn Engine>, slot: u32, len: usize, base: Option<I
     let mut from = chunks.last().map_or(0, |c| c.1);
     while from < len {
         let to = (from + CHUNK).min(len);
-        chunks.push((from, to, m.save_kv(slot, from, to)?));
+        chunks.push((from, to, m.save_kv(slot, from, to).with_context(|| format!("saving positions {from}..{to}"))?));
         from = to;
     }
-    Ok(Image { len, chunks, state: m.save_state(slot)? })
+    Ok(Image { len, chunks, state: m.save_state(slot).context("saving the recurrent state")? })
 }
 
 /// Put an Image into slot `slot` (what it held is gone): its next step continues at `img.len`; false when the device
@@ -300,7 +300,7 @@ impl Store {
                 m.set_adapter(slot, held.adapter)?;
             }
             let pos = held.tokens.len() - 1;
-            m.run(&[Tok { id: held.tokens[pos], slot, pos: pos as u32 }], &[])?;
+            m.run(&[Tok { id: held.tokens[pos], slot, pos: pos as u32 }], &[]).context("settling the last token")?;
             held.dirty = false;
         }
         Ok(())
@@ -337,7 +337,7 @@ impl Store {
         }
         let img = match m.can_save() && fits {
             true => Self::settle(m, slot, &mut e.held).and_then(|_| save_image(m, slot, n, shadow))
-                .map_err(|err| eprintln!("cache: slot {slot} not saved ({err}): its sequence is read again when continued"))
+                .map_err(|err| eprintln!("cache: slot {slot} not saved ({err:#}): its sequence is read again when continued"))
                 .ok(),
             false => None,
         };

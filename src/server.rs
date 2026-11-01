@@ -249,7 +249,8 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 Ok(None) => break,
                 Err(e) => {
                     let (seq, _) = parked.pop_front().unwrap();
-                    let _ = seq.job.tx.send(Msg::Error(format!("engine: {e}")));
+                    eprintln!("engine: a request that gave way could not resume: {e:#}");
+                    let _ = seq.job.tx.send(Msg::Error(format!("engine: {e:#}")));
                 }
             }
         }
@@ -295,7 +296,8 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 Ok(None) => break,
                 Err(e) => {
                     let job = waiting.pop_front().unwrap();
-                    let _ = job.tx.send(Msg::Error(format!("engine: {e}")));
+                    eprintln!("engine: a request ({} tokens) could not start: {e:#}", job.prompt.len());
+                    let _ = job.tx.send(Msg::Error(format!("engine: {e:#}")));
                     continue;
                 }
             };
@@ -416,7 +418,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                     let label_mass = logits.iter().map(|&x| (x as f64 - lse).exp()).sum();
                     Msg::Decision { logits, label_mass, prompt_tokens: s.job.prompt.len() }
                 }
-                Err(e) => Msg::Error(format!("engine: {e}")),
+                Err(e) => Msg::Error(format!("engine: {e:#}")),
             };
             let _ = s.job.tx.send(msg);
             s.finish = Some("decision");
@@ -461,7 +463,8 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                                 parked.push_back((seq, id));
                             }
                             Err(e) => {
-                                let _ = seq.job.tx.send(Msg::Error(format!("engine: {e}")));
+                                eprintln!("engine: a request ({} tokens) could not give way: {e:#}", seq.valid);
+                                let _ = seq.job.tx.send(Msg::Error(format!("engine: {e:#}")));
                                 let _ = m.release(seq.slot);
                                 free.push(seq.slot);
                             }
@@ -469,7 +472,8 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                     }
                     Ok(None) => {
                         let s = active.pop().unwrap();
-                        let _ = s.job.tx.send(Msg::Error(format!("engine: {e}")));
+                        eprintln!("engine: a request ({} tokens) ends: {e:#}", s.valid);
+                        let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
                         let _ = m.release(s.slot);
                         free.push(s.slot);
                     }
@@ -478,8 +482,9 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 continue;
             }
             Err(e) => {
+                eprintln!("engine: a step of {} tokens failed, its {} requests end: {e:#}", toks.len(), active.len());
                 for s in active.drain(..) {
-                    let _ = s.job.tx.send(Msg::Error(format!("engine: {e}")));
+                    let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
                     let _ = m.release(s.slot);
                     free.push(s.slot);
                 }

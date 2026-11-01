@@ -107,7 +107,8 @@ gpu-unlock is active (`sudo journalctl -k -b | grep gpu_unlock`, currently activ
   service included. Look at `nvidia-smi`, stop what holds the GPU, and start the service again when done
   (`sudo systemctl start qwenny`) unless the user says otherwise. Announce a reboot of the VM to every session.
 - The 5080 is shared with other sessions: before a job that takes more than a few GB or minutes, check `nvidia-smi`
-  and agree with the session using the GPU.
+  and agree with the session using the GPU. A server or bench takes all free device memory for its slots' caches when
+  it starts: cap it there with `QWENNY_CACHE_MEM=<GiB>`.
 - **On the VM, run as `ubuntu`, not root.** An agent's shell there may be root (`HOME=/root`), which has no cargo, no
   Hugging Face cache, no references and no venv, and a root build leaves root-owned files in `target/`:
 

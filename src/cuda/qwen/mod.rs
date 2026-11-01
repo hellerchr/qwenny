@@ -24,6 +24,18 @@ use crate::cuda::vmm::{HostMapped, Pool};
 const PAGE_RESERVE: usize = 512 << 20;
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
+/// QWENNY_CACHE_MEM=<GiB>: device memory the slots' caches take at most (a GPU shared with other work). Unset: all
+/// that is free when the model is loaded, less PAGE_RESERVE.
+fn cache_mem_cap() -> Result<Option<usize>> {
+    match std::env::var("QWENNY_CACHE_MEM") {
+        Ok(v) => match v.parse::<f64>() {
+            Ok(g) if g > 0.0 => Ok(Some((g * 1073741824.0) as usize)),
+            _ => bail!("QWENNY_CACHE_MEM={v}: GiB of device memory, e.g. 4"),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
 /// Full attention: key/value heads and head dim; Gated DeltaNet: key heads, key and value head dims (all sizes)
 const NKV: usize = 4;
 const HD: usize = 256;
@@ -318,11 +330,12 @@ impl Stack {
         Ok((x, w))
     }
 
-    /// Give the per-slot caches what device memory is free now, less PAGE_RESERVE
+    /// Give the per-slot caches what device memory is free now, less PAGE_RESERVE (at most QWENNY_CACHE_MEM)
     fn set_budget(&self) -> Result<()> {
         self.s.synchronize()?;
         let (free, _) = cudarc::driver::result::mem_get_info()?;
-        self.pool.set_budget(free.saturating_sub(PAGE_RESERVE) / self.pool.page() + self.pool.usage().0);
+        let room = free.saturating_sub(PAGE_RESERVE).min(cache_mem_cap()?.unwrap_or(usize::MAX));
+        self.pool.set_budget(room / self.pool.page() + self.pool.usage().0);
         Ok(())
     }
 
@@ -477,6 +490,9 @@ impl Embed {
 /// CUDA graph key: the step's shape, the attention's key splits (decode, prompt tiles) and whether the step has
 /// adapter tokens (Step::lora)
 type Key = ([usize; 6], (usize, usize, usize, usize), bool);
+/// The graphs of the model's steps (None) and of the MTP's (whether the hidden states are its own: the norm before
+/// pre_h), in one cache: they share the device memory the cache pool leaves
+type GraphKey = (Key, Option<bool>);
 
 /// The MTP layer (multi-token prediction; the draft model of speculative decoding), as vLLM's
 /// Qwen3_5MultiTokenPredictor: x = fc([pre_e(embed(t_{q+1})); pre_h(h_q)]), one full-attention layer over the MTP's own
@@ -493,8 +509,6 @@ struct Mtp {
     xin: CudaSlice<u16>,
     /// per MTP token: the row of the residual stream (of the step before) its hidden state comes from
     rows: CudaSlice<i32>,
-    /// keyed by the step's shape and whether the hidden states are the MTP's own (the norm before pre_h)
-    graphs: Graphs<(Key, bool)>,
     /// the draft head, if the checkpoint names a draft vocabulary; else the drafts read the whole output layer
     head: Option<DraftHead>,
 }
@@ -506,7 +520,7 @@ pub struct Model {
     /// tied to the embedding (4B) or its own matrix (27B)
     lm_head: Mat,
     final_norm: CudaSlice<f32>,
-    graphs: Graphs<Key>,
+    graphs: Graphs<GraphKey>,
     mtp: Option<Mtp>,
     /// per slot: whether it uses the adapter (set_adapter); None: no adapter loaded
     adapter: Option<(Vec<bool>, f32)>,
@@ -535,7 +549,6 @@ impl Model {
                     norm: fl("norm")?,
                     xin: s.alloc_zeros(MAX_TOK * 2 * d.h)?,
                     rows: s.alloc_zeros(MAX_TOK)?,
-                    graphs: Graphs::new(),
                     head: DraftHead::load(s, &w, dir, d.vocab)?,
                 })
             }
@@ -551,7 +564,8 @@ impl Model {
         let lm_head = Mat::stack(&x.s, &w, &[head], false, int8)?;
         let final_norm = x.s.clone_htod(&norm(&w, "model.language_model.norm.weight")?)?;
         let adapter = adapter.map(|a| (vec![false; x.st.slots], a.scale()));
-        let model = Model { embed, lm_head, final_norm, graphs: Graphs::new(), x, mtp, adapter };
+        let graphs = Graphs::new(Some(x.pool.clone()));
+        let model = Model { embed, lm_head, final_norm, graphs, x, mtp, adapter };
         // the whole model loaded: the caches' pages made at once (Pool::fill)
         model.x.set_budget()?;
         model.x.pool.fill()?;
@@ -685,9 +699,9 @@ impl Model {
         }
         // the MTP layer is not adapted
         x.st.lora = false;
-        let key = ((x.st.shape(), Attn::graph_key(&x.k.attn, &x.st), false), own);
+        let key = ((x.st.shape(), Attn::graph_key(&x.k.attn, &x.st), false), Some(own));
         let m = self.mtp.as_ref().unwrap();
-        m.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_mtp(m, own))
+        self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_mtp(m, own))
     }
 
 }
@@ -876,13 +890,13 @@ impl Engine for Model {
                 Some(mk) => mk.concat(),
                 None => toks.iter().map(|t| t.id).collect(),
             };
-            if h.learn(&self.x.s, &self.x.mm, &ids)? {
-                m.graphs.clear();
+            if h.learn(&self.x.s, &self.x.mm, &ids).context("the draft head")? {
+                self.graphs.retain(|k| k.1.is_none());
             }
         }
         self.x.st.upload(&self.x.s, toks, out, marks)?;
         self.x.st.lora = self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]));
-        let key = (self.x.st.shape(), Attn::graph_key(&self.x.k.attn, &self.x.st), self.x.st.lora);
+        let key = ((self.x.st.shape(), Attn::graph_key(&self.x.k.attn, &self.x.st), self.x.st.lora), None);
         self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_step())
     }
 

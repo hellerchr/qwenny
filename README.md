@@ -67,6 +67,8 @@ context, or the longest one session can hold on the GPU if that is less), `--slo
 `--db=<file>` (where the password and keys are kept; default `~/.local/share/qwenny/qwenny.db`),
 `--adapter=[<name>=]<dir>` (a LoRA served beside the base model under `<name>`; default the directory's name, or its
 parent's for `qwenny train`'s `runs/<data>-N/adapter`).
+`QWENNY_CACHE_MEM=<GiB>` (environment, every command) caps the device memory of the slots' caches; by default they
+take what is free after loading, less 512 MiB for CUDA graphs and the driver (a GPU shared with other work: set it).
 
 **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`. Request fields: `model`,
 `messages`,
@@ -116,8 +118,9 @@ with a token budget). `GET /v1/decisions/presets` lists the presets; `examples/`
 layout, dequantized to f16 as `(q - z) * scale`. Activations are f32, the KV cache int8 with an f32 scale per position
 and head. Matrix products use tensor cores (`mma.m16n8k16`, f16 inputs, f32 accumulation). A step processes up to
 2,048 tokens from any mix of requests (prompt chunks, decode tokens, drafts); steps of up to 32 tokens are replayed as
-CUDA graphs. Sampling (repetition and presence penalty, temperature, top-k, top-p) runs on the GPU. Prompts are built
-from the model's `chat_template.jinja` and `tokenizer.json`.
+CUDA graphs (the least recently used go when the device memory the caches leave runs short; a step without room for
+its graph launches its kernels directly). Sampling (repetition and presence penalty, temperature, top-k, top-p) runs on
+the GPU. Prompts are built from the model's `chat_template.jinja` and `tokenizer.json`.
 
 **LoRA adapters** are served unmerged, so one server answers the base model and the adapter side by side, in the same
 steps: the base matrices stay as stored (int4, int8, 16-bit) and every adapted product adds alpha / r · B (A x) for

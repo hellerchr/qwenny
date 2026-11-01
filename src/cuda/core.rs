@@ -553,9 +553,12 @@ impl Gemm {
 
 impl Gemm {
     /// Write the stored rows `rows` (16 of them) of `q` as the 16-row block `block` of a Marlin matrix from
-    /// Mat::marlin_rows (a draft head learning a row; its quantization, `zeros` its zero points), counting it as valid
-    pub fn put_block(&self, s: &Arc<CudaStream>, m: &mut Mat, q: &Quant, zeros: &[u8], block: usize, rows: &[usize])
-    -> Result<()> {
+    /// Mat::marlin_rows (a draft head learning a row; its quantization, `zeros` its zero points), counting it as valid.
+    /// `stage`: device buffers of block_stage's sizes the block goes through (allocated once: no device memory is
+    /// taken while serving)
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_block(&self, s: &Arc<CudaStream>, m: &mut Mat, q: &Quant, zeros: &[u8], block: usize, rows: &[usize],
+                     stage: &mut (CudaSlice<u32>, CudaSlice<u16>)) -> Result<()> {
         let mk = self.1.as_ref().context("a Marlin matrix in a module without Marlin's kernels")?;
         let (n, k, groups) = (m.tiles * 16, q.cols, q.cols / QG);
         ensure!(rows.len() == 16 && (block + 1) * 16 <= n && k == m.cols, "block {block} of a matrix of {n} rows");
@@ -586,14 +589,23 @@ impl Gemm {
                 }
             }
         }
-        let (wd, sd) = (s.clone_htod(&w)?, s.clone_htod(&sc)?);
+        ensure!(stage.0.len() >= w.len() && stage.1.len() >= sc.len(), "a staging buffer too small for a block");
+        s.memcpy_htod(&w, &mut stage.0.slice_mut(0..w.len()))?;
+        s.memcpy_htod(&sc, &mut stage.1.slice_mut(0..sc.len()))?;
+        let (wd, sd) = (&stage.0, &stage.1);
         let (ni, c64, bi, gi, ti) = (n as i32, (block / 4) as i32, blk as i32, groups as i32, tables as i32);
         unsafe {
-            s.launch_builder(&mk.put).arg(&m.w).arg(&m.s).arg(&wd).arg(&sd).arg(&ni).arg(&c64).arg(&bi).arg(&gi).arg(&ti)
+            s.launch_builder(&mk.put).arg(&m.w).arg(&m.s).arg(wd).arg(sd).arg(&ni).arg(&c64).arg(&bi).arg(&gi).arg(&ti)
                 .launch(cfg((k / 16, 1, 1), 32))?;
         }
         m.valid = m.valid.max((block + 1) * 16);
         Ok(())
+    }
+
+    /// The staging buffers put_block needs for blocks of matrix `m` (packed words, scales and zero points)
+    pub fn block_stage(s: &Arc<CudaStream>, m: &Mat) -> Result<(CudaSlice<u32>, CudaSlice<u16>)> {
+        let tables = if m.wt == Wt::MarlinZ { 2 } else { 1 };
+        Ok((s.alloc_zeros(m.cols / 16 * 32)?, s.alloc_zeros(tables * m.cols / QG * 16)?))
     }
 }
 
@@ -940,36 +952,131 @@ impl Step {
     }
 }
 
-/// CUDA graphs of decode-sized steps (up to GRAPH_TOK tokens), one per key.
-pub struct Graphs<K>(RefCell<HashMap<K, CudaGraph>>);
+/// Device memory outside the cache pool (vmm::Pool) that the CUDA graphs leave free: the driver's own needs (page
+/// tables of the pages mapped, a kernel's first local memory) come from there too. Below half of it, free pages of
+/// the pool go back to the driver.
+const GRAPH_FLOOR: usize = 128 << 20;
 
-impl<K: Hash + Eq> Graphs<K> {
-    pub fn new() -> Self {
-        Graphs(RefCell::new(HashMap::new()))
+/// CUDA graphs of decode-sized steps (up to GRAPH_TOK tokens), one per key. Their memory comes from what the cache
+/// pool leaves (qwen::PAGE_RESERVE), and the keys are many (step shapes, key splits, the MTP's steps). The driver
+/// keeps the memory of a graph dropped for the next ones (the free memory does not grow back), so the cache holds at
+/// most `cap` graphs: unbounded until less than GRAPH_FLOOR is free when a new one is captured, then the graphs kept
+/// at that point, lowered whenever the free memory falls further; the least recently used go. A step whose graph does not fit even
+/// then launches its kernels directly: the same kernels, the same results.
+pub struct Graphs<K> {
+    cache: RefCell<GraphCache<K>>,
+    pool: Option<Arc<crate::cuda::vmm::Pool>>,
+}
+
+struct GraphCache<K> {
+    /// per key: the graph and when it last ran
+    graphs: HashMap<K, (CudaGraph, u64)>,
+    tick: u64,
+    cap: usize,
+    /// the free device memory when the cap was last set
+    low: usize,
+}
+
+/// Whether a CUDA error is the device running out of memory
+fn oom(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<cudarc::driver::DriverError>().is_some_and(|d| d.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY)
+}
+
+impl<K: Hash + Eq + Clone> Graphs<K> {
+    /// `pool`: the cache pool whose free pages go back to the driver when device memory outside it runs short
+    pub fn new(pool: Option<Arc<crate::cuda::vmm::Pool>>) -> Self {
+        Graphs { cache: RefCell::new(GraphCache { graphs: HashMap::new(), tick: 0, cap: usize::MAX, low: usize::MAX }), pool }
     }
 
-    /// Drop the captured graphs (their kernels' arguments changed)
-    pub fn clear(&self) {
-        self.0.borrow_mut().clear();
+    /// Drop the captured graphs whose keys `keep` refuses (their kernels' arguments changed)
+    pub fn retain(&self, keep: impl Fn(&K) -> bool) {
+        self.cache.borrow_mut().graphs.retain(|k, _| keep(k));
     }
 
     /// Run a step of `n` tokens: replay its graph (captured from `launch` on first use), or launch a larger one directly.
-    pub fn run(&self, s: &Arc<CudaStream>, n: usize, key: K, launch: impl FnOnce() -> Result<()>) -> Result<()> {
+    pub fn run(&self, s: &Arc<CudaStream>, n: usize, key: K, launch: impl Fn() -> Result<()>) -> Result<()> {
         if n > GRAPH_TOK {
             return launch();
         }
-        let mut graphs = self.0.borrow_mut();
-        let graph = match graphs.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
-                let launched = launch();
-                let graph = s.end_capture(sys::CUgraphInstantiate_flags(0))?;
-                launched?;
-                e.insert(graph.context("empty graph")?)
+        let mut c = self.cache.borrow_mut();
+        c.tick += 1;
+        let tick = c.tick;
+        if let Some(g) = c.graphs.get_mut(&key) {
+            g.1 = tick;
+            return Ok(g.0.launch().context("replaying a CUDA graph")?);
+        }
+        self.make_room(s, &mut c)?;
+        let captured = (|| -> Result<CudaGraph> {
+            s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
+            let launched = launch();
+            let graph = s.end_capture(sys::CUgraphInstantiate_flags(0));
+            launched?;
+            let graph = graph?.context("empty graph")?;
+            graph.launch()?;
+            Ok(graph)
+        })();
+        match captured {
+            Ok(g) => {
+                c.graphs.insert(key, (g, tick));
+                Ok(())
             }
-        };
-        graph.launch()?;
+            // no memory for the graph (nothing of the step ran): fewer graphs from now on, this step without one
+            Err(e) if oom(&e) => {
+                let cap = c.graphs.len() * 3 / 4;
+                eprintln!("graphs: no device memory for a new CUDA graph ({} MiB free): {cap} kept of {}, a step of {n} \
+                           tokens runs without one", free_mem()? >> 20, c.graphs.len());
+                c.cap = cap;
+                Self::evict(s, &mut c)?;
+                launch()
+            }
+            Err(e) => Err(e.context(format!("capturing the CUDA graph of a step of {n} tokens"))),
+        }
+    }
+
+    /// Before a new graph: room for it within the cap (lowered when device memory is short), the least recently used
+    /// going; free pages of the pool back to the driver when it is shorter still
+    fn make_room(&self, s: &Arc<CudaStream>, c: &mut GraphCache<K>) -> Result<()> {
+        let free = free_mem()?;
+        if free < GRAPH_FLOOR.min(c.low) && !c.graphs.is_empty() {
+            let n = c.cap.min(c.graphs.len());
+            let cap = if c.cap == usize::MAX { n } else { n - n / 16 };
+            c.low = free;
+            eprintln!("graphs: {} MiB of device memory free outside the cache: at most {cap} CUDA graphs kept (of {})",
+                      free >> 20, c.graphs.len());
+            c.cap = cap;
+        }
+        if c.graphs.len() >= c.cap {
+            c.cap = c.cap.max(1);
+            Self::evict(s, c)?;
+        }
+        if free < GRAPH_FLOOR / 2 && let Some(p) = &self.pool {
+            let pages = p.release((GRAPH_FLOOR - free).div_ceil(p.page()))?;
+            if pages > 0 {
+                eprintln!("cache: {pages} free pages of {} MiB back to the driver ({} MiB of device memory free outside \
+                           the cache)", p.page() >> 20, free >> 20);
+            }
+        }
         Ok(())
     }
+
+    /// The least recently used graphs go until fewer than `cap` are kept
+    fn evict(s: &Arc<CudaStream>, c: &mut GraphCache<K>) -> Result<()> {
+        if c.graphs.len() < c.cap {
+            return Ok(());
+        }
+        // (they may still run)
+        s.synchronize()?;
+        let mut by_age: Vec<(u64, K)> = c.graphs.iter().map(|(k, g)| (g.1, k.clone())).collect();
+        by_age.sort_unstable_by_key(|a| a.0);
+        let n = c.graphs.len() + 1 - c.cap.max(1);
+        for (_, k) in by_age.into_iter().take(n) {
+            c.graphs.remove(&k);
+        }
+        Ok(())
+    }
+}
+
+/// Free device memory now
+fn free_mem() -> Result<usize> {
+    Ok(cudarc::driver::result::mem_get_info()?.0)
 }

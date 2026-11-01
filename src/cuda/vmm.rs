@@ -63,6 +63,20 @@ impl Pool {
         Ok(())
     }
 
+    /// Give up to `n` free pages back to the driver, the budget lowered by as many (device memory short outside the
+    /// pool); the pages given
+    pub fn release(&self, n: usize) -> Result<usize> {
+        let mut p = self.inner.lock().unwrap();
+        let k = n.min(p.free.len());
+        for _ in 0..k {
+            let h = p.free.pop().unwrap();
+            check(unsafe { sys::cuMemRelease(h) }, "cuMemRelease")?;
+            p.made -= 1;
+            p.budget -= 1;
+        }
+        Ok(k)
+    }
+
     /// Pages in use (mapped) and the budget
     pub fn usage(&self) -> (usize, usize) {
         let p = self.inner.lock().unwrap();
