@@ -1,0 +1,250 @@
+#!/bin/bash
+# The correctness checks against references from the originals (PyTorch + PEFT, Transformers, TRL / Unsloth's masks),
+# with a pass criterion each, after `cargo test`: OK / FAIL per check, exit status 1 if any failed.
+#
+#   tools/checks.sh changed          the areas the uncommitted changes touch (git diff HEAD); see `areas_of`
+#   tools/checks.sh <area>...        qwen-train qwen-train-27b chat qwen-infer, or all (all but qwen-train-27b)
+#   --make                           make missing references (else a missing one is a FAIL that prints its command)
+#
+# qwen-train-27b runs on the RTX 3090 VM only (the 27B needs 24 GB): tools/vm.sh tools/checks.sh qwen-train-27b, after
+# asking whoever uses the 3090. Every other area runs on the local GPU. Python: QWENNY_PY (default the venv below).
+set -uo pipefail
+cd "$(dirname "$0")/.."
+BIN=${QWENNY_BIN:-target/release/qwenny}
+PY=${QWENNY_PY:-$HOME/.cache/qwenny/venv/bin/python}
+[ -x "$PY" ] || PY=$HOME/ft/.venv/bin/python   # the VM's venv (Transformers, PEFT)
+MAKE=0
+FAILS=()
+
+# --- references: where each lives and the command that makes it ---------------------------------------------------
+QREF=$HOME/.cache/qwen-engine/ref      # Qwen3.5-4B
+VREF=$HOME/qref                        # Qwen3.8-27B (VM)
+FJ=$HOME/.cache/qwenny/fjordhaus-data/data   # Fjordhaus train.jsonl / dev.jsonl
+Q27=/opt/qwen38/models/Qwen3.8-27B-W4A16-AutoRound
+W4A16=RedHatAI/Qwen3.5-4B-quantized.w4a16
+
+snapshot() { "$PY" -c "from huggingface_hub import snapshot_download as s; print(s('$1', local_files_only=True))"; }
+
+# make_ref <file>: the command that makes reference <file>
+make_ref() {
+    case $1 in
+        $QREF/train-grads-4l.safetensors) echo "$PY tools/make_train_reference.py grads Qwen/Qwen3.5-4B $FJ $1 3 4" ;;
+        $QREF/train-grads-4l-w4a16.safetensors)
+            echo "$PY tools/make_train_reference.py grads \$(snapshot $W4A16) $FJ $1 3 4 --weights=\$(snapshot $W4A16)" ;;
+        $QREF/data-ref.safetensors) echo "$PY tools/make_train_reference.py data Qwen/Qwen3.5-4B $FJ $1" ;;
+        $QREF/reference.safetensors) echo "$PY tools/make_reference_qwen.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
+        $QREF/mtp-ref.safetensors) echo "$PY tools/make_reference_mtp.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
+        $VREF/train-grads-27b-4l.safetensors) echo "$PY tools/make_train_reference.py grads $Q27 $FJ $1 3 4 --weights=$Q27" ;;
+        *) echo "no recipe for $1" ;;
+    esac
+}
+
+# need <file>: the reference exists (made with --make), else a FAIL with its recipe
+need() {
+    [ -e "$1" ] && return 0
+    local cmd; cmd=$(make_ref "$1")
+    if [ $MAKE = 1 ]; then
+        echo "making $1: $cmd"
+        mkdir -p "$(dirname "$1")"
+        eval "$cmd" && [ -e "$1" ] && return 0
+    fi
+    fail "missing reference $1 — make it with: $cmd   (or rerun with --make)"
+    return 1
+}
+
+ok() { echo "OK    $*"; }
+fail() { echo "FAIL  $*"; FAILS+=("$*"); }
+
+# --- checks ---------------------------------------------------------------------------------------------------------
+
+# traincheck <name> <reference> <max worst relative error> <args...>: loss, LoRA gradients, AdamW vs. PEFT fp32
+traincheck() {
+    local name=$1 ref=$2 max=$3; shift 3
+    need "$ref" || return
+    local out; out=$($BIN traincheck "$ref" --packed "$@" 2>&1)
+    local err cos; err=$(grep -oP 'gradients of \d+ tensors: worst relative error \K[0-9.e+-]+' <<<"$out")
+    cos=$(grep -oP 'lowest cosine \K[0-9.]+' <<<"$out")
+    if [ -n "$err" ] && awk -v e="$err" -v m="$max" 'BEGIN { exit !(e < m) }'; then
+        ok "traincheck $name: worst gradient error $err (< $max), cosine $cos"
+    else
+        fail "traincheck $name: worst gradient error ${err:-?} (limit $max): $(grep -E '^(loss|Error)' <<<"$out" | head -2)"
+    fi
+}
+
+# datacheck <name> <reference> <args...>: token ids and loss masks identical to TRL's / Unsloth's for every example
+datacheck() {
+    local name=$1 ref=$2; shift 2
+    need "$ref" || return
+    local out; out=$($BIN datacheck "$FJ" "$ref" "$@" 2>&1)
+    if awk '/examples: ids identical/ { n = $2; a = $7; b = $11; sub(/,/, "", a); if (a != n || b != n) bad = 1; seen = 1 }
+            END { exit !(seen && !bad) }' <<<"$out"; then
+        ok "datacheck $name: $(grep -E '^(train|dev): ' <<<"$out" | tr '\n' ' ')"
+    else
+        fail "datacheck $name: $(grep -E '^(train|dev): |Error' <<<"$out" | tr '\n' ' ')"
+    fi
+}
+
+# logits <name> <reference> <max mean |diff| per prompt> <args...>: logits vs. Transformers fp32 (qwenny check)
+logits() {
+    local name=$1 ref=$2 max=$3; shift 3
+    need "$ref" || return
+    local out; out=$($BIN check "$ref" "$@" 2>&1)
+    local worst; worst=$(grep -oP 'mean \K[0-9.]+' <<<"$out" | sort -g | tail -1)
+    if [ -n "$worst" ] && awk -v e="$worst" -v m="$max" 'BEGIN { exit !(e < m) }'; then
+        ok "check $name: mean |logit diff| at most $worst per prompt (< $max)"
+    else
+        fail "check $name: mean |logit diff| ${worst:-?} (limit $max): $(grep -E 'Error' <<<"$out" | head -1)"
+    fi
+}
+
+# layercheck <layer>: one Qwen layer's mixer vs. Transformers (max |diff| below 0.05)
+layercheck() {
+    local ref=$QREF/reference.safetensors
+    need "$ref" || return
+    local out; out=$($BIN layercheck "$ref" --model=Qwen/Qwen3.5-4B --layer="$1" 2>&1)
+    local worst; worst=$(grep -oP 'max \|diff\| \K[0-9.]+' <<<"$out" | sort -g | tail -1)
+    if [ -n "$worst" ] && awk -v e="$worst" 'BEGIN { exit !(e < 0.05) }'; then
+        ok "layercheck $1: max |diff| $worst (< 0.05)"
+    else
+        fail "layercheck $1: max |diff| ${worst:-?}: $(grep Error <<<"$out" | head -1)"
+    fi
+}
+
+# chatcheck <tokref> <args...>: chat template and tokenizer vs. Transformers, every case identical
+chatcheck() {
+    local out; out=$($BIN chatcheck "$1" "${@:2}" 2>&1)
+    local line; line=$(grep -E 'cases identical' <<<"$out")
+    if [[ $line =~ ^([0-9]+)/([0-9]+) ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
+        ok "chatcheck $1: $line"
+    else
+        fail "chatcheck $1: ${line:-$(tail -1 <<<"$out")}"
+    fi
+}
+
+# tokcheck: prompt tokens identical to Transformers' (the reference's first two prompts)
+tokcheck() {
+    local ref=$QREF/reference.safetensors
+    need "$ref" || return
+    local out; out=$($BIN tokcheck "$ref" "$FJ/dev.jsonl" --model=Qwen/Qwen3.5-4B 2>&1)
+    if grep -q identical <<<"$out" && ! grep -qE 'DIFFERENT|Error' <<<"$out"; then
+        ok "tokcheck: $(grep -c identical <<<"$out") prompts identical"
+    else
+        fail "tokcheck: $(grep -E 'DIFFERENT|Error' <<<"$out" | head -2)"
+    fi
+}
+
+# speccheck <options>: drafts (the model's draft layer) give the tokens of one token per step
+speccheck() {
+    local out
+    out=$($BIN speccheck "$@" 2>&1)
+    if grep -q 'tokens as one token per step' <<<"$out" && ! grep -qP 'first (\d+)/(?!\1 )\d+ tokens' <<<"$out"; then
+        ok "speccheck $*: drafts give the same tokens as one token per step"
+    else
+        fail "speccheck $*: $(grep -E 'first|Error' <<<"$out" | head -2 | tr '\n' ' ')"
+    fi
+}
+
+# Self-checks of the engine against its own reference paths (no files): sampler draw for draw, long contexts (16-bit)
+# at every position
+selfchecks() {
+    local out
+    out=$($BIN samplecheck "$@" 2>&1)
+    if grep -q 'draws agree' <<<"$out" && grep -q '^sampled drafts' <<<"$out" && ! grep -qP '(?<!\d)(\d+)/(?!\1 )\d+ draws agree' <<<"$out" && ! grep -q Error <<<"$out"; then
+        ok "samplecheck $*: every draw agrees ($(grep -oP 'total variation \K[0-9.]+' <<<"$out" | sort -g | tail -1 | sed 's/^/max total variation of drafts /'))"
+    else
+        fail "samplecheck $*: $(grep -E 'Error' <<<"$out" | head -1) $(grep -P '(?<!\d)(\d+)/(?!\1 )\d+ draws agree' <<<"$out" | head -1)"
+    fi
+    # the logits of the last 64 positions agree up to rounding (an argmax may flip where two logits nearly tie: the 4B
+    # has one at 1,500 tokens, 0.026 apart)
+    out=$($BIN longcheck --bf16 "$@" 2>&1)
+    local worst; worst=$(grep -oP 'max \|logit diff\| \K[0-9.]+' <<<"$out" | sort -g | tail -1)
+    if [ "$(grep -c 'argmax agrees' <<<"$out")" = 3 ] && awk -v e="$worst" 'BEGIN { exit !(e < 0.1) }'; then
+        ok "longcheck --bf16 $*: max |logit diff| $worst (< 0.1) at every context length, argmax $(grep -oP 'agrees at \K\d+/64' <<<"$out" | tr '\n' ' ')"
+    else
+        fail "longcheck --bf16 $*: $(grep -E 'agrees|Error' <<<"$out" | tr '\n' ' ')"
+    fi
+}
+
+# sessions <command> <pass line> <args...>: a slot saved, loaded or moved to host memory continues with the logits
+# and tokens it has when it never leaves its slot (cachecheck, swapcheck)
+sessions() {
+    local cmd=$1 want=$2; shift 2
+    local out; out=$($BIN "$cmd" "$@" 2>&1)
+    if grep -qF "$want" <<<"$out"; then
+        ok "$cmd $*: $want"
+    else
+        fail "$cmd $*: $(grep -E 'MISMATCH|Error|diff' <<<"$out" | head -2 | tr '\n' ' ')"
+    fi
+}
+
+# --- areas ----------------------------------------------------------------------------------------------------------
+
+area() {
+    echo "== $1"
+    case $1 in
+        qwen-train)
+            traincheck "Qwen3.5-4B f32" "$QREF/train-grads-4l.safetensors" 1e-4 --model=Qwen/Qwen3.5-4B --precision=f32
+            traincheck "Qwen3.5-4B f16" "$QREF/train-grads-4l.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --precision=f16
+            traincheck "Qwen3.5-4B int4 f32" "$QREF/train-grads-4l-w4a16.safetensors" 1e-4 --model=$W4A16 --precision=f32
+            datacheck "Qwen (Unsloth's masks)" "$QREF/data-ref.safetensors" --model=Qwen/Qwen3.5-4B ;;
+        qwen-train-27b)
+            traincheck "Qwen3.8-27B int4 f32" "$VREF/train-grads-27b-4l.safetensors" 1e-4 --model=$Q27 --precision=f32
+            traincheck "Qwen3.8-27B int4 f16" "$VREF/train-grads-27b-4l.safetensors" 0.05 --model=$Q27 --precision=f16 ;;
+        chat)
+            chatcheck tools/tokref-qwen.json --model=Qwen/Qwen3.5-4B
+            tokcheck ;;
+        qwen-infer)
+            logits "Qwen3.5-4B int8" "$QREF/reference.safetensors" 0.12 --model=Qwen/Qwen3.5-4B
+            logits "Qwen3.5-4B 16-bit" "$QREF/reference.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --bf16
+            layercheck 0
+            layercheck 3
+            speccheck --model=Qwen/Qwen3.5-4B
+            selfchecks --model=Qwen/Qwen3.5-4B
+            sessions cachecheck "slots continue identically after save and load" --model=Qwen/Qwen3.5-4B
+            sessions swapcheck "sequences continue identically" --model=Qwen/Qwen3.5-4B --len=32768
+            if need "$QREF/mtp-ref.safetensors"; then   # no pass criterion yet: its result, to compare by eye
+                echo "INFO  mtpcheck: $($BIN mtpcheck "$QREF/mtp-ref.safetensors" --model=Qwen/Qwen3.5-4B 2>&1 | tail -1)"
+            fi ;;
+        *) fail "unknown area $1" ;;
+    esac
+}
+
+# areas_of <file>: the areas a changed file can break (the map AGENTS.md describes)
+areas_of() {
+    case $1 in
+        kernels/qwen_train.cu|kernels/train_common.cuh|src/cuda/qwen/train.rs|src/cuda/qwen/train/*|src/cuda/learn.rs\
+        |src/training.rs|src/lora.rs|tools/make_train_reference.py) echo qwen-train ;;
+        src/checkpoint.rs|build.rs|src/backend.rs|src/hub.rs|src/cuda/qwen/mod.rs) echo qwen-train qwen-infer ;;
+        src/chat.rs) echo chat qwen-train ;;
+        kernels/*|src/cuda/*|src/sample.rs|src/sessions.rs|src/checks.rs) echo qwen-infer ;;
+        tools/make_reference*.py|tools/make_tokref.py|tools/tokref-*.json) echo chat qwen-infer ;;
+    esac
+}
+
+args=()
+for a in "$@"; do
+    case $a in
+        --make) MAKE=1 ;;
+        all) args+=(qwen-train chat qwen-infer) ;;
+        changed)
+            files=$(git diff --name-only HEAD)
+            mapfile -t found < <(for f in $files; do areas_of "$f"; done | tr ' ' '\n' | grep . | sort -u)
+            [ ${#found[@]} -eq 0 ] && echo "the changes touch no checked area" && exit 0
+            echo "changed: $(echo $files | tr '\n' ' ')-> ${found[*]}"
+            if grep -qE '^(kernels/qwen_train.cu|src/cuda/qwen/(train|mod).rs|src/checkpoint.rs)$' <<<"$files"; then
+                echo "NOTE  these files reach the 27B too: also run tools/vm.sh tools/checks.sh qwen-train-27b (on the 3090)"
+            fi
+            args+=("${found[@]}") ;;
+        *) args+=("$a") ;;
+    esac
+done
+[ ${#args[@]} -eq 0 ] && { sed -n 2,10p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+cargo build --release 2>&1 | grep -E '^error' -A5 && { echo "FAIL  the build"; exit 1; }
+# the unit tests (CPU, seconds) with every run
+tests=$(cargo test --release 2>&1 | grep -E '^test result')
+if [ -n "$tests" ] && ! grep -qv '^test result: ok' <<<"$tests"; then ok "cargo test: $(grep -oP "\d+(?= passed)" <<<"$tests" | awk "{ s += \$1 } END { print s }") passed"
+else fail "cargo test: ${tests:-does not build}"; fi
+for a in "${args[@]}"; do area "$a"; done
+echo
+if [ ${#FAILS[@]} -eq 0 ]; then echo "all checks OK"; else echo "${#FAILS[@]} FAILED"; exit 1; fi

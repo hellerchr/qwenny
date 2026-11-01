@@ -1,0 +1,27 @@
+[package]
+name = "qwenny"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+debug = 1
+
+[dependencies]
+anyhow = "1"
+# the access database (auth.rs): admin password, API keys
+argon2 = "0.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+axum = "0.8"
+# hand-written CUDA kernels (nvcc at build time) and cuBLAS
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "fallback-dynamic-loading", "cuda-version-from-build-system"] }
+half = "2"
+hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
+memmap2 = "0.9"
+minijinja = { version = "3", features = ["json", "loop_controls", "preserve_order", "serde"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
+safetensors = "0.8"
+serde_json = { version = "1", features = ["preserve_order"] }
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio-stream = "0.1"

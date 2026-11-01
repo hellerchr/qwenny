@@ -1,0 +1,54 @@
+[
+  {
+    "name": "dringlichkeit",
+    "type": "score",
+    "question": "Wie dringend muss das Ticket bearbeitet werden?",
+    "options": [
+      "kann warten (in den nächsten Tagen)",
+      "diese Woche",
+      "heute",
+      "sofort"
+    ],
+    "threshold": 0.9,
+    "temperature": 1.0,
+    "user_template": "{ticket}",
+    "example": "Hallo, seit heute Morgen kann ich mich nicht mehr in mein Kundenkonto einloggen. Morgen läuft die Rückgabefrist für meine Bestellung FH-2231 ab und ich muss vorher den Rücksendeschein ausdrucken. Bitte helfen Sie mir schnell!"
+  },
+  {
+    "name": "zufriedenheit",
+    "type": "score",
+    "question": "Wie zufrieden ist der Kunde insgesamt?",
+    "options": [
+      "sehr unzufrieden",
+      "unzufrieden",
+      "teils, teils",
+      "zufrieden",
+      "sehr zufrieden"
+    ],
+    "threshold": 0.9,
+    "temperature": 1.0,
+    "user_template": "{ticket}",
+    "example": "Der Esstisch ist wirklich schön und stabil, genau wie auf den Fotos. Aber die Lieferung hat drei Wochen länger gedauert als angekündigt, und niemand hat sich bei mir gemeldet."
+  },
+  {
+    "name": "verärgerung",
+    "type": "score",
+    "question": "Wie verärgert ist der Kunde?",
+    "options": [
+      "völlig entspannt",
+      "freundlich und gelassen",
+      "leicht irritiert",
+      "etwas genervt",
+      "deutlich unzufrieden",
+      "verärgert",
+      "sehr verärgert",
+      "wütend",
+      "sehr wütend, droht mit Konsequenzen",
+      "außer sich vor Wut"
+    ],
+    "threshold": 0.9,
+    "temperature": 1.0,
+    "user_template": "{ticket}",
+    "example": "Zum dritten Mal schreibe ich Ihnen jetzt! Niemand antwortet. Wenn bis Freitag nichts passiert, storniere ich alles und schreibe eine schlechte Bewertung."
+  }
+]

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwenny · Log in</title>
+<style>
+  :root { --bg: #faf9f7; --fg: #1c1b19; --muted: #8a867e; --line: #e7e4de; --accent: #c2410c; --danger: #dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --fg: #ebe9e4; --muted: #8d8980; --line: #2a2926; --accent: #f97316; --danger: #ef4444; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg);
+         color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  form { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 14px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; }
+  h1 span { color: var(--accent); }
+  label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+  input { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+          padding: 10px 12px; }
+  input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent); outline-offset: 0; }
+  button { font: inherit; font-weight: 600; height: 42px; border: 0; border-radius: 12px; background: var(--fg);
+           color: var(--bg); cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #err { color: var(--danger); font-size: 14px; min-height: 1.5em; margin: 0; }
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>Qwenny<span>·</span></h1>
+  <label>Password <input id="pw" type="password" autocomplete="current-password" required autofocus></label>
+  <button id="go" type="submit">Log in</button>
+  <p id="err" role="alert"></p>
+</form>
+<script>
+const $ = (id) => document.getElementById(id);
+// no password set, or logged in already: the page itself
+fetch("/auth/state").then((r) => r.json()).then((st) => { if (st.logged_in || !st.password_set) location.href = "/"; }).catch(() => {});
+$("f").onsubmit = async (e) => {
+  e.preventDefault();
+  $("err").textContent = "";
+  $("go").disabled = true;
+  try {
+    const r = await fetch("/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ password: $("pw").value }) });
+    if (r.ok) { location.href = "/"; return; }
+    const d = await r.json().catch(() => ({}));
+    $("err").textContent = d.error?.message || "Login failed";
+  } catch { $("err").textContent = "The server is not reachable"; }
+  $("go").disabled = false; $("pw").select();
+};
+</script>
+</body>
+</html>

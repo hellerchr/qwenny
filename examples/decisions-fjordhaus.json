@@ -1,0 +1,63 @@
+[
+  {
+    "name": "fjordhaus-route",
+    "system": "Du bist der Kundenservice-Assistent von Fjordhaus, einem Online-Shop für Möbel und Wohnaccessoires. Beantworte die Anfrage im <ticket> ausschließlich auf Basis der Auszüge im <context>. Antworte in der Sprache des Kunden.",
+    "question": "Wie soll dieses Ticket weitergeleitet werden?",
+    "options": [
+      "Keine Eskalation: direkt beantworten",
+      "Eskalation an das Service-Team",
+      "Eskalation an Team Zahlungen",
+      "Eskalation an die Buchhaltung"
+    ],
+    "threshold": 0.9,
+    "temperature": 1.0,
+    "user_template": "<ticket>\n{ticket}\n</ticket>\n<context>\n{context}\n</context>",
+    "example": "Ich möchte mit einem echten Mitarbeiter sprechen, bitte. Kein Bot.",
+    "example_context": "[1] Bewertungen: Kunden können gekaufte Artikel unter „Mein Konto > Bestellungen > Bewerten“ bewerten (1–5 Sterne, Text, Fotos). Feedback zum Service an feedback@fjordhaus.de. Bewertungen werden innerhalb von 3 Werktagen geprüft und veröffentlicht.\n[2] Menschlicher Ansprechpartner: Wünscht ein Kunde ausdrücklich einen Mitarbeiter, wird das Gespräch an das Service-Team übergeben (Eskalation). Während der Telefonzeiten im Chat in der Regel innerhalb von 10 Minuten, sonst am nächsten Werktag per E-Mail.\n[3] Versandoptionen: Standardversand 4,95 €, ab 50 € Bestellwert kostenlos. Expressversand (1–2 Werktage, nur Paketware, nur Deutschland) 9,95 €. Speditionslieferung bis hinter die erste Tür 39 €, mit Aufbau 89 €. Lieferung nur nach DE, AT, CH, BE, NL, LU.\n[4] Kundenservice-Kontakt: Chat und E-Mail (service@fjordhaus.de) rund um die Uhr, Antwort innerhalb von 24 Stunden. Telefon 040 1234 5678, Mo–Fr 8–18 Uhr, Sa 9–14 Uhr. Kein Service an Sonn- und Feiertagen."
+  },
+  {
+    "name": "fjordhaus-intent",
+    "system": "Du bist der Kundenservice-Assistent von Fjordhaus, einem Online-Shop für Möbel und Wohnaccessoires. Beantworte die Anfrage im <ticket> ausschließlich auf Basis der Auszüge im <context>. Antworte in der Sprache des Kunden.",
+    "question": "Welches Anliegen hat der Kunde?",
+    "options": [
+      "cancel_order",
+      "change_order",
+      "change_shipping_address",
+      "check_cancellation_fee",
+      "check_invoice",
+      "check_payment_methods",
+      "check_refund_policy",
+      "complaint",
+      "contact_customer_service",
+      "contact_human_agent",
+      "create_account",
+      "delete_account",
+      "delivery_options",
+      "delivery_period",
+      "edit_account",
+      "get_invoice",
+      "get_refund",
+      "hard:angry",
+      "hard:injection",
+      "hard:missing_info",
+      "hard:multi_issue",
+      "hard:out_of_scope",
+      "hard:policy_exception",
+      "newsletter_subscription",
+      "payment_issue",
+      "place_order",
+      "recover_password",
+      "registration_problems",
+      "review",
+      "set_up_shipping_address",
+      "switch_account",
+      "track_order",
+      "track_refund"
+    ],
+    "threshold": 0.8,
+    "temperature": 1.0,
+    "user_template": "<ticket>\n{ticket}\n</ticket>\n<context>\n{context}\n</context>",
+    "example": "Ich möchte mit einem echten Mitarbeiter sprechen, bitte. Kein Bot.",
+    "example_context": "[1] Bewertungen: Kunden können gekaufte Artikel unter „Mein Konto > Bestellungen > Bewerten“ bewerten (1–5 Sterne, Text, Fotos). Feedback zum Service an feedback@fjordhaus.de. Bewertungen werden innerhalb von 3 Werktagen geprüft und veröffentlicht.\n[2] Menschlicher Ansprechpartner: Wünscht ein Kunde ausdrücklich einen Mitarbeiter, wird das Gespräch an das Service-Team übergeben (Eskalation). Während der Telefonzeiten im Chat in der Regel innerhalb von 10 Minuten, sonst am nächsten Werktag per E-Mail.\n[3] Versandoptionen: Standardversand 4,95 €, ab 50 € Bestellwert kostenlos. Expressversand (1–2 Werktage, nur Paketware, nur Deutschland) 9,95 €. Speditionslieferung bis hinter die erste Tür 39 €, mit Aufbau 89 €. Lieferung nur nach DE, AT, CH, BE, NL, LU.\n[4] Kundenservice-Kontakt: Chat und E-Mail (service@fjordhaus.de) rund um die Uhr, Antwort innerhalb von 24 Stunden. Telefon 040 1234 5678, Mo–Fr 8–18 Uhr, Sa 9–14 Uhr. Kein Service an Sonn- und Feiertagen."
+  }
+]
