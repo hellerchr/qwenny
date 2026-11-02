@@ -140,6 +140,7 @@ impl Mat {
     /// of 256): the rest are room for later rows (Gemm::put_block), not `valid`, and their outputs do not count
     /// (`zeros`: its zero points, Quant::zero_points)
     pub fn marlin_rows(s: &Arc<CudaStream>, q: &Quant, zeros: &[u8], rows: &[usize], cap: usize) -> Result<Self> {
+        ensure!(q.bits == 4, "Marlin packs int4 matrices, not {}-bit ones", q.bits);
         ensure!(rows.len() % 16 == 0 && cap % 256 == 0 && rows.len() <= cap && !rows.is_empty(),
                 "{} rows (room for {cap})", rows.len());
         let sym = zeros.iter().all(|&z| z == 8);

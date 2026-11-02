@@ -131,6 +131,12 @@ impl DraftHead {
             return Ok(None);
         }
         let q = w.quant_matrix("lm_head")?;
+        // the head's tiles are Marlin int4 (learned rows are repacked in place): another width (AutoRound's 8-bit
+        // lm_head) drafts over the whole output layer instead, as stored
+        if q.bits != 4 {
+            eprintln!("draft head: lm_head is stored in {} bits, not int4: drafts read the whole output layer", q.bits);
+            return Ok(None);
+        }
         let Some(zeros) = q.zero_points() else { return Ok(None) };
         let path = saved_path(dir);
         let (mut ids, mut score) = path.as_deref().and_then(|p| read_saved(p, vocab)).unwrap_or_default();
