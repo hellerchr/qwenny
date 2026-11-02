@@ -327,16 +327,19 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     if train_ex.len() < 500 {
         println!("note: {} training examples; 500 to 5,000 are the usual advice", train_ex.len());
     }
-    // a busy GPU: halve the micro-batch (the same gradients, accumulated over more passes) until it fits
+    // short of GPU memory: a smaller micro-batch (the same gradients, accumulated over more passes) until it fits:
+    // half, but not below the longest example (rounded up to 256 tokens: a micro-batch holds at least one whole row)
     let mut o = o;
+    let floor = lmax.max(512).div_ceil(256) * 256;
     let mut tr = loop {
         match Trainer::new(model, o.clone(), o.micro_tokens.max(lmax), lmax, SEED) {
             Ok(t) => break t,
             Err(e) if crate::engine::out_of_memory(&e) => {
                 let (free, all) = mem_gib();
-                ensure!(o.micro_tokens / 2 >= lmax.max(512), "GPU out of memory ({free:.1} of {all:.1} GiB free, \
-                        --micro-tokens={}): other programs hold GPU memory (nvidia-smi lists them)", o.micro_tokens);
-                o.micro_tokens /= 2;
+                ensure!(o.micro_tokens > floor, "GPU out of memory ({free:.1} of {all:.1} GiB free) with micro-batches \
+                        of {} tokens, the least that holds the longest example ({lmax} tokens): a lower --max-len, or \
+                        free the GPU (nvidia-smi lists what holds it)", o.micro_tokens);
+                o.micro_tokens = (o.micro_tokens / 2).max(floor);
                 println!("GPU memory short ({free:.1} GiB free): --micro-tokens={} (same result, a little slower)", o.micro_tokens);
             }
             Err(e) => return Err(e),
