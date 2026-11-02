@@ -78,7 +78,8 @@ fn read_rows(path: &Path) -> Result<Vec<(usize, String)>> {
     Ok(text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()).map(|(i, l)| (i + 1, l.to_string())).collect())
 }
 
-/// Rows `{"messages": [...]}` rendered without thinking, at most `max_len` tokens; `name` names the
+/// Rows `{"messages": [...]}` rendered without thinking (a row's `chat_template_kwargs` override that, e.g. a
+/// thinking row with `{"enable_thinking": true, "reasoning_effort": "low"}`), at most `max_len` tokens; `name` names the
 /// file in messages. A row that is not JSON, has no messages or no assistant reply is an error.
 fn encode_rows(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str) -> Result<Vec<Example>> {
     let kwargs = json!({"enable_thinking": false}).as_object().unwrap().clone();
@@ -95,7 +96,15 @@ fn encode_rows(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str
             no_reply.push(*line);
             continue;
         }
-        let (mut ids, mut mask) = chat.encode_train(&row["messages"], &kwargs).with_context(|| format!("{name}:{line}"))?;
+        // a row's own chat_template_kwargs (e.g. {"enable_thinking": true, "reasoning_effort": "low"}: the system
+        // prompt then carries the effort's instruction, as the server renders such a request) over the default
+        let mut kw = kwargs.clone();
+        match &row["chat_template_kwargs"] {
+            Json::Null => {}
+            Json::Object(o) => kw.extend(o.iter().map(|(k, v)| (k.clone(), v.clone()))),
+            _ => bail!("{name}:{line}: chat_template_kwargs is not an object"),
+        }
+        let (mut ids, mut mask) = chat.encode_train(&row["messages"], &kw).with_context(|| format!("{name}:{line}"))?;
         if ids.len() > max_len {
             cut.push(*line);
             ids.truncate(max_len);

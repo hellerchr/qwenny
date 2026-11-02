@@ -152,7 +152,9 @@ them in one step.
 
 **Training.** LoRA on all linear layers of the language model, as Unsloth's `get_peft_model`, with Unsloth's
 `train_on_responses_only` loss mask. Output: `adapter/` (PEFT format), `train_log.jsonl` and `summary.json` under
-`runs/<data>-N`. The dev loss is measured every half epoch; the adapter with the lowest dev loss is kept, and training
+`runs/<data>-N`. Rows render without thinking; a row's `"chat_template_kwargs"` (e.g. `{"enable_thinking": true,
+"reasoning_effort": "low"}` with the assistant message's `reasoning_content`) renders it as a request with those
+settings would be. The dev loss is measured every half epoch; the adapter with the lowest dev loss is kept, and training
 stops after two measurements without improvement (without `dev.jsonl`, 5 % of `train.jsonl` is held out). Options:
 `--epochs=3`, `--batch=8`, `--lr=2e-4`, `--rank=16`, `--alpha=32`, `--dropout=0.05`, `--max-len=4096`,
 `--precision=f16` (or `bf16`, `f32`). Each layer's backward pass recomputes its forward pass; frozen weights stay in
