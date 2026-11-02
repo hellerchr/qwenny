@@ -57,8 +57,10 @@ tools/checks.sh mlx                         # the MLX backend (builds with --fea
   and adaptercheck: adapter and base requests in the same steps; layercheck of layers 0 and 3, speccheck with MTP,
   samplecheck with sampled drafts, longcheck, cachecheck, swapcheck, mtpcheck as INFO), `chat` (template and tokenizer
   vs. Transformers), `qwen-train` (LoRA gradients vs. PEFT for bf16 and int4, Unsloth's masks), `qwen-train-27b`,
-  `mlx` (the MLX backend: logits vs. Transformers, and `tools/backend_diff.py`: CUDA and MLX servers give
-  byte-identical replies to the same requests). `areas_of` in the script maps changed files to areas.
+  `mlx` (the MLX backend: logits vs. Transformers, and vs. CUDA's on the same prompts within a bound (`check
+  --write` makes CUDA's into a reference), speccheck for DeltaNet rollback; `tools/backend_diff.py`, whether CUDA and
+  MLX servers reply byte for byte alike, as INFO: the backends round differently, so sampled replies can split at a
+  near-tie). `areas_of` in the script maps changed files to areas.
 - Correctness is tested on the 4B: everything but `qwen-train-27b` runs on `Qwen/Qwen3.5-4B` (bf16, int8 and
   16-bit) and `RedHatAI/Qwen3.5-4B-quantized.w4a16` (int4), from the Hugging Face cache.
 - `QWENNY_BIN` and `QWENNY_PY` override the binary and the Python.
@@ -181,5 +183,7 @@ The page is at `http://192.168.31.153:18024/`. A restart reloads the 27B and tak
 - `src/checkpoint.rs`, `src/hub.rs`: loading weights (formats, quantization), Hugging Face downloads.
 - `src/checks.rs`: the checks and `bench`.
 - `src/mlx/`: the MLX backend (`--backend=mlx`; Metal on macOS, MLX's CUDA backend on Linux with `--features mlx`,
-  through `vendor/mlx-sys`): the model as MLX operations, inference only (no MTP drafts, adapters, training or saved
-  sessions).
+  through `vendor/mlx-sys`): the model as MLX operations (`weights.rs`: layers in compiled stages; `model.rs`: caches,
+  rollback; `delta.rs`: the delta rule per token and chunked), inference only (n-gram drafts; no MTP drafts, adapters,
+  training or saved sessions). It is for Apple hardware: optimize what helps any MLX device (fewer operations,
+  compiled stages, less memory traffic); its speed on the 5080 through MLX's CUDA backend says little about Metal.

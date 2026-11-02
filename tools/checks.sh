@@ -149,13 +149,33 @@ speccheck() {
     fi
 }
 
-# backend_diff <args...>: CUDA and MLX servers give byte-identical replies (tools/backend_diff.py)
+# backend_logits <name> <max mean |diff| per prompt> [chunk] <args...>: MLX's logits vs. CUDA's on the reference prompts
+# (CUDA writes them as a reference: qwenny check --write); the two backends' kernels sum in different orders, so this is a
+# bound, not identity
+backend_logits() {
+    local name=$1 max=$2; shift 2
+    local ref=$QREF/reference.safetensors
+    need "$ref" || return
+    local chunk=()
+    [[ ${1:-} =~ ^[0-9]+$ ]] && { chunk=("$1"); shift; }
+    local tmp; tmp=$(mktemp -d)
+    local out; out=$($BIN check "$ref" "$@" --backend=cuda --write="$tmp/cuda.safetensors" 2>&1)
+    if [ -e "$tmp/cuda.safetensors" ]; then
+        logits "MLX vs. CUDA $name" "$tmp/cuda.safetensors" "$max" "${chunk[@]}" "$@" --backend=mlx
+    else
+        fail "MLX vs. CUDA $name: the CUDA logits: $(grep Error <<<"$out" | head -1)"
+    fi
+    rm -rf "$tmp"
+}
+
+# backend_diff <args...>: whether fresh CUDA and MLX servers give byte-identical replies (tools/backend_diff.py); INFO,
+# since rounding differences flip sampled tokens at near-ties
 backend_diff() {
     local out; out=$(python3 tools/backend_diff.py --bin="$BIN" "$@" 2>&1)
-    if grep -q 'response comparisons are byte-identical' <<<"$out"; then
-        ok "backend_diff $*: $(grep -oP 'all \d+' <<<"$out") replies byte-identical"
+    if grep -qE '^(OK|FAIL) ' <<<"$out"; then
+        echo "INFO  backend_diff $*: $(grep -cE '^OK ' <<<"$out")/$(grep -cE '^(OK|FAIL) ' <<<"$out") replies byte-identical $(grep -E '^FAIL' <<<"$out" | cut -c7- | tr '\n' ' ')"
     else
-        fail "backend_diff $*: $(grep -E '^(DIFF|FAIL|Error|RuntimeError)|Error' <<<"$out" | head -3 | tr '\n' ' ')"
+        fail "backend_diff $*: did not run: $(tail -1 <<<"$out")"
     fi
 }
 
@@ -245,10 +265,17 @@ area() {
                 echo "INFO  mtpcheck: $($BIN mtpcheck "$QREF/mtp-ref.safetensors" --model=Qwen/Qwen3.5-4B 2>&1 | tail -1)"
             fi ;;
         mlx)
-            # the MLX backend (built with --features mlx): the same reference limits as CUDA, and replies byte-identical
-            # to the CUDA backend's for the same requests
+            # the MLX backend (built with --features mlx): the reference limits CUDA has, MLX's logits within about 1.6x the
+            # distance to CUDA's measured on the 5080 (16-bit 0.016, int8 0.025, int4 0.021), the rollback, and (INFO)
+            # whether servers reply byte for byte as CUDA's
             logits "MLX Qwen3.5-4B int8" "$QREF/reference.safetensors" 0.12 --model=Qwen/Qwen3.5-4B --backend=mlx
             logits "MLX Qwen3.5-4B 16-bit" "$QREF/reference.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --bf16 --backend=mlx
+            backend_logits "Qwen3.5-4B 16-bit" 0.025 --model=Qwen/Qwen3.5-4B --bf16
+            backend_logits "Qwen3.5-4B int8" 0.04 --model=Qwen/Qwen3.5-4B
+            backend_logits "Qwen3.5-4B int4" 0.035 --model=$W4A16
+            backend_logits "Qwen3.5-4B int4, chunks of 64" 0.035 64 --model=$W4A16
+            # DeltaNet rollback: restarts inside a step replay from the checkpoint
+            speccheck --model=Qwen/Qwen3.5-4B --backend=mlx
             backend_diff --model=Qwen/Qwen3.5-4B --bf16
             backend_diff --model=Qwen/Qwen3.5-4B
             backend_diff --model=$W4A16 ;;

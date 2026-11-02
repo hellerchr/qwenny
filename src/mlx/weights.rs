@@ -70,13 +70,22 @@ impl Linear {
         Ok(Linear::Dense(w))
     }
 
-    fn stored(q: &Quant, dtype: Dtype) -> MResult<Self> {
-        let (rows, groups) = (q.rows as i32, (q.cols / q.group) as i32);
+    /// MLX's quantized products take groups of 32, 64 or 128: a larger group that 128 divides (per channel, 256, ...)
+    /// is the same matrix in groups of 128 with its scale and offset repeated
+    fn stored(q: &Quant, dtype: Dtype) -> Result<Self> {
+        let (scales, offsets, group) = if [32, 64, 128].contains(&q.group) {
+            (q.scales.clone(), q.offsets.clone(), q.group)
+        } else {
+            ensure!(q.group % 128 == 0, "groups of {}: MLX takes 32, 64, 128 or multiples of 128", q.group);
+            let rep = |v: &[f32]| v.iter().flat_map(|&x| std::iter::repeat_n(x, q.group / 128)).collect::<Vec<_>>();
+            (rep(&q.scales), rep(&q.offsets), 128)
+        };
+        let (rows, groups) = (q.rows as i32, (q.cols / group) as i32);
         Ok(Linear::Quant {
             w: Array::from_slice(&q.q, &[rows, (q.cols * q.bits / 32) as i32]),
-            scales: Array::from_slice(&q.scales, &[rows, groups]).as_dtype(dtype)?,
-            biases: Array::from_slice(&q.offsets, &[rows, groups]).as_dtype(dtype)?,
-            group: q.group as i32,
+            scales: Array::from_slice(&scales, &[rows, groups]).as_dtype(dtype)?,
+            biases: Array::from_slice(&offsets, &[rows, groups]).as_dtype(dtype)?,
+            group: group as i32,
             bits: q.bits as i32,
         })
     }
@@ -88,13 +97,160 @@ impl Linear {
         }
     }
 
-    /// Products enter the f32 mixer/residual path without another low-precision element-wise pass.
+    pub fn spec(&self) -> Spec {
+        match self {
+            Linear::Dense(_) => Spec::Dense,
+            Linear::Quant { group, bits, .. } => Spec::Quant { group: *group, bits: *bits },
+        }
+    }
+
+    /// The arrays Spec::apply takes
+    fn owned(&self) -> Vec<Array> {
+        self.arrays().into_iter().cloned().collect()
+    }
+
     pub fn apply(&self, x: &Array) -> MResult<Array> {
+        self.spec().apply(&self.owned(), x)
+    }
+}
+
+/// How a Linear computes, without its arrays: what a compiled stage captures
+#[derive(Clone, Copy, Debug)]
+pub enum Spec {
+    Dense,
+    Quant { group: i32, bits: i32 },
+}
+
+impl Spec {
+    fn n(self) -> usize {
+        match self { Spec::Dense => 1, Spec::Quant { .. } => 3 }
+    }
+
+    /// x W^T from the matrix's arrays (Linear::owned) at the front of `a`, as f32: products enter the f32
+    /// mixer/residual path without another low-precision element-wise pass. Returns the rest of `a`.
+    fn apply_take<'a>(self, a: &'a [Array], x: &Array) -> MResult<(Array, &'a [Array])> {
         let y = match self {
-            Linear::Dense(w) => ops::matmul(x, ops::transpose(w)?),
-            Linear::Quant { w, scales, biases, group, bits } => ops::quantized_matmul(x, w, scales, biases, true, *group, *bits),
+            Spec::Dense => ops::matmul(x, ops::transpose(&a[0])?),
+            Spec::Quant { group, bits } => ops::quantized_matmul(x, &a[0], &a[1], &a[2], true, group, bits),
         }?;
-        y.as_dtype(Dtype::Float32)
+        Ok((y.as_dtype(Dtype::Float32)?, &a[self.n()..]))
+    }
+
+    pub fn apply(self, a: &[Array], x: &Array) -> MResult<Array> {
+        Ok(self.apply_take(a, x)?.0)
+    }
+}
+
+/// Steps of at most this many tokens (decode, drafts, batched decode) run the compiled stages; longer ones (prompts)
+/// the same functions uncompiled, so that prompt lengths do not each trace a graph
+pub const COMPILE_MAX: i32 = 64;
+
+/// A function of arrays, also compiled (mlx's compile: one graph, element-wise operations fused; on Metal in its safe
+/// math mode, through NVRTC without fast math: the operations stay exact, rounding may differ by fused multiply-adds).
+/// QWENNY_MLX_NOCOMPILE=1 runs everything uncompiled.
+pub struct Fused {
+    plain: std::rc::Rc<dyn Fn(&[Array]) -> MResult<Vec<Array>>>,
+    compiled: Option<Box<dyn FnMut(&[Array]) -> MResult<Vec<Array>>>>,
+}
+
+impl Fused {
+    pub fn new(f: impl Fn(&[Array]) -> MResult<Vec<Array>> + 'static) -> Self {
+        let plain: std::rc::Rc<dyn Fn(&[Array]) -> MResult<Vec<Array>>> = std::rc::Rc::new(f);
+        let compiled = std::env::var_os("QWENNY_MLX_NOCOMPILE").is_none().then(|| {
+            let p = plain.clone();
+            let mut c = mlx_rs::transforms::compile::compile(move |a: &[Array]| p(a), false);
+            Box::new(move |a: &[Array]| c(a)) as Box<dyn FnMut(&[Array]) -> MResult<Vec<Array>>>
+        });
+        Fused { plain, compiled }
+    }
+
+    /// compiled when `small` (a step of at most COMPILE_MAX tokens)
+    pub fn call(&mut self, small: bool, a: &[Array]) -> MResult<Vec<Array>> {
+        match (&mut self.compiled, small) {
+            (Some(c), true) => c(a),
+            _ => (self.plain)(a),
+        }
+    }
+}
+
+/// A layer's compiled stages: `pre` from the residual stream to the mixer's inputs, `tail` from the mixer's output
+/// through out_proj, the residual and the MLP; the weights they read
+pub struct Stages {
+    pre: Fused,
+    pre_args: Vec<Array>,
+    tail: Fused,
+    tail_args: Vec<Array>,
+}
+
+impl Stages {
+    fn of(l: &Layer, d: Dims) -> MResult<Self> {
+        let (sp_in, sout, sgu, sdown) = (l.in_proj.spec(), l.out_proj.spec(), l.gate_up.spec(), l.down.spec());
+        let mut pre_args = vec![l.input_norm.clone()];
+        pre_args.extend(l.in_proj.owned());
+        let pre = match l.kind {
+            Kind::Attn => {
+                pre_args.extend([l.q_norm.clone().unwrap(), l.k_norm.clone().unwrap()]);
+                // [h, cos, sin, input_norm, in_proj.., q_norm, k_norm] -> [q, gate, k int8, k scales, v int8, v scales]
+                Fused::new(move |a: &[Array]| {
+                    let (h, cos, sin) = (&a[0], &a[1], &a[2]);
+                    let t = h.shape()[0];
+                    let xn = rms(h, &a[3])?.as_dtype(Dtype::Float16)?;
+                    let (projected, rest) = sp_in.apply_take(&a[4..], &xn)?;
+                    let s = ops::split_at_indices(&projected, &[2 * d.q_width(), 2 * d.q_width() + d.kv_width()], -1)?;
+                    let qg = ops::split_equal(&s[0].reshape(&[t, d.nh, 2, HD])?, 2, 2)?;
+                    let q = rms(&qg[0].squeeze_axes(&[2])?, &rest[0])?;
+                    let k = rms(&s[1].reshape(&[t, NKV, HD])?, &rest[1])?;
+                    let (q, k) = (rope(&q, cos, sin)?, rope(&k, cos, sin)?);
+                    let (kq, ks) = quantize_kv(&k)?;
+                    let (vq, vs) = quantize_kv(&s[2].reshape(&[t, NKV, HD])?)?;
+                    Ok(vec![q, qg[1].squeeze_axes(&[2])?, kq, ks, vq, vs])
+                })
+            }
+            Kind::Delta => {
+                let sba = l.in_ba.as_ref().unwrap().spec();
+                pre_args.extend(l.in_ba.as_ref().unwrap().owned());
+                pre_args.extend([ops::negative(ops::exp(l.a_log.as_ref().unwrap())?)?, l.dt_bias.clone().unwrap()]);
+                // [h, input_norm, in_proj.., in_ba.., -exp(A_log), dt_bias] -> [qkv, z, beta, log decay, decay]
+                Fused::new(move |a: &[Array]| {
+                    let xn = rms(&a[0], &a[1])?.as_dtype(Dtype::Float16)?;
+                    let (projected, rest) = sp_in.apply_take(&a[2..], &xn)?;
+                    let (ba, rest) = sba.apply_take(rest, &xn)?;
+                    let qkvz = ops::split_at_indices(&projected, &[d.conv_width()], -1)?;
+                    let ba = ops::split_equal(&ba, 2, -1)?;
+                    let beta = nn::sigmoid(&ba[0])?;
+                    let lg = ops::multiply(&rest[0], nn::softplus(ops::add(&ba[1], &rest[1])?)?)?;
+                    let e = ops::exp(&lg)?;
+                    Ok(vec![qkvz[0].clone(), qkvz[1].clone(), beta, lg, e])
+                })
+            }
+        };
+        let gated = l.kind == Kind::Attn;
+        let mut tail_args = l.out_proj.owned();
+        tail_args.push(l.post_norm.clone());
+        tail_args.extend(l.gate_up.owned());
+        tail_args.extend(l.down.owned());
+        // [h, y, (gate), out_proj.., post_norm, gate_up.., down..] -> [h after the mixer and the MLP]
+        let tail = Fused::new(move |a: &[Array]| {
+            let h = &a[0];
+            let t = h.shape()[0];
+            let (y, rest) = if gated {
+                (gate(&a[1], &a[2])?.reshape(&[t, d.q_width()])?, &a[3..])
+            } else {
+                (a[1].clone(), &a[2..])
+            };
+            let (op, rest) = sout.apply_take(rest, &y.as_dtype(Dtype::Float16)?)?;
+            let h = ops::add(h, &op)?;
+            let xn = rms(&h, &rest[0])?.as_dtype(Dtype::Float16)?;
+            let (gu, rest) = sgu.apply_take(&rest[1..], &xn)?;
+            let ab = ops::split_equal(&gu, 2, -1)?;
+            let f = sdown.apply(rest, &swiglu(&ab[0], &ab[1], Dtype::Float16)?)?;
+            Ok(vec![ops::add(&h, &f)?])
+        });
+        Ok(Stages { pre, pre_args, tail, tail_args })
+    }
+
+    fn arrays(&self) -> impl Iterator<Item = &Array> {
+        self.pre_args.iter().chain(&self.tail_args)
     }
 }
 
@@ -131,6 +287,7 @@ pub struct Weights {
     pub head: Option<Linear>,
     pub final_norm: Array,
     pub layers: Vec<Layer>,
+    stages: Vec<Stages>,
 }
 
 /// CUDA's dense-to-int8 quantization (core.rs's pack), in the backend-neutral Quant layout.
@@ -227,13 +384,13 @@ impl Weights {
             let ms = mats(names)?;
             if ms.iter().all(|m| matches!(m, Matrix::Quant(_))) {
                 let qs = ms.into_iter().filter_map(|m| if let Matrix::Quant(q) = m { Some(q) } else { None }).collect();
-                return Ok(Linear::stored(&Quant::stack(qs)?, dtype)?);
+                return Linear::stored(&Quant::stack(qs)?, dtype);
             }
             if quantize {
                 // CUDA's pack(), not MLX's affine min/max quantization: symmetric q in [-127,127], stored +128,
                 // an f32 max/127 scale per row and group of 128, and round/clamp in exactly that order.
                 let qs = ms.into_iter().map(symmetric_int8).collect::<Result<Vec<_>>>()?;
-                return Ok(Linear::stored(&Quant::stack(qs)?, dtype)?);
+                return Linear::stored(&Quant::stack(qs)?, dtype);
             }
             Ok(Linear::new(dense(names, ms)?)?)
         };
@@ -298,7 +455,8 @@ impl Weights {
         let head = if ck.is_quant(&head_base) || head_base != embed_base {
             Some(lin(&[format!("{head_base}.weight")])?)
         } else { None };
-        let w = Weights { dtype, d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers };
+        let stages = layers.iter().map(|l| Stages::of(l, d)).collect::<MResult<Vec<_>>>()?;
+        let w = Weights { dtype, d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers, stages };
         w.eval()?;
         Ok(w)
     }
@@ -314,6 +472,7 @@ impl Weights {
             all.extend([&l.input_norm, &l.post_norm]);
             all.extend(l.q_norm.iter().chain(&l.k_norm).chain(&l.conv_w).chain(&l.a_log).chain(&l.dt_bias).chain(&l.delta_norm));
         }
+        all.extend(self.stages.iter().flat_map(Stages::arrays));
         mlx_rs::transforms::eval(all)
     }
 
@@ -331,43 +490,30 @@ impl Weights {
         }).collect()
     }
 
-    pub fn layers(&self, m: &mut impl Mix, mut h: Array) -> MResult<Array> {
+    pub fn layers(&mut self, m: &mut impl Mix, mut h: Array) -> MResult<Array> {
+        let small = h.shape()[0] <= COMPILE_MAX;
         for at in self.positions() {
-            h = self.layer(at, m, &h)?;
+            h = self.layer(at, m, &h, small)?;
         }
         Ok(h)
     }
 
-    fn layer(&self, at: At, m: &mut impl Mix, h: &Array) -> MResult<Array> {
-        let (dt, l, d) = (self.dtype, &self.layers[at.li], self.d);
-        let t = h.shape()[0];
-        let xn = rms(h, &l.input_norm)?.as_dtype(dt)?;
-        let projected = l.in_proj.apply(&xn)?;
-        let y = match l.kind {
+    fn layer(&mut self, at: At, m: &mut impl Mix, h: &Array, small: bool) -> MResult<Array> {
+        let (l, st) = (&self.layers[at.li], &mut self.stages[at.li]);
+        let with = |front: Vec<Array>, rest: &[Array]| -> Vec<Array> { front.into_iter().chain(rest.iter().cloned()).collect() };
+        match l.kind {
             Kind::Attn => {
-                let s = ops::split_at_indices(&projected, &[2 * d.q_width(), 2 * d.q_width() + d.kv_width()], -1)?;
-                let qg = s[0].reshape(&[t, d.nh, 2, HD])?;
-                let qg = ops::split_equal(&qg, 2, 2)?;
-                let q = rms(&qg[0].squeeze_axes(&[2])?, l.q_norm.as_ref().unwrap())?;
-                let k = rms(&s[1].reshape(&[t, NKV, HD])?, l.k_norm.as_ref().unwrap())?;
                 let (cos, sin) = m.rope();
-                let (q, k) = (rope(&q, &cos, &sin)?, rope(&k, &cos, &sin)?);
-                let o = m.attend(at.ai, &q, &k, &s[2].reshape(&[t, NKV, HD])?)?;
-                gate(&o, &qg[1].squeeze_axes(&[2])?)?.reshape(&[t, d.q_width()])?
+                let r = st.pre.call(small, &with(vec![h.clone(), cos, sin], &st.pre_args))?;
+                let o = m.attend(at.ai, &r[0], &r[2], &r[3], &r[4], &r[5])?;
+                Ok(st.tail.call(small, &with(vec![h.clone(), o, r[1].clone()], &st.tail_args))?.remove(0))
             }
             Kind::Delta => {
-                let qkvz = ops::split_at_indices(&projected, &[d.conv_width()], -1)?;
-                let ba = l.in_ba.as_ref().unwrap().apply(&xn)?;
-                m.delta(at.di, l, &qkvz[0], &qkvz[1], &ba)?
+                let r = st.pre.call(small, &with(vec![h.clone()], &st.pre_args))?;
+                let y = m.delta(at.di, l, small, &r[0], &r[1], &r[2], &r[3], &r[4])?;
+                Ok(st.tail.call(small, &with(vec![h.clone(), y], &st.tail_args))?.remove(0))
             }
-        };
-        let op = l.out_proj.apply(&y.as_dtype(dt)?)?;
-        let h = ops::add(h, &op)?;
-        let xn = rms(&h, &l.post_norm)?.as_dtype(dt)?;
-        let ab = ops::split_equal(&l.gate_up.apply(&xn)?, 2, -1)?;
-        let mid = swiglu(&ab[0], &ab[1], dt)?;
-        let f = l.down.apply(&mid)?;
-        ops::add(&h, &f)
+        }
     }
 }
 
@@ -378,10 +524,13 @@ pub struct At { pub li: usize, pub ai: usize, pub di: usize }
 pub trait Mix {
     /// Split-half RoPE tables [T][1][ROT], f32.
     fn rope(&self) -> (Array, Array);
-    /// q [T][Nq][256], k/v [T][Nkv][256], result [T][Nq][256], all f32.
-    fn attend(&mut self, ai: usize, q: &Array, k: &Array, v: &Array) -> MResult<Array>;
-    /// qkv [T][C], z [T][Hv*Dv], ba [T][2*Hv], result [T][Hv*Dv].
-    fn delta(&mut self, di: usize, layer: &Layer, qkv: &Array, z: &Array, ba: &Array) -> MResult<Array>;
+    /// q [T][Nq][256] f32; the new keys and values quantize_kv'd: int8 [T][Nkv][256], f32 scales [T][Nkv][1];
+    /// result [T][Nq][256] f32.
+    fn attend(&mut self, ai: usize, q: &Array, kq: &Array, ks: &Array, vq: &Array, vs: &Array) -> MResult<Array>;
+    /// qkv [T][C], z [T][Hv*Dv], beta, log decay and decay [T][Hv]; result [T][Hv*Dv]. `small`: compiled stages.
+    #[allow(clippy::too_many_arguments)]
+    fn delta(&mut self, di: usize, layer: &Layer, small: bool, qkv: &Array, z: &Array, beta: &Array, lg: &Array,
+             e: &Array) -> MResult<Array>;
 }
 
 pub fn rms(x: &Array, w: &Array) -> MResult<Array> {
@@ -399,6 +548,17 @@ pub fn rope(x: &Array, cos: &Array, sin: &Array) -> MResult<Array> {
     ops::concatenate(&[rotated, parts[1].clone()], -1)?.as_dtype(dtype)
 }
 
+/// CUDA's cache quantization per row (position and head) of x [T][NKV][HD]: int8 q = round(x * (127 / max|x|)) (0 for a
+/// zero row) and the scale max|x| / 127 [T][NKV][1]
+pub fn quantize_kv(x: &Array) -> MResult<(Array, Array)> {
+    let mx = ops::max_axis(ops::abs(x)?, -1, true)?;
+    let scale = ops::divide(&mx, Array::from_f32(127.0))?;
+    let inv = ops::select(ops::gt(&mx, Array::from_f32(0.0))?,
+                          ops::divide(Array::from_f32(127.0), &mx)?, Array::from_f32(0.0))?;
+    let q = ops::round(ops::multiply(x, inv)?, None)?.as_dtype(Dtype::Int8)?;
+    Ok((q, scale))
+}
+
 /// o times the per-channel sigmoid gate, in f32.
 pub fn gate(o: &Array, g: &Array) -> MResult<Array> {
     ops::multiply(o, nn::sigmoid(g.as_dtype(Dtype::Float32)?)?)
@@ -410,12 +570,13 @@ pub fn swiglu(a: &Array, b: &Array, dtype: Dtype) -> MResult<Array> {
 }
 
 /// Once per process, before MLX's first operation. The switches mirror lfm3-engine: changing prompt shapes must not
-/// trip the graph-cache warning, and freed buffers must not accumulate without a bound.
+/// trip the graph-cache warning, and freed buffers must not accumulate without a bound. MLX_ENABLE_TF32 (on by default)
+/// would run f32 matrix products in TF32 (10-bit mantissas): off, the products stay f32.
 pub fn init() -> MResult<()> {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let mut r = Ok(());
     ONCE.call_once(|| {
-        for (k, v) in [("MLX_ENABLE_CACHE_THRASHING_CHECK", "0"), ("MLX_USE_CUDA_GRAPHS", "0")] {
+        for (k, v) in [("MLX_ENABLE_CACHE_THRASHING_CHECK", "0"), ("MLX_USE_CUDA_GRAPHS", "0"), ("MLX_ENABLE_TF32", "0")] {
             if std::env::var_os(k).is_none() {
                 // SAFETY: startup, before MLX and before any thread that reads these variables.
                 unsafe { std::env::set_var(k, v) };

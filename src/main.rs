@@ -153,7 +153,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
         "train" => ([&lora[..], &["epochs", "batch", "lr", "max-len"]].concat(), vec![], 1..=2),
         "merge" => (vec!["model"], vec![], 2..=2),
         "bench" => ([&LOAD[..], &["pos"]].concat(), bf16, 0..=1),
-        "check" => (LOAD.to_vec(), bf16, 1..=2),
+        "check" => ([&LOAD[..], &["write"]].concat(), bf16, 1..=2),
         "layercheck" => (vec!["model", "layer"], bf16, 1..=1),
         "mtpcheck" => (vec!["model"], bf16, 1..=1),
         "adaptercheck" => (vec!["model", "adapter"], bf16, 1..=1),

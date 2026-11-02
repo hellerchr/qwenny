@@ -2,7 +2,7 @@
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::{Opts, chat, sample, sessions};
 use anyhow::{Context, Result, ensure};
-use safetensors::SafeTensors;
+use safetensors::{Dtype, SafeTensors};
 use std::{path::Path, time::Instant};
 
 fn ints(st: &SafeTensors, name: &str) -> Result<Vec<u32>> {
@@ -14,11 +14,17 @@ fn floats(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
 }
 
 /// Feed each reference prompt in chunks, compare logits and argmax at every position, then decode greedily.
+/// --write=<file>: also write this engine's logits, argmax and greedy tokens as a reference of the same prompts and
+/// positions (the MLX area compares MLX with CUDA through one)
 pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()> {
     let bytes = std::fs::read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     let mut m = opts.load(dir)?;
     let (chunk, vocab) = (chunk.clamp(1, m.max_out()), m.vocab());
+    let write = opts.values.iter().find(|(k, _)| k == "write").map(|(_, v)| v.clone());
+    // name, shape, little-endian bytes (i32 or f32)
+    let mut out: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
+    let le_i32 = |v: &[u32]| v.iter().flat_map(|&x| (x as i32).to_le_bytes()).collect::<Vec<u8>>();
     let mut p = 0;
     while r.tensor(&format!("ids_{p}")).is_ok() {
         let ids = ints(&r, &format!("ids_{p}"))?;
@@ -38,6 +44,7 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
         // where the largest difference is: position, token, our logit, the reference's
         let mut worst = (0, 0, 0f32, 0f32);
         let mut next = 0;
+        let (mut our_argmax, mut our_logits) = (Vec::new(), Vec::new());
         for (c, ids_c) in ids.chunks(chunk).enumerate() {
             let start = c * chunk;
             let toks: Vec<Tok> =
@@ -49,6 +56,12 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
                 let at = start + j;
                 agree += (am[j] == ref_argmax[at]) as usize;
                 let ours = &lg[j * vocab..(j + 1) * vocab];
+                if write.is_some() {
+                    our_argmax.push(am[j]);
+                    if !topk && pos.contains(&(at as u32)) {
+                        our_logits.extend_from_slice(ours);
+                    }
+                }
                 if topk {
                     let mx = ours.iter().fold(f32::MIN, |a, &b| a.max(b));
                     let lse = mx as f64 + ours.iter().map(|&x| ((x - mx) as f64).exp()).sum::<f64>().ln();
@@ -83,6 +96,15 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
             next = m.argmax()?[0];
         }
         let gen_agree = generated.iter().zip(&ref_gen).take_while(|(a, b)| a == b).count();
+        if write.is_some() {
+            ensure!(!topk, "--write: a reference with full logits");
+            out.push((format!("ids_{p}"), Dtype::I32, vec![ids.len()], le_i32(&ids)));
+            out.push((format!("pos_{p}"), Dtype::I32, vec![pos.len()], le_i32(&pos)));
+            out.push((format!("logits_{p}"), Dtype::F32, vec![pos.len(), vocab],
+                      our_logits.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            out.push((format!("argmax_{p}"), Dtype::I32, vec![our_argmax.len()], le_i32(&our_argmax)));
+            out.push((format!("gen_{p}"), Dtype::I32, vec![generated.len()], le_i32(&generated)));
+        }
         println!(
             "prompt {p}: {} tokens, argmax agrees at {agree}/{}, {} at {compared} positions: max |diff| {max_diff:.4} \
              (position {}, token {}: {:.3} vs. {:.3}), mean {:.5}; greedy matches the first {gen_agree}/{} tokens",
@@ -97,6 +119,13 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
             ref_gen.len()
         );
         p += 1;
+    }
+    if let Some(path) = write {
+        let views: Vec<_> = out.iter()
+            .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
+            .collect::<Result<_>>()?;
+        safetensors::serialize_to_file(views, None, Path::new(&path))?;
+        println!("wrote {path}");
     }
     Ok(())
 }
@@ -310,9 +339,10 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
     }
     let dt = t.elapsed().as_secs_f64();
     println!("with logits: {:.1} tok/s ({:.3} ms/token)", n as f64 / dt, dt * 1e3 / n as f64);
-    // speculative decoding's steps: the last token and k drafts of one sequence, every row's logits
+    // speculative decoding's steps: the last token and k drafts of one sequence, every row's logits (each run continues
+    // where the last one ended: engines that roll back only inside a step refuse an earlier restart)
+    let mut p = p0 + (16 + 3 * n) as u32;
     for k in [2usize, 4] {
-        let mut p = p0 + (16 + 3 * n) as u32;
         let rows: Vec<usize> = (0..=k).collect();
         m.sync()?;
         let t = Instant::now();
@@ -331,6 +361,15 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
             continue;
         }
         let rows: Vec<usize> = (0..b).collect();
+        // every slot holds a sequence of p0 + 16 tokens first (not timed)
+        for s in 0..b as u32 {
+            let mut at = 0;
+            while at < p0 as usize + 16 {
+                let to = (at + m.max_tok()).min(p0 as usize + 16);
+                m.run(&(at..to).map(|q| Tok { id: 42, slot: s, pos: q as u32 }).collect::<Vec<_>>(), &[])?;
+                at = to;
+            }
+        }
         let at = |i: usize| -> Vec<Tok> { (0..b as u32).map(|s| Tok { id: 42, slot: s, pos: p0 + 16 + i as u32 }).collect() };
         m.run(&at(0), &rows)?;
         m.sync()?;
