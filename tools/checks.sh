@@ -3,7 +3,7 @@
 # with a pass criterion each, after `cargo test`: OK / FAIL per check, exit status 1 if any failed.
 #
 #   tools/checks.sh changed          the areas the uncommitted changes touch (git diff HEAD); see `areas_of`
-#   tools/checks.sh <area>...        qwen-train qwen-train-27b chat qwen-infer, or all (all but qwen-train-27b)
+#   tools/checks.sh <area>...        qwen-train qwen-train-27b chat qwen-infer mlx, or all (all but qwen-train-27b)
 #   --make                           make missing references (else a missing one is a FAIL that prints its command)
 #
 # qwen-train-27b runs on the RTX 3090 VM only (the 27B needs 24 GB): tools/vm.sh tools/checks.sh qwen-train-27b, after
@@ -149,6 +149,16 @@ speccheck() {
     fi
 }
 
+# backend_diff <args...>: CUDA and MLX servers give byte-identical replies (tools/backend_diff.py)
+backend_diff() {
+    local out; out=$(python3 tools/backend_diff.py --bin="$BIN" "$@" 2>&1)
+    if grep -q 'response comparisons are byte-identical' <<<"$out"; then
+        ok "backend_diff $*: $(grep -oP 'all \d+' <<<"$out") replies byte-identical"
+    else
+        fail "backend_diff $*: $(grep -E '^(DIFF|FAIL|Error|RuntimeError)|Error' <<<"$out" | head -3 | tr '\n' ' ')"
+    fi
+}
+
 # Self-checks of the engine against its own reference paths (no files): sampler draw for draw, long contexts (16-bit)
 # at every position
 selfchecks() {
@@ -234,6 +244,14 @@ area() {
             if need "$QREF/mtp-ref.safetensors"; then   # no pass criterion yet: its result, to compare by eye
                 echo "INFO  mtpcheck: $($BIN mtpcheck "$QREF/mtp-ref.safetensors" --model=Qwen/Qwen3.5-4B 2>&1 | tail -1)"
             fi ;;
+        mlx)
+            # the MLX backend (built with --features mlx): the same reference limits as CUDA, and replies byte-identical
+            # to the CUDA backend's for the same requests
+            logits "MLX Qwen3.5-4B int8" "$QREF/reference.safetensors" 0.12 --model=Qwen/Qwen3.5-4B --backend=mlx
+            logits "MLX Qwen3.5-4B 16-bit" "$QREF/reference.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --bf16 --backend=mlx
+            backend_diff --model=Qwen/Qwen3.5-4B --bf16
+            backend_diff --model=Qwen/Qwen3.5-4B
+            backend_diff --model=$W4A16 ;;
         *) fail "unknown area $1" ;;
     esac
 }
@@ -243,9 +261,12 @@ areas_of() {
     case $1 in
         kernels/qwen_train.cu|kernels/train_common.cuh|src/cuda/qwen/train.rs|src/cuda/qwen/train/*|src/cuda/learn.rs\
         |src/training.rs|tools/make_train_reference.py) echo qwen-train ;;
-        src/checkpoint.rs|build.rs|src/backend.rs|src/hub.rs|src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-infer ;;
+        src/checkpoint.rs|build.rs|src/engine.rs|src/hub.rs) echo qwen-train qwen-infer mlx ;;
+        src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-infer ;;
+        src/mlx/*|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
         src/chat.rs) echo chat qwen-train ;;
-        kernels/*|src/cuda/*|src/sample.rs|src/sessions.rs|src/checks.rs) echo qwen-infer ;;
+        kernels/*|src/cuda/*) echo qwen-infer ;;
+        src/sample.rs|src/sessions.rs|src/checks.rs|src/server.rs) echo qwen-infer mlx ;;
         tools/make_reference*.py|tools/make_tokref.py|tools/tokref-*.json) echo chat qwen-infer ;;
     esac
 }
@@ -256,7 +277,7 @@ for a in "$@"; do
         --make) MAKE=1 ;;
         all) args+=(qwen-train chat qwen-infer) ;;
         changed)
-            files=$(git diff --name-only HEAD)
+            files=$(git diff --name-only HEAD; git ls-files --others --exclude-standard src kernels tools vendor)
             mapfile -t found < <(for f in $files; do areas_of "$f"; done | tr ' ' '\n' | grep . | sort -u)
             [ ${#found[@]} -eq 0 ] && echo "the changes touch no checked area" && exit 0
             echo "changed: $(echo $files | tr '\n' ' ')-> ${found[*]}"
@@ -269,9 +290,11 @@ for a in "$@"; do
 done
 [ ${#args[@]} -eq 0 ] && { sed -n 2,10p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
-cargo build --release 2>&1 | grep -E '^error' -A5 && { echo "FAIL  the build"; exit 1; }
+# the MLX backend needs its cargo feature (MLX's CUDA build, long the first time); the binary keeps the CUDA backend
+features=(); [[ " ${args[*]} " == *" mlx "* ]] && features=(--features mlx)
+cargo build --release "${features[@]}" 2>&1 | grep -E '^error' -A5 && { echo "FAIL  the build"; exit 1; }
 # the unit tests (CPU, seconds) with every run
-tests=$(cargo test --release 2>&1 | grep -E '^test result')
+tests=$(cargo test --release "${features[@]}" 2>&1 | grep -E '^test result')
 if [ -n "$tests" ] && ! grep -qv '^test result: ok' <<<"$tests"; then ok "cargo test: $(grep -oP "\d+(?= passed)" <<<"$tests" | awk "{ s += \$1 } END { print s }") passed"
 else fail "cargo test: ${tests:-does not build}"; fi
 for a in "${args[@]}"; do area "$a"; done

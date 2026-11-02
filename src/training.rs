@@ -176,10 +176,6 @@ pub fn shuffled(n: usize, rng: &mut u64) -> Vec<usize> {
     order
 }
 
-pub fn bf16_to_f32(b: &[u8]) -> Vec<f32> {
-    b.as_chunks().0.iter().map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16)).collect()
-}
-
 /// little-endian f32 bytes as floats
 pub fn f32s(b: &[u8]) -> Vec<f32> {
     b.as_chunks().0.iter().map(|&c| f32::from_le_bytes(c)).collect()

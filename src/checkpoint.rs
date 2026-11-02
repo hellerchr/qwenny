@@ -1,4 +1,5 @@
 //! A model's weights as stored: Hugging Face safetensors (one file or shards) in bf16, f16 or f32, or pre-quantized as
+//! MLX's affine format (`quantization` in config.json: tensors `.weight`, `.scales`, `.biases`), or
 //! compressed-tensors `pack-quantized` (`quantization_config`, what llm-compressor, AutoRound and GPTQModel write
 //!   for vLLM, e.g. RedHatAI's w4a16 and HyperQwen's AutoRound int4: tensors `.weight_packed` (int32, the same packing
 //!   along each row), `.weight_scale`, `.weight_shape`, `.weight_zero_point` when asymmetric; symmetric values are
@@ -8,8 +9,8 @@
 //! They are read into one form, `Quant`. Tensors keep their Hugging Face names; a checkpoint that prefixes them
 //! (`language_model.`) is read without it.
 //!
-//! `bf16` returns any tensor dense, dequantizing quantized matrices; `quant_matrix` returns a quantized matrix as stored,
-//! for the kernels that compute with quantized weights.
+//! `bf16` returns any tensor dense, dequantizing quantized matrices; `matrix` / `quant_matrix` return a quantized matrix
+//! as stored, for backends that compute with quantized weights.
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors, tensor::Metadata};
@@ -91,6 +92,14 @@ impl Quant {
     }
 }
 
+/// A weight matrix as stored
+#[cfg_attr(not(has_mlx), allow(dead_code))]
+pub enum Matrix {
+    /// bf16 bits [rows][cols]
+    Dense { w: Vec<u16>, rows: usize, cols: usize },
+    Quant(Quant),
+}
+
 struct File {
     mmap: Mmap,
     header: usize,
@@ -108,6 +117,7 @@ pub struct Checkpoint {
 /// How a checkpoint's quantized matrices are stored
 #[derive(Clone, Copy, Debug)]
 enum Scheme {
+    Mlx { bits: usize, group: usize },
     /// compressed-tensors pack-quantized; `group` 0: one group per row (strategy "channel"); a matrix is
     /// symmetric unless it stores `weight_zero_point`
     Packed { bits: usize, group: usize },
@@ -181,11 +191,17 @@ impl Checkpoint {
                 .context("no model.embed_tokens.weight: not a Qwen3.5-style checkpoint")?.to_string()
         };
         let index = index.into_iter().filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.to_string(), v))).collect();
-        let qc = &config["quantization_config"];
-        let quant = if qc.is_object() {
+        let (q, qc) = (&config["quantization"], &config["quantization_config"]);
+        let quant = if q.is_object() {
+            ensure!(q["mode"].as_str().unwrap_or("affine") == "affine", "quantization mode {}: only MLX's affine one", q["mode"]);
+            let (bits, group) = (q["bits"].as_u64().context("quantization bits")? as usize,
+                                 q["group_size"].as_u64().context("quantization group_size")? as usize);
+            ensure!([4, 8].contains(&bits), "{bits}-bit weights: 4 or 8");
+            Some(Scheme::Mlx { bits, group })
+        } else if qc.is_object() {
             ensure!(qc["quant_method"] == "compressed-tensors",
-                    "quantization_config {}: compressed-tensors (llm-compressor, AutoRound, GPTQModel for vLLM) is \
-                     supported", qc["quant_method"]);
+                    "quantization_config {}: compressed-tensors (llm-compressor, AutoRound, GPTQModel for vLLM) and MLX's \
+                     format are supported", qc["quant_method"]);
             Some(packed_scheme(qc)?)
         } else {
             None
@@ -220,9 +236,9 @@ impl Checkpoint {
         self.index.contains_key(&format!("{base}.weight_zero_point"))
     }
 
-    /// Whether `{base}` is stored quantized
+    /// Whether `{base}` is stored quantized (either format)
     pub fn is_quant(&self, base: &str) -> bool {
-        self.packed(base)
+        self.packed(base) || self.index.contains_key(&format!("{base}.scales"))
     }
 
     /// A tensor stored as floats (bf16, f16 or f32), as f32, and its shape
@@ -249,6 +265,7 @@ impl Checkpoint {
             })
         };
         if !self.packed(base) {
+            ensure!(!self.is_quant(base), "{base}: row reads of MLX-quantized matrices are not supported");
             let (dtype, shape, data) = self.raw(&format!("{base}.weight")).with_context(|| format!("tensor {base}.weight"))?;
             let cols = shape[1];
             let mut out = Vec::with_capacity(ids.len() * cols);
@@ -261,7 +278,7 @@ impl Checkpoint {
             return Ok(out);
         }
         let Some(Scheme::Packed { group, .. }) = self.quant.filter(|_| !self.has_zero_point(base)) else {
-            bail!("{base}: row reads of asymmetric matrices are not supported");
+            bail!("{base}: row reads of asymmetric or MLX-quantized matrices are not supported");
         };
         let (_, qshape, q) = self.raw(&format!("{base}.weight_packed")).context("weight_packed")?;
         let (sdtype, _, sc) = self.raw(&format!("{base}.weight_scale")).context("weight_scale")?;
@@ -300,17 +317,39 @@ impl Checkpoint {
         Ok((v, shape.to_vec()))
     }
 
+    /// The matrix `{base}.weight` as stored
+    #[cfg_attr(not(has_mlx), allow(dead_code))]
+    pub fn matrix(&self, base: &str) -> Result<Matrix> {
+        if self.is_quant(base) {
+            return Ok(Matrix::Quant(self.quant_matrix(base)?));
+        }
+        let (w, shape) = self.bf16(&format!("{base}.weight"))?;
+        ensure!(shape.len() == 2, "{base}.weight has shape {shape:?}, expected a matrix");
+        Ok(Matrix::Dense { w, rows: shape[0], cols: shape[1] })
+    }
+
     /// The quantized matrix `{base}.weight` as stored (`is_quant`)
     pub fn quant_matrix(&self, base: &str) -> Result<Quant> {
-        let Scheme::Packed { bits, group } =
-            self.quant.with_context(|| format!("{base} is stored quantized but config.json has no quantization"))?;
-        self.packed_matrix(base, bits, group, !self.has_zero_point(base))
+        match self.quant.with_context(|| format!("{base} is stored quantized but config.json has no quantization"))? {
+            Scheme::Mlx { bits, group } => self.mlx_matrix(base, bits, group),
+            Scheme::Packed { bits, group } => self.packed_matrix(base, bits, group, !self.has_zero_point(base)),
+        }
     }
 
     fn words(&self, name: &str) -> Result<(Vec<u32>, Vec<usize>)> {
         let (dtype, shape, data) = self.raw(name).with_context(|| format!("tensor {name}"))?;
         ensure!(matches!(dtype, Dtype::U32 | Dtype::I32) && shape.len() == 2, "{name} is {dtype:?} {shape:?}, expected packed 32-bit words");
         Ok((data.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(), shape.to_vec()))
+    }
+
+    fn mlx_matrix(&self, base: &str, bits: usize, group: usize) -> Result<Quant> {
+        let (q, shape) = self.words(&format!("{base}.weight"))?;
+        let (rows, cols) = (shape[0], shape[1] * 32 / bits);
+        let (scales, s_shape) = self.floats(&format!("{base}.scales"))?;
+        let (offsets, _) = self.floats(&format!("{base}.biases"))?;
+        ensure!(s_shape == [rows, cols / group] && offsets.len() == scales.len(),
+                "{base}: scales {s_shape:?} for {rows} x {cols} in groups of {group}");
+        Ok(Quant { bits, group, rows, cols, q, scales, offsets })
     }
 
     /// compressed-tensors: w = (q - zero) * scale, zero 2^(bits-1) when symmetric (q stored unsigned), else the

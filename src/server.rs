@@ -1106,7 +1106,7 @@ fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
     std::thread::spawn(move || {
         // finished sequences kept for the requests that continue them (engines that can save slots)
         let ready = load().and_then(|mut m| {
-            if fit_ctx {
+            if fit_ctx && m.cache_room().is_some() {
                 let c = sessions::fitting_ctx(&m, m.max_ctx());
                 m.limit_ctx(c);
             }

@@ -1,8 +1,44 @@
 //! What the server and the checks ask of the model (`Engine`, implemented by `cuda::qwen::Model` and the server's test
 //! doubles), and which models it runs.
 use crate::lora::Adapter;
-use anyhow::{Context, Result, bail};
-use std::path::Path;
+use anyhow::{Context, Result, bail, ensure};
+use std::{path::Path, sync::OnceLock};
+
+/// The compute backend: hand-written CUDA kernels, or MLX (Metal on Apple silicon, MLX's CUDA backend on Linux).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    Cuda,
+    Mlx,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self { Backend::Cuda => "cuda", Backend::Mlx => "mlx" }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        let b = match s {
+            "cuda" => Backend::Cuda,
+            "mlx" => Backend::Mlx,
+            _ => bail!("--backend is cuda or mlx"),
+        };
+        let compiled = match b { Backend::Cuda => cfg!(has_cuda), Backend::Mlx => cfg!(has_mlx) };
+        ensure!(compiled, "this build has no {s} backend (cargo feature `{s}`)");
+        Ok(b)
+    }
+}
+
+static CURRENT: OnceLock<Backend> = OnceLock::new();
+
+/// Choose the backend for this process (once, at startup).
+pub fn set_backend(b: Backend) {
+    let _ = CURRENT.set(b);
+}
+
+/// The chosen backend; CUDA when built with it, else MLX.
+pub fn backend() -> Backend {
+    *CURRENT.get_or_init(|| if cfg!(has_cuda) { Backend::Cuda } else { Backend::Mlx })
+}
 
 /// That a parsed config.json is a model this engine runs: Qwen3.5 / Qwen3.8 (`model_type` qwen3_5: Gated DeltaNet and
 /// gated attention)
@@ -21,14 +57,25 @@ pub fn check_model(dir: &Path) -> Result<()> {
     check_config(&config).with_context(|| format!("{}", dir.display()))
 }
 
-/// The model in `dir` on the GPU: `int8` weights (else 16-bit), `adapter` served unmerged for the slots that use it
-/// (Engine::set_adapter)
+/// The model in `dir` on the selected backend: `int8` weights (else 16-bit), `adapter` served unmerged for the slots
+/// that use it (Engine::set_adapter; CUDA only).
+#[allow(unused_variables)]
 pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>) -> Result<Box<dyn Engine>> {
     check_model(dir)?;
     if let Some(a) = adapter {
         a.check(&crate::checkpoint::Checkpoint::open(dir)?)?;
     }
-    Ok(Box::new(crate::cuda::qwen::Model::load(dir, max_ctx, slots, int8, adapter)?))
+    match backend() {
+        #[cfg(has_cuda)]
+        Backend::Cuda => Ok(Box::new(crate::cuda::qwen::Model::load(dir, max_ctx, slots, int8, adapter)?)),
+        #[cfg(has_mlx)]
+        Backend::Mlx => {
+            ensure!(adapter.is_none(), "LoRA adapters: CUDA backend only so far");
+            Ok(Box::new(crate::mlx::model::Model::load(dir, max_ctx, slots, int8)?))
+        }
+        #[allow(unreachable_patterns)]
+        b => bail!("no {} backend in this build", b.name()),
+    }
 }
 
 /// One token of a step: its id, the sequence slot it belongs to and its position in that sequence.

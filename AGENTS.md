@@ -49,13 +49,16 @@ cargo test --release                        # unit tests, CPU, seconds (checks.s
 tools/checks.sh changed                     # the checks the uncommitted changes need
 tools/checks.sh all                         # qwen-infer, chat, qwen-train: everything on the 4B
 tools/checks.sh qwen-train-27b              # the 27B, on the 3090 only (from the dev box: tools/vm.sh tools/checks.sh qwen-train-27b)
+cargo build --release --features mlx        # also the MLX backend (--backend=mlx; MLX's CUDA build, long the first time)
+tools/checks.sh mlx                         # the MLX backend (builds with --features mlx)
 ```
 
 - Areas: `qwen-infer` (logits vs. Transformers for int8 and 16-bit; with a LoRA vs. PEFT for int4, int8 and 16-bit,
   and adaptercheck: adapter and base requests in the same steps; layercheck of layers 0 and 3, speccheck with MTP,
   samplecheck with sampled drafts, longcheck, cachecheck, swapcheck, mtpcheck as INFO), `chat` (template and tokenizer
-  vs. Transformers), `qwen-train` (LoRA gradients vs. PEFT for bf16 and int4, Unsloth's masks), `qwen-train-27b`.
-  `areas_of` in the script maps changed files to areas.
+  vs. Transformers), `qwen-train` (LoRA gradients vs. PEFT for bf16 and int4, Unsloth's masks), `qwen-train-27b`,
+  `mlx` (the MLX backend: logits vs. Transformers, and `tools/backend_diff.py`: CUDA and MLX servers give
+  byte-identical replies to the same requests). `areas_of` in the script maps changed files to areas.
 - Correctness is tested on the 4B: everything but `qwen-train-27b` runs on `Qwen/Qwen3.5-4B` (bf16, int8 and
   16-bit) and `RedHatAI/Qwen3.5-4B-quantized.w4a16` (int4), from the Hugging Face cache.
 - `QWENNY_BIN` and `QWENNY_PY` override the binary and the Python.
@@ -177,3 +180,6 @@ The page is at `http://192.168.31.153:18024/`. A restart reloads the 27B and tak
   sessions keep the base model's and the adapter's states apart).
 - `src/checkpoint.rs`, `src/hub.rs`: loading weights (formats, quantization), Hugging Face downloads.
 - `src/checks.rs`: the checks and `bench`.
+- `src/mlx/`: the MLX backend (`--backend=mlx`; Metal on macOS, MLX's CUDA backend on Linux with `--features mlx`,
+  through `vendor/mlx-sys`): the model as MLX operations, inference only (no MTP drafts, adapters, training or saved
+  sessions).

@@ -19,6 +19,7 @@ pub const CHUNK: usize = 8192;
 
 /// `n` zeroed bytes for an Image, in huge pages where the system gives them on request (the copies from the device
 /// fill fresh pages: on the 3090's VM 2.5 GB/s in 4 KB pages, 8 GB/s in 2 MB ones)
+#[cfg(target_os = "linux")]
 pub fn host_buf(n: usize) -> Vec<u8> {
     unsafe extern "C" {
         fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
@@ -32,6 +33,11 @@ pub fn host_buf(n: usize) -> Vec<u8> {
         unsafe { madvise(a as *mut _, len, 14 /* MADV_HUGEPAGE */) };
     }
     v
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn host_buf(n: usize) -> Vec<u8> {
+    vec![0; n]
 }
 
 /// What a slot holds after a step at its end `len`: the KV cache of [0, len) in chunks of CHUNK positions (the

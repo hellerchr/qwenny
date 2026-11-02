@@ -2,6 +2,7 @@ mod auth;
 mod chat;
 mod checkpoint;
 mod checks;
+#[cfg(has_cuda)]
 mod cuda;
 mod decide;
 mod engine;
@@ -10,7 +11,10 @@ mod lora;
 mod sample;
 mod server;
 mod sessions;
+#[cfg(has_cuda)]
 mod training;
+#[cfg(has_mlx)]
+mod mlx;
 
 use anyhow::{Context, Result, bail, ensure};
 use engine::Engine;
@@ -42,7 +46,7 @@ const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] 
   qwenny datacheck <data dir> <data reference>  token ids and loss masks vs. Unsloth's
 options: --adapter=[<name>=]<dir> (a LoRA, served unmerged: serve answers \"model\": <name> with it and --name without
          it; name default: the directory's, or its parent's for runs/<data>-N/adapter; the checks and bench run it),
-         --bf16 (16-bit weights instead of int8),
+         --backend=cuda|mlx (default: CUDA when built in, else MLX), --bf16 (16-bit weights instead of int8),
          bench: --pos=0 (context before decoding) --slots=1 --ctx=4096,
          serve: --ui (the web page at /), --host=0.0.0.0 --port=18023 --name=qwenny, --ctx=<tokens> (default: the
                 model's native context, or what one session can hold on the GPU if less), --slots=16 (sessions at
@@ -110,6 +114,7 @@ impl Opts {
         Ok(Some((name, lora::Adapter::load(&dir)?)))
     }
 
+    #[cfg(has_cuda)]
     fn lora(&self) -> Result<training::Opts> {
         Ok(training::Opts {
             rank: self.get("rank", 16)?, alpha: self.get("alpha", 32.0)?, dropout: self.get("dropout", 0.05)?,
@@ -117,6 +122,7 @@ impl Opts {
         })
     }
 
+    #[cfg(has_cuda)]
     fn train_opts(&self) -> Result<training::TrainOpts> {
         Ok(training::TrainOpts {
             epochs: self.get("epochs", 3)?, batch: self.get("batch", 8)?, lr: self.get("lr", 2e-4)?,
@@ -204,7 +210,8 @@ fn main() -> Result<()> {
         }
     }
     let Some(cmd) = args.first().map(|s| s.as_str()) else { bail!("{USAGE}") };
-    let Some((keys, switches, positional)) = strict(cmd) else { bail!("no command {cmd}\n{USAGE}") };
+    let Some((mut keys, switches, positional)) = strict(cmd) else { bail!("no command {cmd}\n{USAGE}") };
+    keys.push("backend");
     for (k, _) in &values {
         ensure!(keys.contains(&k.as_str()), "{cmd} has no option --{k}{}", did_you_mean(k, keys.iter().chain(switches.iter())));
     }
@@ -225,6 +232,12 @@ fn main() -> Result<()> {
     let mut opts = Opts { int8: !flags.iter().any(|f| *f == "--bf16"), precision: String::new(), values };
     opts.precision = opts.get("precision", "f16".to_string())?;
     ensure!(["f16", "bf16", "f32"].contains(&opts.precision.as_str()), "--precision is f16, bf16 or f32");
+    // Do not call engine::backend() eagerly as opts.get's default: that initializes the OnceLock before set_backend.
+    let selected = match opts.values.iter().find(|(k, _)| k == "backend") {
+        Some((_, b)) => b.clone(),
+        None => engine::backend().name().to_string(),
+    };
+    engine::set_backend(engine::Backend::parse(&selected)?);
     if cmd == "password" {
         return password(&opts);
     }
@@ -258,6 +271,7 @@ fn main() -> Result<()> {
             let so = server::ServeOpts { adapter: name, ..so };
             server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
         }
+        #[cfg(has_cuda)]
         "train" => training::train(&model, p(0), a.get(1).map(Path::new), opts.lora()?, opts.train_opts()?),
         "merge" => lora::merge(&model, p(0), p(1)),
         "bench" => checks::bench(&opts, m, a.first().map_or(Ok(256), |c| c.parse())?),
@@ -276,8 +290,12 @@ fn main() -> Result<()> {
         "longcheck" => checks::longcheck(&opts, m),
         "cachecheck" => checks::cachecheck(&opts, m),
         "swapcheck" => checks::swapcheck(&opts, m),
+        #[cfg(has_cuda)]
         "traincheck" => training::traincheck(&model, p(0), opts.lora()?, flags.iter().any(|f| *f == "--packed")),
+        #[cfg(has_cuda)]
         "datacheck" => training::datacheck(&model, p(0), p(1)),
+        #[cfg(not(has_cuda))]
+        "train" | "traincheck" | "datacheck" => bail!("{cmd}: CUDA backend only so far"),
         _ => unreachable!("{cmd}: in `strict`, not here"),
     }
 }

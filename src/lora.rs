@@ -1,6 +1,5 @@
 //! A PEFT LoRA adapter: served unmerged (src/cuda/qwen/lora.rs: y = W x + alpha / r * B A x, per request), and
 //! `qwenny merge`, which writes the model with it merged into the bf16 base weights (W += alpha / r * B A).
-use crate::training::{bf16_to_f32, f32s};
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value as Json;
@@ -12,6 +11,14 @@ pub struct Adapter {
     base: String,
     /// lora_A [r][in] and lora_B [out][r] by base weight name ("model.language_model.layers.3.self_attn.q_proj.weight")
     pairs: HashMap<String, (Vec<f32>, Vec<f32>, usize)>,
+}
+
+fn bf16_to_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect()
+}
+
+fn f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
 fn floats(st: &SafeTensors, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {

@@ -163,13 +163,20 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
 }
 
 /// layercheck: a slot bit marking draft tokens that the next step rejects
+#[cfg(has_cuda)]
 const DRAFT: u32 = 0x100;
+
+#[cfg(not(has_cuda))]
+pub fn layercheck(_opts: &Opts, _dir: &str, _reference: &str, _layer: usize) -> Result<()> {
+    anyhow::bail!("layercheck: CUDA backend only so far")
+}
 
 /// One layer's mixer (in_proj, mixer, out_proj) on the reference's mixer inputs, compared with its outputs, fed in
 /// several ways: (a) the prompt as MAX_TOK-token chunks then the last 4 tokens as single-token decode steps, in slot
 /// 0; (b) chunks of 5 tokens (short segments) in slot 1; (c) two sequences per step, chunks of 64, in slots 2 and 3;
 /// (d) a 3-token step in slot 0 while slot 1 decodes, after both had their prompts; (e) speculative decoding with
 /// rejected drafts in slot 1.
+#[cfg(has_cuda)]
 pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Result<()> {
     let bytes = std::fs::read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;

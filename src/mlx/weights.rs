@@ -1,0 +1,434 @@
+//! Qwen3.5 / Qwen3.8 weights and the residual stack as MLX operations. Matrix products use f16 inputs (dense or the
+//! checkpoint's affine quantization), with f32 residual streams, norms, mixer state and element-wise gates. The
+//! backend-specific cache operations are supplied by `Mix`, as in lfm3-engine's MLX backend.
+use crate::checkpoint::{Checkpoint, Matrix, Quant};
+use anyhow::{Context, Result, bail, ensure};
+use half::bf16;
+use mlx_rs::{Array, Dtype, error::Exception, fast, nn, ops};
+use std::{fs, path::Path};
+
+pub type MResult<T> = std::result::Result<T, Exception>;
+
+pub const NKV: i32 = 4;
+pub const HD: i32 = 256;
+pub const LK_HEADS: i32 = 16;
+pub const LKD: i32 = 128;
+pub const LVD: i32 = 128;
+pub const CONV_K: i32 = 4;
+pub const EPS: f32 = 1e-6;
+pub const ROT: i32 = 64;
+pub const THETA: f64 = 1e7;
+/// qwenny's CUDA backend quantizes dense weights at load in groups of 128.
+const QGROUP: i32 = 128;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Dims {
+    pub h: i32,
+    pub ff: i32,
+    pub nh: i32,
+    pub lv_heads: i32,
+    pub vocab: usize,
+}
+
+impl Dims {
+    pub fn of(config: &serde_json::Value) -> Result<Self> {
+        let tc = config.get("text_config").unwrap_or(config);
+        let get = |k: &str| tc[k].as_u64().map(|v| v as i32);
+        for (key, want) in [("num_key_value_heads", NKV), ("head_dim", HD),
+                            ("linear_num_key_heads", LK_HEADS), ("linear_key_head_dim", LKD),
+                            ("linear_value_head_dim", LVD), ("linear_conv_kernel_dim", CONV_K)] {
+            ensure!(get(key) == Some(want), "config {key} = {}, expected {want}", tc[key]);
+        }
+        ensure!(tc["rms_norm_eps"].as_f64().is_some_and(|e| (e - EPS as f64).abs() < 1e-12), "rms_norm_eps {}", tc["rms_norm_eps"]);
+        ensure!(tc["attn_output_gate"].as_bool() == Some(true) && tc["attention_bias"].as_bool() == Some(false),
+                "attention without the output gate or with biases");
+        ensure!(tc.get("num_experts").and_then(|x| x.as_u64()).unwrap_or(0) == 0, "MoE Qwen checkpoints are not supported");
+        let rope = &tc["rope_parameters"];
+        ensure!(rope["rope_type"] == "default" && rope["rope_theta"].as_f64() == Some(THETA)
+                && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64), "rope {rope}");
+        Ok(Dims { h: get("hidden_size").context("hidden_size")?, ff: get("intermediate_size").context("intermediate_size")?,
+                  nh: get("num_attention_heads").context("num_attention_heads")?,
+                  lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")?,
+                  vocab: tc["vocab_size"].as_u64().context("vocab_size")? as usize })
+    }
+
+    pub fn q_width(self) -> i32 { self.nh * HD }
+    pub fn kv_width(self) -> i32 { NKV * HD }
+    pub fn key_width(self) -> i32 { LK_HEADS * LKD }
+    pub fn value_width(self) -> i32 { self.lv_heads * LVD }
+    pub fn conv_width(self) -> i32 { 2 * self.key_width() + self.value_width() }
+}
+
+/// x W^T for W [out][in], dense in f16 or in MLX's affine quantized layout.
+pub enum Linear {
+    Dense(Array),
+    Quant { w: Array, scales: Array, biases: Array, group: i32, bits: i32 },
+}
+
+impl Linear {
+    fn new(w: Array) -> MResult<Self> {
+        Ok(Linear::Dense(w))
+    }
+
+    fn stored(q: &Quant, dtype: Dtype) -> MResult<Self> {
+        let (rows, groups) = (q.rows as i32, (q.cols / q.group) as i32);
+        Ok(Linear::Quant {
+            w: Array::from_slice(&q.q, &[rows, (q.cols * q.bits / 32) as i32]),
+            scales: Array::from_slice(&q.scales, &[rows, groups]).as_dtype(dtype)?,
+            biases: Array::from_slice(&q.offsets, &[rows, groups]).as_dtype(dtype)?,
+            group: q.group as i32,
+            bits: q.bits as i32,
+        })
+    }
+
+    fn arrays(&self) -> Vec<&Array> {
+        match self {
+            Linear::Dense(w) => vec![w],
+            Linear::Quant { w, scales, biases, .. } => vec![w, scales, biases],
+        }
+    }
+
+    /// Products enter the f32 mixer/residual path without another low-precision element-wise pass.
+    pub fn apply(&self, x: &Array) -> MResult<Array> {
+        let y = match self {
+            Linear::Dense(w) => ops::matmul(x, ops::transpose(w)?),
+            Linear::Quant { w, scales, biases, group, bits } => ops::quantized_matmul(x, w, scales, biases, true, *group, *bits),
+        }?;
+        y.as_dtype(Dtype::Float32)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind { Delta, Attn }
+
+pub struct Layer {
+    pub kind: Kind,
+    /// Attention: [q_proj; k_proj; v_proj], q_proj interleaving query and gate rows per head.
+    /// DeltaNet: [in_proj_qkv; in_proj_z].
+    pub in_proj: Linear,
+    /// DeltaNet: [in_proj_b; in_proj_a].
+    pub in_ba: Option<Linear>,
+    pub out_proj: Linear,
+    pub input_norm: Array,
+    pub post_norm: Array,
+    pub gate_up: Linear,
+    pub down: Linear,
+    pub q_norm: Option<Array>,
+    pub k_norm: Option<Array>,
+    /// DeltaNet convolution [C][4], gates [Hv], and its plain (not zero-centered) output norm [Dv].
+    pub conv_w: Option<Array>,
+    pub a_log: Option<Array>,
+    pub dt_bias: Option<Array>,
+    pub delta_norm: Option<Array>,
+}
+
+pub struct Weights {
+    pub dtype: Dtype,
+    pub d: Dims,
+    /// [V][H], used for lookup and for a dense tied output layer.
+    pub embed: Array,
+    /// None: a dense tied output layer (`embed`); otherwise the checkpoint's separate or quantized output matrix.
+    pub head: Option<Linear>,
+    pub final_norm: Array,
+    pub layers: Vec<Layer>,
+}
+
+/// CUDA's dense-to-int8 quantization (core.rs's pack), in the backend-neutral Quant layout.
+fn symmetric_int8(m: Matrix) -> Result<Quant> {
+    let Matrix::Dense { w, rows, cols } = m else { bail!("quantizing an already quantized matrix") };
+    let group = QGROUP as usize;
+    ensure!(cols % group == 0, "int8 quantization: {cols} columns, not groups of {group}");
+    let (groups, words) = (cols / group, cols / 4);
+    let mut q = vec![0u32; rows * words];
+    let mut scales = vec![0f32; rows * groups];
+    let mut offsets = vec![0f32; rows * groups];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per = rows.div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for (i, ((qc, sc_out), oc)) in q.chunks_mut(per * words).zip(scales.chunks_mut(per * groups))
+            .zip(offsets.chunks_mut(per * groups)).enumerate() {
+            let w = &w;
+            sc.spawn(move || {
+                for r in 0..sc_out.len() / groups {
+                    let row = (i * per + r) * cols;
+                    for g in 0..groups {
+                        let at = row + g * group;
+                        let max = w[at..at + group].iter().fold(0f32, |m, &x| {
+                            m.max(f32::from_bits((x as u32) << 16).abs())
+                        });
+                        let scale = if max > 0.0 { max / 127.0 } else { 1.0 };
+                        sc_out[r * groups + g] = scale;
+                        oc[r * groups + g] = -128.0 * scale;
+                        for (c, &x) in w[at..at + group].iter().enumerate() {
+                            let x = f32::from_bits((x as u32) << 16);
+                            let v = (x / scale).round().clamp(-127.0, 127.0) as i32 + 128;
+                            let col = g * group + c;
+                            qc[r * words + col / 4] |= (v as u32) << ((col % 4) * 8);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(Quant { bits: 8, group, rows, cols, q, scales, offsets })
+}
+
+fn array(bits: &[u16], shape: &[i32], dtype: Dtype) -> MResult<Array> {
+    let v: Vec<bf16> = bits.iter().map(|&b| bf16::from_bits(b)).collect();
+    Array::from_slice(&v, shape).as_dtype(dtype)
+}
+
+impl Weights {
+    pub fn load(dir: &Path, dtype: Dtype, int8: bool) -> Result<Self> {
+        ensure!(dtype == Dtype::Float16, "the MLX inference backend currently uses f16 matrix inputs");
+        let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
+        let tc = config.get("text_config").unwrap_or(&config);
+        let d = Dims::of(&config)?;
+        let ck = Checkpoint::open(dir)?;
+        // Original HF: model.language_model.*. An mlx-lm conversion is language_model.model.* on disk, which
+        // Checkpoint's prefix removal exposes as model.*.
+        let text = if ck.has("model.language_model.embed_tokens.weight") {
+            "model.language_model"
+        } else if ck.has("model.embed_tokens.weight") {
+            "model"
+        } else {
+            bail!("no text embedding table")
+        };
+        let types = tc["layer_types"].as_array().context("layer_types")?;
+        ensure!(!types.is_empty(), "no layers");
+        // mlx-lm's sanitizer moves conv [C][1][4] to [C][4][1] and adds one to the zero-centered norms. Detect
+        // that exact conversion rather than adding one twice to an MLX checkpoint.
+        let first_delta = types.iter().position(|x| x == "linear_attention").context("no DeltaNet layers")?;
+        let conv_name = format!("{text}.layers.{first_delta}.linear_attn.conv1d.weight");
+        let (_, conv_shape) = ck.floats(&conv_name)?;
+        let zero_centered = conv_shape.last() != Some(&1);
+        let quantize = int8 && !ck.prequantized();
+
+        let mats = |names: &[String]| -> Result<Vec<Matrix>> {
+            names.iter().map(|n| ck.matrix(n.strip_suffix(".weight").unwrap_or(n))).collect()
+        };
+        let dense = |names: &[String], mats: Vec<Matrix>| -> Result<Array> {
+            let (mut all, mut cols) = (Vec::new(), 0);
+            for (n, m) in names.iter().zip(mats) {
+                let (w, c) = match m {
+                    Matrix::Dense { w, rows, cols } => {
+                        ensure!(w.len() == rows * cols, "{n}: {} values for {rows} x {cols}", w.len());
+                        (w, cols)
+                    }
+                    Matrix::Quant(q) => (q.to_bf16(), q.cols),
+                };
+                ensure!(cols == 0 || cols == c, "stacking matrices with different column counts");
+                cols = c;
+                all.extend(w);
+            }
+            Ok(array(&all, &[(all.len() / cols) as i32, cols as i32], dtype)?)
+        };
+        let lin = |names: &[String]| -> Result<Linear> {
+            let ms = mats(names)?;
+            if ms.iter().all(|m| matches!(m, Matrix::Quant(_))) {
+                let qs = ms.into_iter().filter_map(|m| if let Matrix::Quant(q) = m { Some(q) } else { None }).collect();
+                return Ok(Linear::stored(&Quant::stack(qs)?, dtype)?);
+            }
+            if quantize {
+                // CUDA's pack(), not MLX's affine min/max quantization: symmetric q in [-127,127], stored +128,
+                // an f32 max/127 scale per row and group of 128, and round/clamp in exactly that order.
+                let qs = ms.into_iter().map(symmetric_int8).collect::<Result<Vec<_>>>()?;
+                return Ok(Linear::stored(&Quant::stack(qs)?, dtype)?);
+            }
+            Ok(Linear::new(dense(names, ms)?)?)
+        };
+        let vec = |n: &str| -> Result<Array> {
+            let (w, shape) = ck.floats(n)?;
+            Ok(Array::from_slice(&w, &shape.iter().map(|&d| d as i32).collect::<Vec<_>>()))
+        };
+        let norm = |n: &str| -> Result<Array> {
+            let (w, _) = ck.floats(n)?;
+            let w: Vec<f32> = if zero_centered { w.into_iter().map(|x| 1.0 + x).collect() } else { w };
+            Ok(Array::from_slice(&w, &[w.len() as i32]))
+        };
+        let mut layers = Vec::new();
+        for (i, kind) in types.iter().enumerate() {
+            let p = format!("{text}.layers.{i}");
+            let kind = match kind.as_str() {
+                Some("linear_attention") => Kind::Delta,
+                Some("full_attention") => Kind::Attn,
+                other => bail!("layer {i}: unknown type {other:?}"),
+            };
+            let mixer = if kind == Kind::Delta { "linear_attn" } else { "self_attn" };
+            let a = format!("{p}.{mixer}");
+            let in_names: Vec<String> = if kind == Kind::Delta {
+                ["in_proj_qkv", "in_proj_z"].map(|n| format!("{a}.{n}.weight")).into()
+            } else {
+                ["q_proj", "k_proj", "v_proj"].map(|n| format!("{a}.{n}.weight")).into()
+            };
+            let in_ba = if kind == Kind::Delta {
+                Some(lin(&["in_proj_b", "in_proj_a"].map(|n| format!("{a}.{n}.weight")))?)
+            } else { None };
+            let attn_norm = |n: &str| -> Result<Option<Array>> {
+                if kind == Kind::Attn { Ok(Some(norm(&format!("{a}.{n}.weight"))?)) } else { Ok(None) }
+            };
+            let delta_vec = |n: &str| -> Result<Option<Array>> {
+                if kind == Kind::Delta { Ok(Some(vec(&format!("{a}.{n}"))?)) } else { Ok(None) }
+            };
+            layers.push(Layer {
+                kind,
+                in_proj: lin(&in_names)?,
+                in_ba,
+                out_proj: lin(&[format!("{a}.{}.weight", if kind == Kind::Delta { "out_proj" } else { "o_proj" })])?,
+                input_norm: norm(&format!("{p}.input_layernorm.weight"))?,
+                post_norm: norm(&format!("{p}.post_attention_layernorm.weight"))?,
+                gate_up: lin(&["gate_proj", "up_proj"].map(|n| format!("{p}.mlp.{n}.weight")))?,
+                down: lin(&[format!("{p}.mlp.down_proj.weight")])?,
+                q_norm: attn_norm("q_norm")?,
+                k_norm: attn_norm("k_norm")?,
+                conv_w: if kind == Kind::Delta {
+                    let (w, shape) = ck.floats(&format!("{a}.conv1d.weight"))?;
+                    ensure!(shape.iter().product::<usize>() == d.conv_width() as usize * CONV_K as usize,
+                            "{a}.conv1d.weight: shape {shape:?}");
+                    Some(Array::from_slice(&w, &[d.conv_width(), CONV_K]))
+                } else { None },
+                a_log: delta_vec("A_log")?,
+                dt_bias: delta_vec("dt_bias")?,
+                delta_norm: delta_vec("norm.weight")?,
+            });
+        }
+        let embed_base = format!("{text}.embed_tokens");
+        let embed = dense(&[format!("{embed_base}.weight")], mats(&[format!("{embed_base}.weight")])?)?;
+        let head_base = if ck.has("lm_head.weight") { "lm_head".to_string() } else { embed_base.clone() };
+        let head = if ck.is_quant(&head_base) || head_base != embed_base {
+            Some(lin(&[format!("{head_base}.weight")])?)
+        } else { None };
+        let w = Weights { dtype, d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers };
+        w.eval()?;
+        Ok(w)
+    }
+
+    fn eval(&self) -> MResult<()> {
+        let mut all: Vec<&Array> = vec![&self.embed, &self.final_norm];
+        all.extend(self.head.iter().flat_map(Linear::arrays));
+        for l in &self.layers {
+            for x in [&l.in_proj, &l.out_proj, &l.gate_up, &l.down] {
+                all.extend(x.arrays());
+            }
+            all.extend(l.in_ba.iter().flat_map(Linear::arrays));
+            all.extend([&l.input_norm, &l.post_norm]);
+            all.extend(l.q_norm.iter().chain(&l.k_norm).chain(&l.conv_w).chain(&l.a_log).chain(&l.dt_bias).chain(&l.delta_norm));
+        }
+        mlx_rs::transforms::eval(all)
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        let n_attn = self.layers.iter().filter(|l| l.kind == Kind::Attn).count();
+        (n_attn, self.layers.len() - n_attn)
+    }
+
+    pub fn positions(&self) -> Vec<At> {
+        let (mut ai, mut di) = (0, 0);
+        self.layers.iter().enumerate().map(|(li, l)| {
+            let at = At { li, ai, di };
+            if l.kind == Kind::Delta { di += 1 } else { ai += 1 }
+            at
+        }).collect()
+    }
+
+    pub fn layers(&self, m: &mut impl Mix, mut h: Array) -> MResult<Array> {
+        for at in self.positions() {
+            h = self.layer(at, m, &h)?;
+        }
+        Ok(h)
+    }
+
+    fn layer(&self, at: At, m: &mut impl Mix, h: &Array) -> MResult<Array> {
+        let (dt, l, d) = (self.dtype, &self.layers[at.li], self.d);
+        let t = h.shape()[0];
+        let xn = rms(h, &l.input_norm)?.as_dtype(dt)?;
+        let projected = l.in_proj.apply(&xn)?;
+        let y = match l.kind {
+            Kind::Attn => {
+                let s = ops::split_at_indices(&projected, &[2 * d.q_width(), 2 * d.q_width() + d.kv_width()], -1)?;
+                let qg = s[0].reshape(&[t, d.nh, 2, HD])?;
+                let qg = ops::split_equal(&qg, 2, 2)?;
+                let q = rms(&qg[0].squeeze_axes(&[2])?, l.q_norm.as_ref().unwrap())?;
+                let k = rms(&s[1].reshape(&[t, NKV, HD])?, l.k_norm.as_ref().unwrap())?;
+                let (cos, sin) = m.rope();
+                let (q, k) = (rope(&q, &cos, &sin)?, rope(&k, &cos, &sin)?);
+                let o = m.attend(at.ai, &q, &k, &s[2].reshape(&[t, NKV, HD])?)?;
+                gate(&o, &qg[1].squeeze_axes(&[2])?)?.reshape(&[t, d.q_width()])?
+            }
+            Kind::Delta => {
+                let qkvz = ops::split_at_indices(&projected, &[d.conv_width()], -1)?;
+                let ba = l.in_ba.as_ref().unwrap().apply(&xn)?;
+                m.delta(at.di, l, &qkvz[0], &qkvz[1], &ba)?
+            }
+        };
+        let op = l.out_proj.apply(&y.as_dtype(dt)?)?;
+        let h = ops::add(h, &op)?;
+        let xn = rms(&h, &l.post_norm)?.as_dtype(dt)?;
+        let ab = ops::split_equal(&l.gate_up.apply(&xn)?, 2, -1)?;
+        let mid = swiglu(&ab[0], &ab[1], dt)?;
+        let f = l.down.apply(&mid)?;
+        ops::add(&h, &f)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct At { pub li: usize, pub ai: usize, pub di: usize }
+
+/// The cache-dependent parts of a step. Arrays have no batch dimension: each segment is one sequence.
+pub trait Mix {
+    /// Split-half RoPE tables [T][1][ROT], f32.
+    fn rope(&self) -> (Array, Array);
+    /// q [T][Nq][256], k/v [T][Nkv][256], result [T][Nq][256], all f32.
+    fn attend(&mut self, ai: usize, q: &Array, k: &Array, v: &Array) -> MResult<Array>;
+    /// qkv [T][C], z [T][Hv*Dv], ba [T][2*Hv], result [T][Hv*Dv].
+    fn delta(&mut self, di: usize, layer: &Layer, qkv: &Array, z: &Array, ba: &Array) -> MResult<Array>;
+}
+
+pub fn rms(x: &Array, w: &Array) -> MResult<Array> {
+    fast::rms_norm(x, Some(w), EPS)
+}
+
+/// Split-half RoPE on the first 64 dimensions; the remaining 192 pass through unchanged.
+pub fn rope(x: &Array, cos: &Array, sin: &Array) -> MResult<Array> {
+    let dtype = x.dtype();
+    let x = x.as_dtype(Dtype::Float32)?;
+    let parts = ops::split_at_indices(&x, &[ROT], -1)?;
+    let halves = ops::split_equal(&parts[0], 2, -1)?;
+    let rot = ops::concatenate(&[ops::negative(&halves[1])?, halves[0].clone()], -1)?;
+    let rotated = ops::add(ops::multiply(&parts[0], cos)?, ops::multiply(&rot, sin)?)?;
+    ops::concatenate(&[rotated, parts[1].clone()], -1)?.as_dtype(dtype)
+}
+
+/// o times the per-channel sigmoid gate, in f32.
+pub fn gate(o: &Array, g: &Array) -> MResult<Array> {
+    ops::multiply(o, nn::sigmoid(g.as_dtype(Dtype::Float32)?)?)
+}
+
+/// silu(a) * b in f32, rounded to the matrix input dtype.
+pub fn swiglu(a: &Array, b: &Array, dtype: Dtype) -> MResult<Array> {
+    ops::multiply(nn::silu(a.as_dtype(Dtype::Float32)?)?, b.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)
+}
+
+/// Once per process, before MLX's first operation. The switches mirror lfm3-engine: changing prompt shapes must not
+/// trip the graph-cache warning, and freed buffers must not accumulate without a bound.
+pub fn init() -> MResult<()> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let mut r = Ok(());
+    ONCE.call_once(|| {
+        for (k, v) in [("MLX_ENABLE_CACHE_THRASHING_CHECK", "0"), ("MLX_USE_CUDA_GRAPHS", "0")] {
+            if std::env::var_os(k).is_none() {
+                // SAFETY: startup, before MLX and before any thread that reads these variables.
+                unsafe { std::env::set_var(k, v) };
+            }
+        }
+        r = mlx_rs::memory::set_cache_limit(2 << 30).map(|_| ());
+    });
+    r
+}
+
+/// An array's values on the host as f32, in row-major order.
+pub fn host(a: &Array) -> Result<Vec<f32>> {
+    let a = a.as_dtype(Dtype::Float32)?.contiguous()?;
+    a.eval()?;
+    Ok(a.try_as_slice::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?.to_vec())
+}
