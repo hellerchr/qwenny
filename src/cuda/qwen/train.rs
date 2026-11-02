@@ -29,8 +29,9 @@ const PTX_27B: [&str; 3] = [include_str!(concat!(env!("OUT_DIR"), "/qwen27b_trai
                             include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_f32.ptx")),
                             include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_f16.ptx"))];
 
-const KERNELS: [&str; 22] = [
+const KERNELS: [&str; 23] = [
     "dequant", "rms_fwd", "add_rms", "rms_bwd_pre", "rms_bwd_final", "swiglu_fwd", "swiglu_bwd", "scatter_rows",
+    "scatter_rows_scaled",
     "cross_entropy", "dn_conv", "dn_rule", "dn_rule_bwd", "dn_norm", "dn_norm_bwd", "dn_conv_bwd", "dn_conv_in_bwd",
     "at_prep", "at_prep_bwd", "at_softmax", "at_softmax_bwd", "at_gate", "at_gate_bwd",
 ];
@@ -163,6 +164,8 @@ pub struct Trainer {
     dlog: Buf,
     loss_row: Buf,
     correct: Buf,
+    /// per loss row: the weight of its loss (pass_weighted)
+    row_w: Buf,
 }
 
 fn cfg3(grid: (usize, usize, usize), block: usize) -> LaunchConfig {
@@ -367,6 +370,7 @@ impl Trainer {
             dlog: alloc(CHUNK * d.vocab * es)?,
             loss_row: alloc(tmax * 4)?,
             correct: alloc(tmax * 4)?,
+            row_w: alloc(tmax * 4)?,
             l: Learn::new(s.clone(), &module, &KERNELS, o.clone(), lay, &init,
                           Scratch { tmax, inp: d.ff.max(mix).max(in_max), ldu: U_RANKS * o.rank })?,
             layers,
@@ -616,6 +620,21 @@ impl Trainer {
     /// Forward over the micro-batch; with `train` (dropout on) also the backward pass, adding the gradients of
     /// `scale` * (summed loss) to the arena. Returns (summed loss, correct argmax) over the micro-batch's loss rows.
     pub fn pass(&self, mb: &Micro, train: bool, scale: f32, step: u64, micro: usize) -> Result<(f64, usize)> {
+        let (loss, correct) = self.run(mb, train, scale, None, step, micro)?;
+        Ok((loss.iter().map(|&x| x as f64).sum(), correct))
+    }
+
+    /// A training pass with a weight per loss row that depends on the losses (preference training): after the
+    /// forward pass `weigh` gets the loss (NLL) of every loss row and returns their weights w; the gradients of
+    /// sum_i w_i * loss_i are added to the arena. Returns the rows' losses. The output layer's backward runs once
+    /// with weight 1 and its rows are scaled afterwards (the rest of the backward pass is linear in them).
+    pub fn pass_weighted(&self, mb: &Micro, step: u64, micro: usize, weigh: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>>)
+        -> Result<Vec<f32>> {
+        Ok(self.run(mb, true, 1.0, Some(weigh), step, micro)?.0)
+    }
+
+    fn run(&self, mb: &Micro, train: bool, scale: f32, weigh: Option<&mut dyn FnMut(&[f32]) -> Result<Vec<f32>>>, step: u64,
+           micro: usize) -> Result<(Vec<f32>, usize)> {
         self.upload(mb)?;
         let (l, t, h, es) = (&self.l, mb.tokens(), self.d.h, self.l.es as u64);
         let ids: Vec<u32> = mb.ids.iter().map(|&i| i as u32).collect();
@@ -655,21 +674,38 @@ impl Trainer {
         }
         let loss: Vec<f32> = l.dtoh(self.loss_row.p, na)?;
         let correct: Vec<i32> = l.dtoh(self.correct.p, na)?;
-        let out = (loss.iter().map(|&x| x as f64).sum(), correct.iter().filter(|&&c| c != 0).count());
+        let correct = correct.iter().filter(|&&c| c != 0).count();
         if !train {
-            return Ok(out);
+            return Ok((loss, correct));
         }
 
         l.zero(self.dh.p, t * h * 4)?;
+        let weights = match weigh {
+            Some(f) => {
+                let w = f(&loss)?;
+                ensure!(w.len() == na, "{} row weights for {na} loss rows", w.len());
+                Some(w)
+            }
+            None => None,
+        };
         if na > 0 {
-            l.launch("scatter_rows", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.dh.p)])?;
+            match &weights {
+                None => l.launch("scatter_rows", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.dh.p)])?,
+                Some(w) => {
+                    l.htod(self.row_w.p, w)?;
+                    l.launch("scatter_rows_scaled", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.row_w.p), P(self.dh.p)])?;
+                }
+            }
         }
         let n = self.layers.len();
         l.launch("rms_bwd_final", t, 256, &[P(self.hs(n)), P(self.rs_fin.p), P(self.final_norm.p), P(self.dh.p)])?;
         for i in (0..n).rev() {
             self.layer_bwd(i, mb, step, micro)?;
         }
-        Ok(out)
+        if weights.is_some() {
+            l.s.synchronize()?; // the weights' host copy outlives their upload
+        }
+        Ok((loss, correct))
     }
 }
 

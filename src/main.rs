@@ -15,6 +15,8 @@ mod sessions;
 mod training;
 #[cfg(has_mlx)]
 mod mlx;
+#[cfg(has_cuda)]
+mod preference;
 
 use anyhow::{Context, Result, bail, ensure};
 use engine::Engine;
@@ -24,7 +26,8 @@ const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] 
                       Qwen3.5-4B, Qwen3.5-9B and Qwen3.8-27B, also compressed-tensors int4/int8 checkpoints)
   qwenny serve                                  OpenAI-compatible server (--ui: also the chat and decision page)
   qwenny train <data> [out dir]                 LoRA fine-tune (data: a dir with train.jsonl and optionally dev.jsonl,
-                                                or one .jsonl; out: runs/<data>-N)
+                                                or one .jsonl; out: runs/<data>-N); rows with \"chosen\" and
+                                                \"rejected\": preference training (DPO + NLL, RPO)
   qwenny merge <adapter dir> <out dir>          write the model with a LoRA merged in
   qwenny bench [tokens]                         decode (1 and more streams), verify steps and prompt speed
   qwenny password                               set the web page's password (asked for; it is also chosen on the
@@ -44,6 +47,8 @@ const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] 
   qwenny cachecheck, swapcheck                  slots saved, loaded and swapped to host memory continue identically
   qwenny traincheck <grads reference>           loss, gradients, AdamW step vs. PEFT (--precision, --packed)
   qwenny datacheck <data dir> <data reference>  token ids and loss masks vs. Unsloth's
+  qwenny dpocheck <dpo reference>               preference training: RPO loss, log-probabilities, gradients vs. PyTorch
+                                                + PEFT (tools/make_dpo_reference.py; --precision, --packed)
 options: --adapter=[<name>=]<dir> (a LoRA, served unmerged: serve answers \"model\": <name> with it and --name without
          it; name default: the directory's, or its parent's for runs/<data>-N/adapter; the checks and bench run it),
          --backend=cuda|mlx (default: CUDA when built in, else MLX), --bf16 (16-bit weights instead of int8),
@@ -56,7 +61,8 @@ options: --adapter=[<name>=]<dir> (a LoRA, served unmerged: serve answers \"mode
          train: the defaults are the tested recipe: --epochs=3 (at most: the adapter of the lowest dev loss is kept,
                 training stops after 2 measurements without a new low) --batch=8 --lr=2e-4 --rank=16 --alpha=32
                 --dropout=0.05 --max-len=4096 --precision=f16 (the big products accumulated in f16; bf16; f32: the
-                check build)
+                check build), --init-adapter=<dir> (start from a PEFT adapter, its rank and alpha);
+                preference rows: --beta=0.1 --nll=1.0 (the chosen response's NLL weight) --lr=5e-6 --dropout=0
          --key value works like --key=value";
 
 /// Command-line options: `--flag` or `--key=value`.
@@ -126,7 +132,7 @@ impl Opts {
     fn train_opts(&self) -> Result<training::TrainOpts> {
         Ok(training::TrainOpts {
             epochs: self.get("epochs", 3)?, batch: self.get("batch", 8)?, lr: self.get("lr", 2e-4)?,
-            max_len: self.get("max-len", 4096)?,
+            max_len: self.get("max-len", 4096)?, init: self.path("init-adapter"),
         })
     }
 
@@ -150,7 +156,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
     Some(match cmd {
         "serve" => ([&LOAD[..], &["host", "port", "name", "spec", "decisions", "db"]].concat(), vec!["bf16", "ui"], 0..=0),
         "password" => (vec!["db"], vec![], 0..=0),
-        "train" => ([&lora[..], &["epochs", "batch", "lr", "max-len"]].concat(), vec![], 1..=2),
+        "train" => ([&lora[..], &["epochs", "batch", "lr", "max-len", "init-adapter", "beta", "nll"]].concat(), vec![], 1..=2),
         "merge" => (vec!["model"], vec![], 2..=2),
         "bench" => ([&LOAD[..], &["pos"]].concat(), bf16, 0..=1),
         "check" => ([&LOAD[..], &["write"]].concat(), bf16, 1..=2),
@@ -164,6 +170,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
         "swapcheck" => (vec!["model", "len"], bf16, 0..=0),
         "traincheck" => (lora.to_vec(), vec!["packed"], 1..=1),
         "datacheck" => (vec!["model"], vec![], 2..=2),
+        "dpocheck" => (lora.to_vec(), vec!["packed"], 1..=1),
         _ => return None,
     })
 }
@@ -272,7 +279,25 @@ fn main() -> Result<()> {
             server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
         }
         #[cfg(has_cuda)]
-        "train" => training::train(&model, p(0), a.get(1).map(Path::new), opts.lora()?, opts.train_opts()?),
+        "train" => {
+            let (mut lo, mut to) = (opts.lora()?, opts.train_opts()?);
+            if preference::is_preference(p(0))? {
+                // preference defaults: dropout off (TRL's DPOConfig.disable_dropout: the implicit reward compares the
+                // policy with the reference, both without dropout), lr 5e-6 (alignment-handbook's QLoRA DPO recipe)
+                if opts.path("dropout").is_none() {
+                    lo.dropout = 0.0;
+                }
+                if opts.path("lr").is_none() {
+                    to.lr = 5e-6;
+                }
+                let po = preference::PrefOpts { beta: opts.get("beta", 0.1)?, nll: opts.get("nll", 1.0)? };
+                preference::train(&model, p(0), a.get(1).map(Path::new), lo, to, po)
+            } else {
+                ensure!(opts.path("beta").is_none() && opts.path("nll").is_none(), "--beta and --nll are options of \
+                         preference training (rows with \"chosen\" and \"rejected\")");
+                training::train(&model, p(0), a.get(1).map(Path::new), lo, to)
+            }
+        }
         "merge" => lora::merge(&model, p(0), p(1)),
         "bench" => checks::bench(&opts, m, a.first().map_or(Ok(256), |c| c.parse())?),
         "check" => checks::check(&opts, m, a[0], a.get(1).map_or(Ok(1), |c| c.parse())?),
@@ -294,8 +319,10 @@ fn main() -> Result<()> {
         "traincheck" => training::traincheck(&model, p(0), opts.lora()?, flags.iter().any(|f| *f == "--packed")),
         #[cfg(has_cuda)]
         "datacheck" => training::datacheck(&model, p(0), p(1)),
+        #[cfg(has_cuda)]
+        "dpocheck" => preference::dpocheck(&model, p(0), opts.lora()?, flags.iter().any(|f| *f == "--packed")),
         #[cfg(not(has_cuda))]
-        "train" | "traincheck" | "datacheck" => bail!("{cmd}: CUDA backend only so far"),
+        "train" | "traincheck" | "datacheck" | "dpocheck" => bail!("{cmd}: CUDA backend only so far"),
         _ => unreachable!("{cmd}: in `strict`, not here"),
     }
 }

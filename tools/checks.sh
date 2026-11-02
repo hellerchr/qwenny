@@ -3,7 +3,8 @@
 # with a pass criterion each, after `cargo test`: OK / FAIL per check, exit status 1 if any failed.
 #
 #   tools/checks.sh changed          the areas the uncommitted changes touch (git diff HEAD); see `areas_of`
-#   tools/checks.sh <area>...        qwen-train qwen-train-27b chat qwen-infer mlx, or all (all but qwen-train-27b)
+#   tools/checks.sh <area>...        qwen-train qwen-dpo qwen-train-27b chat qwen-infer mlx, or all (all but
+#                                    qwen-train-27b and mlx)
 #   --make                           make missing references (else a missing one is a FAIL that prints its command)
 #
 # qwen-train-27b runs on the RTX 3090 VM only (the 27B needs 24 GB): tools/vm.sh tools/checks.sh qwen-train-27b, after
@@ -32,6 +33,10 @@ make_ref() {
         $QREF/train-grads-4l.safetensors) echo "$PY tools/make_train_reference.py grads Qwen/Qwen3.5-4B $FJ $1 3 4" ;;
         $QREF/train-grads-4l-w4a16.safetensors)
             echo "$PY tools/make_train_reference.py grads \$(snapshot $W4A16) $FJ $1 3 4 --weights=\$(snapshot $W4A16)" ;;
+        # preference training (RPO): 3 pairs of the Fjordhaus data, the first 4 layers, cross-checked with TRL
+        $QREF/dpo-4l.safetensors) echo "$PY tools/make_dpo_reference.py Qwen/Qwen3.5-4B $FJ $1 3 4" ;;
+        $QREF/dpo-4l-w4a16.safetensors)
+            echo "$PY tools/make_dpo_reference.py \$(snapshot $W4A16) $FJ $1 3 4 --weights=\$(snapshot $W4A16)" ;;
         $QREF/data-ref.safetensors) echo "$PY tools/make_train_reference.py data Qwen/Qwen3.5-4B $FJ $1" ;;
         $QREF/reference.safetensors) echo "$PY tools/make_reference_qwen.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         $QREF/mtp-ref.safetensors) echo "$PY tools/make_reference_mtp.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
@@ -73,6 +78,23 @@ traincheck() {
         ok "traincheck $name: worst gradient error $err (< $max), cosine $cos"
     else
         fail "traincheck $name: worst gradient error ${err:-?} (limit $max): $(grep -E '^(loss|Error)' <<<"$out" | head -2)"
+    fi
+}
+
+# dpocheck <name> <reference> <max worst relative error> <args...>: preference training (RPO) vs. PyTorch + PEFT fp32:
+# the pairs' token ids and masks identical, then loss, log-probabilities and LoRA gradients
+dpocheck() {
+    local name=$1 ref=$2 max=$3; shift 3
+    need "$ref" || return
+    local out; out=$($BIN dpocheck "$ref" "$@" 2>&1)
+    local err cos loss; err=$(grep -oP 'gradients of \d+ tensors: worst relative error \K[0-9.e+-]+' <<<"$out")
+    cos=$(grep -oP 'lowest cosine \K[0-9.]+' <<<"$out")
+    loss=$(grep -oP '^loss .*\(diff \K[0-9.e+-]+' <<<"$out")
+    if [ -n "$err" ] && grep -qP '^(\d+) responses: ids identical for \1, masks identical for \1$' <<<"$out" \
+        && awk -v e="$err" -v m="$max" 'BEGIN { exit !(e < m) }'; then
+        ok "dpocheck $name: tokens identical, loss diff $loss, worst gradient error $err (< $max), cosine $cos"
+    else
+        fail "dpocheck $name: worst gradient error ${err:-?} (limit $max): $(grep -E '^(loss|Error|[0-9]+ responses)' <<<"$out" | head -2 | tr '\n' ' ')"
     fi
 }
 
@@ -238,6 +260,12 @@ area() {
             traincheck "Qwen3.5-4B f16" "$QREF/train-grads-4l.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --precision=f16
             traincheck "Qwen3.5-4B int4 f32" "$QREF/train-grads-4l-w4a16.safetensors" 1e-4 --model=$W4A16 --precision=f32
             datacheck "Qwen (Unsloth's masks)" "$QREF/data-ref.safetensors" --model=Qwen/Qwen3.5-4B ;;
+        qwen-dpo)
+            # preference training: every pair split over two passes (the later half's forward first), and packed
+            dpocheck "Qwen3.5-4B f32, pairs split" "$QREF/dpo-4l.safetensors" 1e-4 --model=Qwen/Qwen3.5-4B --precision=f32
+            dpocheck "Qwen3.5-4B f32, packed" "$QREF/dpo-4l.safetensors" 1e-4 --model=Qwen/Qwen3.5-4B --precision=f32 --packed
+            dpocheck "Qwen3.5-4B f16, packed" "$QREF/dpo-4l.safetensors" 0.05 --model=Qwen/Qwen3.5-4B --precision=f16 --packed
+            dpocheck "Qwen3.5-4B int4 f32" "$QREF/dpo-4l-w4a16.safetensors" 1e-4 --model=$W4A16 --precision=f32 ;;
         qwen-train-27b)
             traincheck "Qwen3.8-27B int4 f32" "$VREF/train-grads-27b-4l.safetensors" 1e-4 --model=$Q27 --precision=f32
             traincheck "Qwen3.8-27B int4 f16" "$VREF/train-grads-27b-4l.safetensors" 0.05 --model=$Q27 --precision=f16 ;;
@@ -287,11 +315,12 @@ area() {
 areas_of() {
     case $1 in
         kernels/qwen_train.cu|kernels/train_common.cuh|src/cuda/qwen/train.rs|src/cuda/qwen/train/*|src/cuda/learn.rs\
-        |src/training.rs|tools/make_train_reference.py) echo qwen-train ;;
-        src/checkpoint.rs|build.rs|src/engine.rs|src/hub.rs) echo qwen-train qwen-infer mlx ;;
-        src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-infer ;;
+        |src/training.rs|tools/make_train_reference.py) echo qwen-train qwen-dpo ;;
+        src/preference.rs|tools/make_dpo_reference.py) echo qwen-dpo ;;
+        src/checkpoint.rs|build.rs|src/engine.rs|src/hub.rs) echo qwen-train qwen-dpo qwen-infer mlx ;;
+        src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-dpo qwen-infer ;;
         src/mlx/*|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
-        src/chat.rs) echo chat qwen-train ;;
+        src/chat.rs) echo chat qwen-train qwen-dpo ;;
         kernels/*|src/cuda/*) echo qwen-infer ;;
         src/sample.rs|src/sessions.rs|src/checks.rs|src/server.rs) echo qwen-infer mlx ;;
         tools/make_reference*.py|tools/make_tokref.py|tools/tokref-*.json) echo chat qwen-infer ;;
@@ -302,7 +331,7 @@ args=()
 for a in "$@"; do
     case $a in
         --make) MAKE=1 ;;
-        all) args+=(qwen-train chat qwen-infer) ;;
+        all) args+=(qwen-train qwen-dpo chat qwen-infer) ;;
         changed)
             files=$(git diff --name-only HEAD; git ls-files --others --exclude-standard src kernels tools vendor)
             mapfile -t found < <(for f in $files; do areas_of "$f"; done | tr ' ' '\n' | grep . | sort -u)

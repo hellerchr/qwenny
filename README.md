@@ -157,13 +157,38 @@ them in one step.
 settings would be. The dev loss is measured every half epoch; the adapter with the lowest dev loss is kept, and training
 stops after two measurements without improvement (without `dev.jsonl`, 5 % of `train.jsonl` is held out). Options:
 `--epochs=3`, `--batch=8`, `--lr=2e-4`, `--rank=16`, `--alpha=32`, `--dropout=0.05`, `--max-len=4096`,
-`--precision=f16` (or `bf16`, `f32`). Each layer's backward pass recomputes its forward pass; frozen weights stay in
-their stored format and are dequantized per product.
+`--precision=f16` (or `bf16`, `f32`), `--init-adapter=<dir>` (start from a PEFT adapter, with its rank and alpha,
+instead of a fresh LoRA). Each layer's backward pass recomputes its forward pass; frozen weights stay in their stored
+format and are dequantized per product.
+
+**Preference training** (DPO with an NLL term, RPO: Pang et al. 2024, "Iterative Reasoning Preference
+Optimization"). Data whose rows carry `"chosen"` and `"rejected"` switches `qwenny train` to it (the first row of
+`train.jsonl` decides; every row must then be a pair):
+
+```json
+{"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}],
+ "chosen": {"role": "assistant", "content": "...", "reasoning_content": "..."},
+ "rejected": {"role": "assistant", "content": "..."}, "chat_template_kwargs": {"enable_thinking": true}}
+```
+
+Each response renders as `messages + [response]` (with the row's `chat_template_kwargs`), and only it is in the loss,
+masked as SFT masks a reply (the prompt's earlier assistant turns are context). The reference policy is the starting
+point, frozen: `--init-adapter` (e.g. the SFT / RFT adapter) or, without it, the base model; its log-probabilities of
+every response are computed once before training. Per pair, with summed response log-probabilities `lp` (policy) and
+`rf` (reference), margin `m = β((lp_c − rf_c) − (lp_r − rf_r))` and loss `−log σ(m) + α · NLL_c` (NLL_c: the chosen
+response's mean per-token NLL), averaged over the step's pairs. Options: `--beta=0.1`, `--nll=1.0` (α; 0 is plain
+DPO), and other defaults than SFT's: `--lr=5e-6` (alignment-handbook's QLoRA DPO recipe for Zephyr) and
+`--dropout=0` (TRL's `disable_dropout`: policy and reference are compared without dropout); `--batch` counts pairs.
+The log has per step the loss, its DPO and NLL parts, the mean margin, the share of pairs with a positive margin
+(`accuracy`) and both rewards; the dev pairs (dev.jsonl or 5 % held out) are measured the same way every half epoch
+(and at the start, where the margin is 0), and the adapter of the lowest dev loss is kept. A pair's two responses
+share a micro-batch when they fit (4,096 tokens); a longer pair is split, the later half's log-probability then comes
+from a forward pass before the backward of the first.
 
 ## Checks
 
 `tools/checks.sh` runs each check against a reference with a pass criterion: `tools/checks.sh changed` (what the
-uncommitted changes need), `all`, or one area (`qwen-infer`, `chat`, `qwen-train`, `qwen-train-27b`).
+uncommitted changes need), `all`, or one area (`qwen-infer`, `chat`, `qwen-train`, `qwen-dpo`, `qwen-train-27b`).
 
 | Check | Compared with |
 |---|---|
@@ -174,9 +199,10 @@ uncommitted changes need), `all`, or one area (`qwen-infer`, `chat`, `qwen-train
 | `cachecheck`, `swapcheck` | the same sequence without saving or swapping |
 | `chatcheck`, `tokcheck` | Transformers' chat template and tokenizer |
 | `traincheck`, `datacheck` | PEFT's LoRA gradients and AdamW step; Unsloth's loss masks |
+| `dpocheck` | preference training: RPO loss, log-probabilities and LoRA gradients of PyTorch + PEFT (cross-checked with TRL's `DPOTrainer`), the pairs' tokens and masks |
 
 The references are made by `tools/make_reference_qwen.py`, `make_reference_mtp.py`, `make_reference_lora.py`,
-`make_train_reference.py` and `make_tokref.py`; `make_reference_vllm.py` takes top-k log-probabilities from a vLLM server for int4 checkpoints.
+`make_train_reference.py`, `make_dpo_reference.py` and `make_tokref.py`; `make_reference_vllm.py` takes top-k log-probabilities from a vLLM server for int4 checkpoints.
 `tools/decode_bench.py` (one stream) and `tools/serve_bench.py` (1 to 16 streams) measure a running server.
 
 ## Layout

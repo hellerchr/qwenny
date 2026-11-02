@@ -47,7 +47,7 @@ Unsloth's loss masks). `tools/checks.sh` runs them, each with a pass criterion, 
 cargo build --release                       # target/release/qwenny; kernels compile to PTX for compute_86
 cargo test --release                        # unit tests, CPU, seconds (checks.sh runs these first)
 tools/checks.sh changed                     # the checks the uncommitted changes need
-tools/checks.sh all                         # qwen-infer, chat, qwen-train: everything on the 4B
+tools/checks.sh all                         # qwen-infer, chat, qwen-train, qwen-dpo: everything on the 4B
 tools/checks.sh qwen-train-27b              # the 27B, on the 3090 only (from the dev box: tools/vm.sh tools/checks.sh qwen-train-27b)
 cargo build --release --features mlx        # also the MLX backend (--backend=mlx; MLX's CUDA build, long the first time)
 tools/checks.sh mlx                         # the MLX backend (builds with --features mlx)
@@ -56,7 +56,8 @@ tools/checks.sh mlx                         # the MLX backend (builds with --fea
 - Areas: `qwen-infer` (logits vs. Transformers for int8 and 16-bit; with a LoRA vs. PEFT for int4, int8 and 16-bit,
   and adaptercheck: adapter and base requests in the same steps; layercheck of layers 0 and 3, speccheck with MTP,
   samplecheck with sampled drafts, longcheck, cachecheck, swapcheck, mtpcheck as INFO), `chat` (template and tokenizer
-  vs. Transformers), `qwen-train` (LoRA gradients vs. PEFT for bf16 and int4, Unsloth's masks), `qwen-train-27b`,
+  vs. Transformers), `qwen-train` (LoRA gradients vs. PEFT for bf16 and int4, Unsloth's masks), `qwen-dpo`
+  (preference training: RPO loss and LoRA gradients vs. PyTorch + PEFT and TRL, pairs split and packed), `qwen-train-27b`,
   `mlx` (the MLX backend: logits vs. Transformers, and vs. CUDA's on the same prompts within a bound (`check
   --write` makes CUDA's into a reference), speccheck for DeltaNet rollback; `tools/backend_diff.py`, whether CUDA and
   MLX servers reply byte for byte alike, as INFO: the backends round differently, so sampled replies can split at a
@@ -66,7 +67,7 @@ tools/checks.sh mlx                         # the MLX backend (builds with --fea
 - `QWENNY_BIN` and `QWENNY_PY` override the binary and the Python.
 - The single checks, for a quick look while working: `qwenny check <ref>`, `layercheck <ref> --layer=N`,
   `speccheck`, `samplecheck`, `longcheck`, `cachecheck`, `swapcheck`, `mtpcheck <ref>`, `adaptercheck <ref>
-  --adapter=<dir>`, `tokcheck`, `chatcheck`, `traincheck`, `datacheck` (all take `--model=`; `src/main.rs` lists their
+  --adapter=<dir>`, `tokcheck`, `chatcheck`, `traincheck`, `datacheck`, `dpocheck` (all take `--model=`; `src/main.rs` lists their
   options; `check` and `bench` take `--adapter=` too).
 
 ## Measure speed
@@ -177,7 +178,8 @@ The page is at `http://192.168.31.153:18024/`. A restart reloads the 27B and tak
   points; argmax epilogue), `kernels/sampling.cuh` (the sampler, sampled drafts).
 - `src/server.rs`, `src/sessions.rs` (slots, saved states, host swap), `src/chat.rs` (template, tool calls),
   `src/decide.rs`, `src/sample.rs`, `src/ui.html`.
-- `src/training.rs`, `src/lora.rs`, `src/cuda/learn.rs`, `src/cuda/qwen/train.rs`, `kernels/qwen_train.cu`: LoRA.
+- `src/training.rs`, `src/lora.rs`, `src/cuda/learn.rs`, `src/cuda/qwen/train.rs`, `kernels/qwen_train.cu`: LoRA;
+  `src/preference.rs`: preference training (RPO) on it.
 - `src/cuda/qwen/lora.rs`, `kernels/lora.cuh`: a LoRA served unmerged, per request (`Engine::set_adapter` per slot;
   sessions keep the base model's and the adapter's states apart).
 - `src/checkpoint.rs`, `src/hub.rs`: loading weights (formats, quantization), Hugging Face downloads.

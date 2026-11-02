@@ -92,10 +92,10 @@ def dequantized(qdir, dest):
                         t.copy_(st.get_tensor(n).reshape(t.shape))
 
 
-def grads_ref(model, data, out, docs, layers, weights=None):
+def load_model(model, layers, weights=None):
+    """The tokenizer and the fp32 text model on the GPU (its first `layers` layers; 0: all), the weights of `weights`
+    (a compressed-tensors checkpoint) dequantized into it, or from `model`"""
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-    from peft import LoraConfig, get_peft_model
-    torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     tc = config.text_config
@@ -131,6 +131,13 @@ def grads_ref(model, data, out, docs, layers, weights=None):
     else:
         m = AutoModelForCausalLM.from_pretrained(model, config=config, dtype=torch.float32, device_map="cuda",
                                                  trust_remote_code=True, attn_implementation="eager")
+    return tok, m
+
+
+def grads_ref(model, data, out, docs, layers, weights=None):
+    from peft import LoraConfig, get_peft_model
+    torch.manual_seed(0)
+    tok, m = load_model(model, layers, weights)
     m = get_peft_model(m, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.0, target_modules=TARGETS,
                                      task_type="CAUSAL_LM"))
     params = {n: p for n, p in m.named_parameters() if p.requires_grad}

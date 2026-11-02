@@ -67,15 +67,28 @@ pub struct Example {
 }
 
 impl Example {
-    fn loss_tokens(&self) -> usize {
+    pub fn loss_tokens(&self) -> usize {
         self.mask[1..].iter().filter(|&&m| m != 0).count()
     }
 }
 
 /// The non-empty lines of a JSONL file with their line numbers.
-fn read_rows(path: &Path) -> Result<Vec<(usize, String)>> {
+pub(crate) fn read_rows(path: &Path) -> Result<Vec<(usize, String)>> {
     let text = fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
     Ok(text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()).map(|(i, l)| (i + 1, l.to_string())).collect())
+}
+
+/// A row's own chat_template_kwargs (e.g. {"enable_thinking": true, "reasoning_effort": "low"}: the system prompt then
+/// carries the effort's instruction, as the server renders such a request) over the defaults
+pub(crate) fn row_kwargs(defaults: &serde_json::Map<String, Json>, row: &Json, name: &str, line: usize)
+    -> Result<serde_json::Map<String, Json>> {
+    let mut kw = defaults.clone();
+    match &row["chat_template_kwargs"] {
+        Json::Null => {}
+        Json::Object(o) => kw.extend(o.iter().map(|(k, v)| (k.clone(), v.clone()))),
+        _ => bail!("{name}:{line}: chat_template_kwargs is not an object"),
+    }
+    Ok(kw)
 }
 
 /// Rows `{"messages": [...]}` rendered without thinking (a row's `chat_template_kwargs` override that, e.g. a
@@ -96,14 +109,7 @@ fn encode_rows(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str
             no_reply.push(*line);
             continue;
         }
-        // a row's own chat_template_kwargs (e.g. {"enable_thinking": true, "reasoning_effort": "low"}: the system
-        // prompt then carries the effort's instruction, as the server renders such a request) over the default
-        let mut kw = kwargs.clone();
-        match &row["chat_template_kwargs"] {
-            Json::Null => {}
-            Json::Object(o) => kw.extend(o.iter().map(|(k, v)| (k.clone(), v.clone()))),
-            _ => bail!("{name}:{line}: chat_template_kwargs is not an object"),
-        }
+        let kw = row_kwargs(&kwargs, &row, name, *line)?;
         let (mut ids, mut mask) = chat.encode_train(&row["messages"], &kw).with_context(|| format!("{name}:{line}"))?;
         if ids.len() > max_len {
             cut.push(*line);
@@ -137,7 +143,7 @@ pub fn load_examples(chat: &Chat, path: &Path, max_len: usize) -> Result<Vec<Exa
 
 /// Takes a dev set out of `rows` when there is no dev.jsonl: 5 % (at least 30 or a tenth, at most 200), chosen with a
 /// fixed seed so that every run of the same data holds out the same rows; nothing below 100 rows.
-fn hold_out(rows: &mut Vec<(usize, String)>) -> Vec<(usize, String)> {
+pub(crate) fn hold_out(rows: &mut Vec<(usize, String)>) -> Vec<(usize, String)> {
     let n = rows.len();
     if n < 100 {
         return Vec::new();
@@ -229,15 +235,17 @@ pub struct TrainOpts {
     pub lr: f32,
     /// longer examples are cut
     pub max_len: usize,
+    /// --init-adapter: a PEFT adapter to start from (its rank and alpha), instead of a fresh LoRA (B = 0)
+    pub init: Option<std::path::PathBuf>,
 }
 
 /// The rest of the recipe: warmup share of the steps, gradient clipping, AdamW weight decay, the seed of the shuffle
 /// and of LoRA's init, and how many dev measurements (every half epoch) without a new low stop training
 const WARMUP: f32 = 0.05;
-const MAX_GRAD_NORM: f32 = 1.0;
-const WEIGHT_DECAY: f32 = 0.0;
-const SEED: u64 = 42;
-const PATIENCE: usize = 2;
+pub(crate) const MAX_GRAD_NORM: f32 = 1.0;
+pub(crate) const WEIGHT_DECAY: f32 = 0.0;
+pub(crate) const SEED: u64 = 42;
+pub(crate) const PATIENCE: usize = 2;
 
 impl TrainOpts {
     /// Learning rate of `step` of `total`: HF's cosine schedule with linear warmup, evaluated before the step (the
@@ -282,10 +290,9 @@ fn evaluate(t: &mut Trainer, examples: &[Example]) -> Result<(f64, f64, f64, f64
 /// With a dev set: the dev loss is measured every half epoch, the adapter is saved whenever it is the lowest so far,
 /// and training stops after PATIENCE measurements without a new low, so `adapter/` holds the best adapter and `epochs`
 /// is an upper bound. Without one (fewer than 100 examples and no dev.jsonl): the adapter after `epochs`.
-pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOpts) -> Result<()> {
-    let t0 = Instant::now();
-    // data: a directory with train.jsonl (and dev.jsonl), or one JSONL file
-    let (train_path, dev_path) = if data.is_dir() {
+/// The training data: a directory with train.jsonl (and dev.jsonl), or one JSONL file
+pub(crate) fn data_paths(data: &Path) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    Ok(if data.is_dir() {
         let t = data.join("train.jsonl");
         ensure!(t.exists(), "{} has no train.jsonl (one row {{\"messages\": [...]}} per line; dev.jsonl is optional)",
                 data.display());
@@ -293,11 +300,114 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     } else {
         ensure!(data.exists(), "{}: no such file or directory", data.display());
         (data.to_path_buf(), None)
-    };
+    })
+}
+
+/// The run's out dir (runs/<data>-N by default) and its adapter dir, which must not exist yet
+pub(crate) fn out_dirs(data: &Path, out: Option<&Path>) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let out = out.map_or_else(|| run_dir(data), Path::to_path_buf);
     let adapter = out.join("adapter");
     ensure!(!adapter.exists(), "{} already holds an adapter: give another out dir (or leave it out for runs/<data>-N)",
             out.display());
+    Ok((out, adapter))
+}
+
+/// A PEFT adapter to start from (--init-adapter): its rank, alpha and LoRA tensors by the trainer's names
+pub struct InitAdapter {
+    pub rank: usize,
+    pub alpha: f32,
+    pub tensors: HashMap<String, Vec<f32>>,
+}
+
+/// The trainer's name of a PEFT LoRA tensor: without the adapter name (".default"), and the text model's
+/// "model.layers.N" (an adapter of AutoModelForCausalLM) as the checkpoint's "model.language_model.layers.N"
+pub(crate) fn trainer_name(name: &str) -> String {
+    name.replace(".default", "").replace("base_model.model.model.layers.", "base_model.model.model.language_model.layers.")
+}
+
+pub fn read_init_adapter(dir: &Path) -> Result<InitAdapter> {
+    let cfg: Json = serde_json::from_str(&fs::read_to_string(dir.join("adapter_config.json"))
+        .with_context(|| format!("--init-adapter: {}/adapter_config.json", dir.display()))?)?;
+    ensure!(cfg["peft_type"].as_str().is_none_or(|t| t == "LORA"), "--init-adapter: {} is not a LoRA", dir.display());
+    ensure!(cfg["use_rslora"].as_bool() != Some(true) && cfg["use_dora"].as_bool() != Some(true),
+            "--init-adapter: an rsLoRA/DoRA adapter");
+    let empty = |k: &str| cfg[k].is_null() || cfg[k].as_object().is_some_and(|o| o.is_empty());
+    ensure!(empty("rank_pattern") && empty("alpha_pattern"), "--init-adapter: an adapter with a rank_pattern or alpha_pattern");
+    let rank = cfg["r"].as_u64().context("adapter_config.json: r")? as usize;
+    let alpha = cfg["lora_alpha"].as_f64().context("adapter_config.json: lora_alpha")? as f32;
+    let bytes = fs::read(dir.join("adapter_model.safetensors")).with_context(|| format!("{}/adapter_model.safetensors", dir.display()))?;
+    let st = SafeTensors::deserialize(&bytes)?;
+    let mut tensors = HashMap::new();
+    for name in st.names() {
+        if name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight") {
+            let t = st.tensor(name)?;
+            let v = match t.dtype() {
+                Dtype::F32 => f32s(t.data()),
+                Dtype::BF16 => t.data().as_chunks().0.iter().map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16)).collect(),
+                d => bail!("--init-adapter: {name} is {d:?}"),
+            };
+            tensors.insert(trainer_name(name), v);
+        }
+    }
+    ensure!(!tensors.is_empty(), "--init-adapter: no LoRA tensors in {}", dir.display());
+    Ok(InitAdapter { rank, alpha, tensors })
+}
+
+/// Writes `init` (by the trainer's names) over the trainer's LoRA: every tensor of it must be one the trainer has,
+/// with its shape; the trainer's others stay fresh (B = 0, no change to the model). Returns how many were written.
+pub fn apply_init(tr: &mut Trainer, init: &HashMap<String, Vec<f32>>) -> Result<usize> {
+    let shapes: HashMap<String, usize> = tr.tensors().into_iter().map(|(n, r, c)| (n, r * c)).collect();
+    let foreign: Vec<&String> = init.keys().filter(|n| !shapes.contains_key(*n)).collect();
+    ensure!(foreign.is_empty(), "the adapter has {} tensors this model's LoRA does not (e.g. {}): an adapter of another \
+             model or of other layers", foreign.len(), foreign[0]);
+    for (n, v) in init {
+        ensure!(v.len() == shapes[n], "{n}: {} values, this LoRA has {} (another rank?)", v.len(), shapes[n]);
+    }
+    let mut params = tr.read_params(false)?;
+    for (n, v) in init {
+        params.insert(n.clone(), v.clone());
+    }
+    tr.write_params(&params)?;
+    Ok(init.len())
+}
+
+/// The trainer, with smaller micro-batches while the GPU is short of memory (see below); `lmax`: the longest example
+pub(crate) fn new_trainer(model: &Path, o: Opts, lmax: usize) -> Result<Trainer> {
+    // short of GPU memory: a smaller micro-batch (the same gradients, accumulated over more passes) until it fits:
+    // half, but not below the longest example (rounded up to 256 tokens: a micro-batch holds at least one whole row)
+    let mut o = o;
+    let floor = lmax.max(512).div_ceil(256) * 256;
+    loop {
+        match Trainer::new(model, o.clone(), o.micro_tokens.max(lmax), lmax, SEED) {
+            Ok(t) => return Ok(t),
+            Err(e) if crate::engine::out_of_memory(&e) => {
+                let (free, all) = mem_gib();
+                ensure!(o.micro_tokens > floor, "GPU out of memory ({free:.1} of {all:.1} GiB free) with micro-batches \
+                        of {} tokens, the least that holds the longest example ({lmax} tokens): a lower --max-len, or \
+                        free the GPU (nvidia-smi lists what holds it)", o.micro_tokens);
+                o.micro_tokens = (o.micro_tokens / 2).max(floor);
+                println!("GPU memory short ({free:.1} GiB free): --micro-tokens={} (same result, a little slower)", o.micro_tokens);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `o` with the rank and alpha of --init-adapter, and the adapter
+pub(crate) fn with_init(o: Opts, init: Option<&Path>) -> Result<(Opts, Option<InitAdapter>)> {
+    let Some(dir) = init else { return Ok((o, None)) };
+    let a = read_init_adapter(dir)?;
+    if (a.rank, a.alpha) != (o.rank, o.alpha) {
+        println!("--init-adapter: rank {} and alpha {} from {}", a.rank, a.alpha, dir.display());
+    }
+    Ok((Opts { rank: a.rank, alpha: a.alpha, ..o }, Some(a)))
+}
+
+pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOpts) -> Result<()> {
+    let t0 = Instant::now();
+    let (train_path, dev_path) = data_paths(data)?;
+    let (out, adapter) = out_dirs(data, out)?;
+    let (o, init) = with_init(o, to.init.as_deref())?;
     let chat = Chat::load(model)?;
     let tname = train_path.display().to_string();
     let mut rows = read_rows(&train_path)?;
@@ -332,24 +442,10 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     if train_ex.len() < 500 {
         println!("note: {} training examples; 500 to 5,000 are the usual advice", train_ex.len());
     }
-    // short of GPU memory: a smaller micro-batch (the same gradients, accumulated over more passes) until it fits:
-    // half, but not below the longest example (rounded up to 256 tokens: a micro-batch holds at least one whole row)
-    let mut o = o;
-    let floor = lmax.max(512).div_ceil(256) * 256;
-    let mut tr = loop {
-        match Trainer::new(model, o.clone(), o.micro_tokens.max(lmax), lmax, SEED) {
-            Ok(t) => break t,
-            Err(e) if crate::engine::out_of_memory(&e) => {
-                let (free, all) = mem_gib();
-                ensure!(o.micro_tokens > floor, "GPU out of memory ({free:.1} of {all:.1} GiB free) with micro-batches \
-                        of {} tokens, the least that holds the longest example ({lmax} tokens): a lower --max-len, or \
-                        free the GPU (nvidia-smi lists what holds it)", o.micro_tokens);
-                o.micro_tokens = (o.micro_tokens / 2).max(floor);
-                println!("GPU memory short ({free:.1} GiB free): --micro-tokens={} (same result, a little slower)", o.micro_tokens);
-            }
-            Err(e) => return Err(e),
-        }
-    };
+    let mut tr = new_trainer(model, o, lmax)?;
+    if let Some(a) = &init {
+        println!("starting from {} ({} LoRA tensors)", to.init.as_ref().unwrap().display(), apply_init(&mut tr, &a.tensors)?);
+    }
     let (free, all) = mem_gib();
     println!("loaded in {:.1}s, {} LoRA parameters, {free:.1} GiB free of {all:.1}", t0.elapsed().as_secs_f64(),
              tr.tensors().iter().map(|t| t.1 * t.2).sum::<usize>());
@@ -433,19 +529,19 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     Ok(())
 }
 
-fn ref_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn ref_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     let t = st.tensor(name).with_context(|| format!("reference tensor {name}"))?;
     ensure!(t.dtype() == Dtype::F32, "{name} is {:?}", t.dtype());
     Ok(f32s(t.data()))
 }
 
-fn ref_i32(st: &SafeTensors, name: &str) -> Result<Vec<i32>> {
+pub(crate) fn ref_i32(st: &SafeTensors, name: &str) -> Result<Vec<i32>> {
     let t = st.tensor(name).with_context(|| format!("reference tensor {name}"))?;
     Ok(t.data().as_chunks().0.iter().map(|&c| i32::from_le_bytes(c)).collect())
 }
 
 /// Reference tensors with the given prefix, by PEFT name without the adapter name (".default")
-fn ref_params(st: &SafeTensors, prefix: &str) -> Result<HashMap<String, Vec<f32>>> {
+pub(crate) fn ref_params(st: &SafeTensors, prefix: &str) -> Result<HashMap<String, Vec<f32>>> {
     let mut out = HashMap::new();
     for name in st.names() {
         if let Some(rest) = name.strip_prefix(prefix) {
@@ -456,7 +552,7 @@ fn ref_params(st: &SafeTensors, prefix: &str) -> Result<HashMap<String, Vec<f32>
 }
 
 /// |a - b| / |b| and the cosine of a and b
-fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
+pub(crate) fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
     let (mut d, mut nb, mut na, mut dot) = (0f64, 0f64, 0f64, 0f64);
     for (&x, &y) in a.iter().zip(b) {
         d += ((x - y) as f64).powi(2);
@@ -516,8 +612,14 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
     println!("loss {:.6} vs reference {ref_loss:.6} (diff {:.2e}); per-token NLL mean |diff| {:.2e}, max {:.2e}",
              loss / total as f64, (loss / total as f64 - ref_loss).abs(), nll_err / total as f64, worst_nll);
 
+    grads_and_step(&mut tr, &r)
+}
+
+/// The LoRA gradients against the reference's "grad." tensors, then one AdamW step (lr 2e-4, clip 1.0) against its
+/// "step1." tensors from its "init." ones (traincheck, dpocheck)
+pub(crate) fn grads_and_step(tr: &mut Trainer, r: &SafeTensors) -> Result<()> {
     let ours = tr.read_params(true)?;
-    let reff = ref_params(&r, "grad.")?;
+    let reff = ref_params(r, "grad.")?;
     let (mut worst, mut worst_name, mut min_cos) = (0f64, String::new(), 1f64);
     let mut by_kind: HashMap<String, (f64, usize)> = HashMap::new();
     for (name, g) in &reff {
@@ -539,10 +641,10 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
         println!("  {k:<18} worst relative error {e:.2e} ({n} tensors)");
     }
     let norm = tr.optimizer_step(2e-4, 1.0, 0.0)?;
-    let ref_norm = ref_f32(&r, "grad_norm")?[0];
+    let ref_norm = ref_f32(r, "grad_norm")?[0];
     let after = tr.read_params(false)?;
-    let ref_after = ref_params(&r, "step1.")?;
-    let init = ref_params(&r, "init.")?;
+    let ref_after = ref_params(r, "step1.")?;
+    let init = ref_params(r, "init.")?;
     let mut worst_step = 0f64;
     for (name, p) in &ref_after {
         let ours_d: Vec<f32> = after[name].iter().zip(&init[name]).map(|(a, b)| a - b).collect();

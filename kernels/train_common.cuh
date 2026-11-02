@@ -124,6 +124,13 @@ extern "C" __global__ void scatter_rows(const float* x, const int* rows, float* 
     for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = x[(size_t)blockIdx.x * H + i];
 }
 
+// the same with row blockIdx.x scaled by w[blockIdx.x] (preference training: a weight per loss row)
+extern "C" __global__ void scatter_rows_scaled(const float* x, const int* rows, const float* w, float* out) {
+    float* dst = out + (size_t)rows[blockIdx.x] * H;
+    const float s = w[blockIdx.x];
+    for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = s * x[(size_t)blockIdx.x * H + i];
+}
+
 // Per row (one block): loss = logsumexp - logit[target], correct = argmax == target, and with dlog != 0
 // dlog = scale * (softmax - onehot(target)).
 extern "C" __global__ void cross_entropy(const float* logits, const int* targets, int V, float scale, act* dlog,

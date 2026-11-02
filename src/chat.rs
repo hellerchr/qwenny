@@ -190,6 +190,16 @@ impl Chat {
     /// Token ids of a whole conversation and which of them the assistant wrote: the replies as Unsloth's
     /// train_on_responses_only marks them (`response_spans`; a token is in the loss if one of its characters is in one).
     pub fn encode_train(&self, messages: &Json, kwargs: &Map<String, Json>) -> Result<(Vec<u32>, Vec<u8>)> {
+        self.encode_masked(messages, kwargs, false)
+    }
+
+    /// The same with only the last reply in the loss (preference training: a prompt and one response to it, the
+    /// prompt's earlier assistant turns are context)
+    pub fn encode_last_reply(&self, messages: &Json, kwargs: &Map<String, Json>) -> Result<(Vec<u32>, Vec<u8>)> {
+        self.encode_masked(messages, kwargs, true)
+    }
+
+    fn encode_masked(&self, messages: &Json, kwargs: &Map<String, Json>, last: bool) -> Result<(Vec<u32>, Vec<u8>)> {
         let mut ctx = Map::new();
         ctx.insert("messages".into(), normalize(messages)?);
         ctx.insert("add_generation_prompt".into(), json!(false));
@@ -198,7 +208,10 @@ impl Chat {
             ctx.insert(k.clone(), v.clone());
         }
         let text = self.env.get_template("chat")?.render(Value::from(Serde(&ctx)))?;
-        let spans = response_spans(&text);
+        let mut spans = response_spans(&text);
+        if last {
+            spans.drain(..spans.len().saturating_sub(1));
+        }
         let enc = self.tok.encode_char_offsets(text.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         let mask = enc.get_offsets().iter().map(|&(s, e)| spans.iter().any(|&(a, b)| s < b && e > a) as u8).collect();
         Ok((enc.get_ids().to_vec(), mask))
