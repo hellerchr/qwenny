@@ -428,7 +428,11 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
         .collect::<Result<_>>()?;
     ensure!(!rows.is_empty(), "no prompts in {prompts}");
 
-    let mut m = crate::cuda::qwen::Model::load_only(Path::new(dir), ctx, 1, opts.int8, None, None)?;
+    let adapter = opts.adapter()?;
+    let mut m = crate::cuda::qwen::Model::load_only(Path::new(dir), ctx, 1, opts.int8, adapter.as_ref().map(|a| &a.1), None)?;
+    if adapter.is_some() {
+        m.set_adapter(0, true)?;
+    }
     let (nl, h) = (m.n_layers(), m.hidden());
 
     let mut group_names: Vec<String> = Vec::new();
@@ -497,6 +501,10 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     meta.insert("n_layers".into(), nl.to_string());
     meta.insert("k".into(), k.to_string());
     meta.insert("hidden".into(), h.to_string());
+    if let Some((name, ad)) = &adapter {
+        meta.insert("adapter".into(), name.clone());
+        meta.insert("adapter_matrices".into(), ad.len().to_string());
+    }
     meta.insert("model_dir".into(), dir.to_string());
     meta.insert("int8".into(), opts.int8.to_string());
     meta.insert("template_hash".into(), format!("{template_hash:016x}"));

@@ -623,7 +623,8 @@ impl Model {
     pub fn capture_forward(&mut self, toks: &[Tok], k: usize) -> Result<Vec<f32>> {
         self.map_step(toks)?;
         self.x.st.upload(&self.x.s, toks, &[], None)?;
-        self.x.st.lora = false;
+        // match step(): adapter on iff a token's slot has it enabled (so the mechanistic check can capture WITH the adapter)
+        self.x.st.lora = self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]));
         let (x, h) = (&self.x, self.x.d.h);
         let (s, kern, b, st) = (&x.s, &x.k, &x.b, &x.st);
         let (eps, n) = (EPS, st.n);

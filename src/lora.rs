@@ -117,6 +117,157 @@ impl Adapter {
     }
 }
 
+/// The residual-stream WRITER submodules of a Qwen-family transformer layer: every matrix whose output is added
+/// back into the residual stream. Abliteration edits each as W' = W - alpha * r (rᵀW), a rank-1 LoRA (B = -r,
+/// A = rᵀW). A Qwen layer writes the residual through exactly: the mixer out-projection (DeltaNet
+/// `linear_attn.out_proj` OR attention `self_attn.o_proj`, whichever that layer has) and the MLP down-projection
+/// (dense `mlp.down_proj`, or every expert `mlp.experts.{e}.down_proj` when the layer is MoE). THIS LIST IS THE ONLY
+/// ARCHITECTURE-SPECIFIC KNOWLEDGE IN THE BAKE: a new Qwen variant with a new residual-writer submodule is a one-line
+/// addition here (and, if it is an expert set, to the MoE probe in `writers_of`).
+const WRITER_SUBMODULES: &[&str] = &["linear_attn.out_proj", "self_attn.o_proj", "mlp.down_proj"];
+
+/// Enumerate the residual-writer matrices of the model STRUCTURALLY from the checkpoint (never a hardcoded layer
+/// count or writer count): scan `model.language_model.layers.{i}` while it exists, and for each take whichever
+/// `WRITER_SUBMODULES` are present; `mlp.down_proj` expands to `mlp.experts.{e}.down_proj` for a MoE layer. Returns
+/// (base weight name without `.weight`, a short kind label for reporting).
+fn writers_of(ck: &crate::checkpoint::Checkpoint) -> Vec<(String, &'static str)> {
+    let present = |base: &str| ck.is_quant(base) || ck.has(&format!("{base}.weight"));
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let lp = format!("model.language_model.layers.{i}");
+        if !ck.has(&format!("{lp}.input_layernorm.weight")) {
+            break;
+        }
+        for sub in WRITER_SUBMODULES {
+            let base = format!("{lp}.{sub}");
+            if *sub == "mlp.down_proj" {
+                if present(&base) {
+                    out.push((base, "mlp.down_proj"));
+                } else {
+                    let mut e = 0usize; // MoE: per-expert down-projections
+                    loop {
+                        let eb = format!("{lp}.mlp.experts.{e}.down_proj");
+                        if present(&eb) { out.push((eb, "mlp.experts.down_proj")); e += 1; } else { break; }
+                    }
+                }
+            } else if present(&base) {
+                out.push((base, sub));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A = rᵀW [cols] for writer `base`, dequantized through the checkpoint's OWN dequant path (int4/int8/dense alike),
+/// threaded over rows. Also returns (rows, cols) = W's output/input dims.
+fn writer_a(ck: &crate::checkpoint::Checkpoint, base: &str, r: &[f32]) -> Result<(usize, usize, Vec<f32>)> {
+    use crate::checkpoint::Matrix;
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let reduce = |rows: usize, cols: usize, row_f32: &(dyn Fn(usize, &mut [f32]) + Sync)| -> Vec<f32> {
+        let per = rows.div_ceil(threads).max(1);
+        let partials: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..rows).step_by(per).map(|r0| {
+                s.spawn(move || {
+                    let (mut acc, mut buf) = (vec![0f32; cols], vec![0f32; cols]);
+                    for row in r0..(r0 + per).min(rows) {
+                        row_f32(row, &mut buf);
+                        let rr = r[row];
+                        for (a, &b) in acc.iter_mut().zip(&buf) { *a += rr * b; }
+                    }
+                    acc
+                })
+            }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut a = vec![0f32; cols];
+        for p in partials { for (x, &y) in a.iter_mut().zip(&p) { *x += y; } }
+        a
+    };
+    match ck.matrix(base)? {
+        Matrix::Quant(q) => {
+            let (rows, cols) = (q.rows, q.cols);
+            let a = reduce(rows, cols, &|row, buf| q.row_into(row, buf));
+            Ok((rows, cols, a))
+        }
+        Matrix::Dense { w, rows, cols } => {
+            let a = reduce(rows, cols, &|row, buf| {
+                for (c, o) in buf.iter_mut().enumerate() {
+                    *o = f32::from_bits((w[row * cols + c] as u32) << 16);
+                }
+            });
+            Ok((rows, cols, a))
+        }
+    }
+}
+
+/// `qwenny bake-direction`: build the abliteration adapter from a direction `r` [hidden]. For every residual-writer
+/// matrix W in the model, emit a rank-1 LoRA A = rᵀW (from the served int4/int8 dequant), B = -r, so the served
+/// unmerged edit is W x + alpha*B(A x) = (W - alpha * r rᵀ W) x. `alpha` is the strength knob (lora_alpha; 1.0 = full).
+pub fn bake_direction(model: &Path, dir_file: &Path, out: &Path, alpha: f32) -> Result<()> {
+    let bytes = fs::read(dir_file).with_context(|| format!("reading {}", dir_file.display()))?;
+    let st = SafeTensors::deserialize(&bytes)?;
+    let (r, rshape) = floats(&st, "r")?;
+    ensure!(rshape.len() == 1, "direction 'r' must be a vector, got shape {rshape:?}");
+    let ck = crate::checkpoint::Checkpoint::open(model)?;
+    let writers = writers_of(&ck);
+    ensure!(!writers.is_empty(), "no residual-writer matrices under model.language_model.layers.*");
+
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut leaves: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out_vec: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
+    // The serving kernel serves LoRA ranks [8,16,32,64], so pad rank 1 -> 8 with zero rows/cols (exact same edit).
+    const RANK: usize = 8;
+    let mut b_bytes: Vec<u8> = Vec::with_capacity(r.len() * RANK * 4); // B = -r in col 0, zeros in cols 1..8, [rows][8]
+    for &v in &r {
+        b_bytes.extend_from_slice(&(-v).to_le_bytes());
+        b_bytes.extend(std::iter::repeat(0u8).take((RANK - 1) * 4));
+    }
+    let (mut hidden, mut per_layer) = (0usize, std::collections::BTreeMap::<usize, usize>::new());
+    for (base, kind) in &writers {
+        let (rows, cols, a) = writer_a(&ck, base, &r).with_context(|| format!("writer {base}"))?;
+        ensure!(rows == r.len(), "{base}: {rows} output rows != direction length {}", r.len());
+        hidden = rows;
+        *counts.entry(kind).or_default() += 1;
+        if let Some(seg) = base.split(".layers.").nth(1).and_then(|s| s.split('.').next()).and_then(|s| s.parse().ok()) {
+            *per_layer.entry(seg).or_default() += 1;
+        }
+        leaves.insert(base.rsplit('.').next().unwrap_or(base).to_string());
+        let stem = format!("base_model.model.{base}");
+        let mut a_bytes: Vec<u8> = Vec::with_capacity(RANK * cols * 4); // A = rᵀW in row 0, zeros in rows 1..8, [8][cols]
+        a_bytes.extend(a.iter().flat_map(|x| x.to_le_bytes()));
+        a_bytes.extend(std::iter::repeat(0u8).take((RANK - 1) * cols * 4));
+        out_vec.push((format!("{stem}.lora_A.weight"), Dtype::F32, vec![RANK, cols], a_bytes));
+        out_vec.push((format!("{stem}.lora_B.weight"), Dtype::F32, vec![rows, RANK], b_bytes.clone()));
+    }
+
+    fs::create_dir_all(out)?;
+    let views: Vec<_> = out_vec.iter()
+        .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
+        .collect::<Result<_>>()?;
+    let meta: HashMap<String, String> = [("format".to_string(), "pt".to_string())].into();
+    safetensors::serialize_to_file(views, Some(meta), &out.join("adapter_model.safetensors"))?;
+    let targets: Vec<String> = leaves.into_iter().collect();
+    let cfg = serde_json::json!({
+        "peft_type": "LORA", "task_type": "CAUSAL_LM", "r": RANK, "lora_alpha": alpha * RANK as f32, "lora_dropout": 0.0,
+        "bias": "none", "fan_in_fan_out": false, "use_rslora": false, "use_dora": false,
+        "rank_pattern": {}, "alpha_pattern": {}, "target_modules": targets,
+        "base_model_name_or_path": model.to_string_lossy(),
+    });
+    fs::write(out.join("adapter_config.json"), serde_json::to_string_pretty(&cfg)?)?;
+
+    let per_vals: Vec<usize> = per_layer.values().copied().collect();
+    let (lo, hi) = (per_vals.iter().min().copied().unwrap_or(0), per_vals.iter().max().copied().unwrap_or(0));
+    println!("baked {} residual-writer matrices across {} layers (writers/layer {}..{}), hidden {hidden}, rank {RANK}, alpha {alpha}:",
+             writers.len(), per_layer.len(), lo, hi);
+    for (k, c) in &counts {
+        println!("  {k}: {c}");
+    }
+    println!("wrote {}/adapter_model.safetensors + adapter_config.json", out.display());
+    Ok(())
+}
+
 /// Copy the model directory to `out` with the adapter merged into model.safetensors.
 pub fn merge(base: &Path, adapter: &Path, out: &Path) -> Result<()> {
     let ad = Adapter::load(adapter)?;
