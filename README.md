@@ -230,3 +230,8 @@ extended with zero points and an argmax epilogue. Swift 1.5's int4 checkpoint an
 ## License
 
 No license has been chosen yet. `kernels/marlin.cuh` keeps Marlin's Apache 2.0 notice.
+
+## Linting
+
+`scripts/lint.sh` is the CI gate: `cargo fmt --all --check`, then `cargo clippy --all-targets --all-features -- -D warnings`.
+The lint levels live in the `[lints]` tables of `Cargo.toml` and the format in `rustfmt.toml`. `cargo machete` finds unused dependencies.

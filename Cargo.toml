@@ -41,3 +41,11 @@ mlx-rs = { version = "0.32.0", features = ["metal", "accelerate"] }
 [patch.crates-io]
 # mlx-sys with a Linux build path (MLX's CUDA backend) and x86 half types; macOS builds as upstream
 mlx-sys = { path = "vendor/mlx-sys" }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lints.rust]
+dead_code = "warn"
+unused_imports = "warn"
+unused_variables = "warn"

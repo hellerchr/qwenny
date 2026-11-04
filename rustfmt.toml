@@ -1,0 +1,3 @@
+# Matches the existing code exactly: cargo fmt --check is clean with these two settings.
+max_width = 120
+use_small_heuristics = "Max"
