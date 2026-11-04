@@ -36,6 +36,7 @@ const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] 
   qwenny check <reference.safetensors> [chunk]  logits vs. Transformers (tools/make_reference_qwen.py) or vLLM's top-k
                                                 log-probabilities (tools/make_reference_vllm.py)
   qwenny layercheck <reference.safetensors>     one layer's mixer vs. the reference (--layer=0: DeltaNet, 3: attention)
+  qwenny capture <prompts.jsonl> <out.safetensors>   residual activations per prompt/layer (--last=K suffix rows)
   qwenny mtpcheck <reference.safetensors>       the draft layer (MTP) vs. tools/make_reference_mtp.py
   qwenny adaptercheck <reference.safetensors>   a LoRA (--adapter) and the base model in the same steps vs. each
                                                 alone and vs. tools/make_reference_lora.py
@@ -161,6 +162,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
         "bench" => ([&LOAD[..], &["pos"]].concat(), bf16, 0..=1),
         "check" => ([&LOAD[..], &["write"]].concat(), bf16, 1..=2),
         "layercheck" => (vec!["model", "layer"], bf16, 1..=1),
+        "capture" => ([&LOAD[..], &["last"]].concat(), bf16, 2..=2),
         "mtpcheck" => (vec!["model"], bf16, 1..=1),
         "adaptercheck" => (vec!["model", "adapter"], bf16, 1..=1),
         "tokcheck" => (vec!["model"], vec![], 2..=2),
@@ -302,6 +304,7 @@ fn main() -> Result<()> {
         "bench" => checks::bench(&opts, m, a.first().map_or(Ok(256), |c| c.parse())?),
         "check" => checks::check(&opts, m, a[0], a.get(1).map_or(Ok(1), |c| c.parse())?),
         "layercheck" => checks::layercheck(&opts, m, a[0], opts.get("layer", 0)?),
+        "capture" => checks::capture(&opts, m, a[0], a[1]),
         "mtpcheck" => checks::mtpcheck(&opts, m, a[0]),
         "adaptercheck" => checks::adaptercheck(&opts, m, a[0]),
         "tokcheck" => checks::tokcheck(m, a[0], a[1]),

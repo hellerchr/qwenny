@@ -531,8 +531,16 @@ impl Model {
     /// none at first).
     pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>)
     -> Result<Self> {
+        Self::load_only(dir, max_ctx, slots, int8, adapter, None)
+    }
+
+    /// Like `load`, but passes `only` to `Stack::load` (`Some(i)`: load just transformer layer `i`; `None`: all the
+    /// layers). For the abliteration cross-check that a truncated forward matches the full model at a depth; the
+    /// capture subcommand loads at full depth (`None`) so one forward yields every layer's tap.
+    pub fn load_only(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>,
+                     only: Option<usize>) -> Result<Self> {
         let mut used = HashSet::new();
-        let (x, w) = Stack::load(dir, max_ctx, slots, int8, None, adapter.map(|a| (a, &mut used)))?;
+        let (x, w) = Stack::load(dir, max_ctx, slots, int8, only, adapter.map(|a| (a, &mut used)))?;
         let e = "model.language_model.embed_tokens.weight".to_string();
         let head = if w.has("lm_head.weight") { "lm_head.weight".to_string() } else { e.clone() };
         let mtp = match w.has("mtp.fc.weight") {
@@ -596,6 +604,45 @@ impl Model {
             x.gemm(&self.lm_head, &b.xn, &st.logits, Epi::Argmax)?;
         }
         Ok(())
+    }
+
+    /// Hidden size (the residual-stream width).
+    pub fn hidden(&self) -> usize {
+        self.x.d.h
+    }
+
+    /// The number of loaded transformer layers.
+    pub fn n_layers(&self) -> usize {
+        self.x.layers.len()
+    }
+
+    /// An UNGRAPHED forward over `toks` (one prompt in slot 0, adapter off) for activation capture: embed, then every
+    /// loaded layer, copying the last `k` positions of the raw pre-norm residual stream `b.h` to the host after each
+    /// layer's MLP residual add. Returns [n_layers][k][hidden] f32, row-major. No lm_head (no logits requested). Kept
+    /// out of the graph-captured hot path on purpose; call `release(slot)` between prompts to reset DeltaNet/KV state.
+    pub fn capture_forward(&mut self, toks: &[Tok], k: usize) -> Result<Vec<f32>> {
+        self.map_step(toks)?;
+        self.x.st.upload(&self.x.s, toks, &[], None)?;
+        self.x.st.lora = false;
+        let (x, h) = (&self.x, self.x.d.h);
+        let (s, kern, b, st) = (&x.s, &x.k, &x.b, &x.st);
+        let (eps, n) = (EPS, st.n);
+        ensure!(k >= 1 && k < n, "last={k} suffix rows of a {n}-token prompt (need 1 <= k < n, never position 0)");
+        st.mark_seen(s)?;
+        unsafe {
+            self.embed.launch(s, kern, &st.ids, &b.h, &st.keys, st.n_out as i32, st.n)?;
+            s.launch_builder(&kern.rmsnorm).arg(&b.h).arg(&x.layers[0].input_norm).arg(&b.xn).arg(&eps)
+                .launch(cfg((st.n, 1, 1), 256))?;
+        }
+        let mut caps: Vec<f32> = Vec::with_capacity(x.layers.len() * k * h);
+        for (i, l) in x.layers.iter().enumerate() {
+            let sp = x.mix(l)?;
+            x.add_rmsnorm(sp, &l.post_norm)?;
+            let sp = x.mlp(l)?;
+            x.add_rmsnorm(sp, x.layers.get(i + 1).map_or(&self.final_norm, |l| &l.input_norm))?;
+            caps.extend_from_slice(&s.clone_dtoh(&b.h.slice((n - k) * h..n * h))?);
+        }
+        Ok(caps)
     }
 
     /// The kernels of one MTP step over the uploaded tokens, their hidden states at `m.rows` of the residual stream

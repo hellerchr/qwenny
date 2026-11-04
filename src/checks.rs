@@ -397,6 +397,95 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// capture: residual-stream activations for representation engineering (contrastive activation steering).
+#[cfg(not(has_cuda))]
+pub fn capture(_opts: &Opts, _dir: &str, _prompts: &str, _out: &str) -> Result<()> {
+    anyhow::bail!("capture: CUDA backend only so far")
+}
+
+/// For each prompt in `prompts` (JSONL, one `{"group": "...", "text": "..."}` per line) render it as a single user
+/// turn with the serving chat template (enable_thinking false, generation prompt appended), run one ungraphed forward,
+/// and store the last K positions' raw residual rows at every layer (K from --last, default 4). Writes a safetensors
+/// with one f32 tensor `p{idx}` [n_layers, K, hidden] per prompt, an int32 `group_ids` tensor, and metadata (groups,
+/// counts, dims) for the offline direction/gate math in numpy. State is reset (`release`) between prompts.
+#[cfg(has_cuda)]
+pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
+    use std::collections::{BTreeMap, HashMap};
+    let k: usize = opts.get("last", 4)?;
+    ensure!(k >= 1, "--last must be >= 1");
+    let ctx = opts.get("ctx", 4096)?;
+    let chat = chat::Chat::load(Path::new(dir))?;
+    let kwargs = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
+    // prompts.jsonl is project input (not raw/ untrusted), parsed as plain JSON per line
+    let text = std::fs::read_to_string(prompts).with_context(|| format!("reading {prompts}"))?;
+    let rows: Vec<(String, String)> = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty())
+        .map(|(i, l)| {
+            let v: serde_json::Value = serde_json::from_str(l).with_context(|| format!("{prompts} line {}", i + 1))?;
+            let g = v["group"].as_str().with_context(|| format!("{prompts} line {}: no \"group\" string", i + 1))?;
+            let t = v["text"].as_str().with_context(|| format!("{prompts} line {}: no \"text\" string", i + 1))?;
+            Ok((g.to_string(), t.to_string()))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(!rows.is_empty(), "no prompts in {prompts}");
+
+    let mut m = crate::cuda::qwen::Model::load_only(Path::new(dir), ctx, 1, opts.int8, None, None)?;
+    let (nl, h) = (m.n_layers(), m.hidden());
+
+    let mut group_names: Vec<String> = Vec::new();
+    let mut group_ids: Vec<u32> = Vec::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tensors: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut rms0: Vec<f32> = Vec::new();
+
+    for (idx, (group, txt)) in rows.iter().enumerate() {
+        let msgs = serde_json::json!([{"role": "user", "content": txt}]);
+        let ids = chat.encode(&chat.render(&msgs, None, &kwargs)?)?;
+        let toks: Vec<Tok> = ids.iter().enumerate().map(|(p, &id)| Tok { id, slot: 0, pos: p as u32 }).collect();
+        let caps = m.capture_forward(&toks, k)
+            .with_context(|| format!("prompt {idx} (group {group}, {} tokens)", ids.len()))?;
+        ensure!(caps.len() == nl * k * h, "capture returned {} values, expected {}", caps.len(), nl * k * h);
+        let gid = group_names.iter().position(|g| g == group).unwrap_or_else(|| {
+            group_names.push(group.clone());
+            group_names.len() - 1
+        });
+        group_ids.push(gid as u32);
+        *counts.entry(group.clone()).or_default() += 1;
+        if idx == 0 {
+            rms0 = (0..nl).map(|layer| {
+                let row = &caps[layer * k * h + (k - 1) * h..layer * k * h + k * h];
+                (row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / h as f64).sqrt() as f32
+            }).collect();
+        }
+        m.release(0)?;
+        tensors.push((format!("p{idx}"), caps));
+    }
+
+    let mut out_vec: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
+    for (name, data) in &tensors {
+        out_vec.push((name.clone(), Dtype::F32, vec![nl, k, h], data.iter().flat_map(|x| x.to_le_bytes()).collect()));
+    }
+    out_vec.push(("group_ids".to_string(), Dtype::I32, vec![group_ids.len()],
+                  group_ids.iter().flat_map(|&g| (g as i32).to_le_bytes()).collect()));
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("groups".into(), group_names.join(","));
+    meta.insert("n_prompts".into(), rows.len().to_string());
+    meta.insert("n_layers".into(), nl.to_string());
+    meta.insert("k".into(), k.to_string());
+    meta.insert("hidden".into(), h.to_string());
+    let views: Vec<_> = out_vec.iter()
+        .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
+        .collect::<Result<_>>()?;
+    safetensors::serialize_to_file(views, Some(meta), Path::new(out))?;
+
+    for (g, c) in &counts {
+        println!("group {g}: {c} prompts");
+    }
+    let rms_line: Vec<String> = (0..nl).step_by(8).map(|layer| format!("L{layer}={:.1}", rms0[layer])).collect();
+    println!("prompt 0 residual RMS (last position) by layer: {}", rms_line.join(" "));
+    println!("wrote {out}: {} prompts x [{nl}][{k}][{h}] f32", rows.len());
+    Ok(())
+}
+
 /// Render the reference prompts with the chat template and compare the token ids with Transformers'.
 pub fn tokcheck(dir: &str, reference: &str, tests: &str) -> Result<()> {
     let chat = chat::Chat::load(Path::new(dir))?;
