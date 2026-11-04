@@ -436,10 +436,22 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut tensors: Vec<(String, Vec<f32>)> = Vec::new();
     let mut rms0: Vec<f32> = Vec::new();
+    let mut tail_ids: Vec<i32> = Vec::new();
+    let mut n_tokens: Vec<i32> = Vec::new();
+    let mut tail0: Option<Vec<i32>> = None;
 
     for (idx, (group, txt)) in rows.iter().enumerate() {
         let msgs = serde_json::json!([{"role": "user", "content": txt}]);
         let ids = chat.encode(&chat.render(&msgs, None, &kwargs)?)?;
+        ensure!(ids.len() > k, "prompt {idx} (group {group}) has {} tokens <= --last={k}", ids.len());
+        // the last K ids are the template suffix we tap: assert it is identical across prompts (position alignment)
+        let tail: Vec<i32> = ids[ids.len() - k..].iter().map(|&x| x as i32).collect();
+        match &tail0 {
+            None => tail0 = Some(tail.clone()),
+            Some(t0) => ensure!(&tail == t0, "prompt {idx} (group {group}) suffix ids {tail:?} differ from prompt 0's                                  {t0:?}: the tapped positions are not aligned across prompts"),
+        }
+        tail_ids.extend_from_slice(&tail);
+        n_tokens.push(ids.len() as i32);
         let toks: Vec<Tok> = ids.iter().enumerate().map(|(p, &id)| Tok { id, slot: 0, pos: p as u32 }).collect();
         let caps = m.capture_forward(&toks, k)
             .with_context(|| format!("prompt {idx} (group {group}, {} tokens)", ids.len()))?;
@@ -451,10 +463,15 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
         group_ids.push(gid as u32);
         *counts.entry(group.clone()).or_default() += 1;
         if idx == 0 {
-            rms0 = (0..nl).map(|layer| {
-                let row = &caps[layer * k * h + (k - 1) * h..layer * k * h + k * h];
-                (row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / h as f64).sqrt() as f32
-            }).collect();
+            // RMS at every (suffix position, layer) of prompt 0, laid out rms0[pos * nl + layer]
+            rms0 = vec![0f32; k * nl];
+            for pos in 0..k {
+                for layer in 0..nl {
+                    let row = &caps[layer * k * h + pos * h..layer * k * h + (pos + 1) * h];
+                    rms0[pos * nl + layer] =
+                        (row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / h as f64).sqrt() as f32;
+                }
+            }
         }
         m.release(0)?;
         tensors.push((format!("p{idx}"), caps));
@@ -466,12 +483,23 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     }
     out_vec.push(("group_ids".to_string(), Dtype::I32, vec![group_ids.len()],
                   group_ids.iter().flat_map(|&g| (g as i32).to_le_bytes()).collect()));
+    out_vec.push(("tail_ids".to_string(), Dtype::I32, vec![rows.len(), k],
+                  tail_ids.iter().flat_map(|&x| x.to_le_bytes()).collect()));
+    out_vec.push(("n_tokens".to_string(), Dtype::I32, vec![rows.len()],
+                  n_tokens.iter().flat_map(|&x| x.to_le_bytes()).collect()));
+    // FNV-1a 64-bit of a canonical rendered prompt: a stable fingerprint of the chat template + kwargs + specials,
+    // so the offline direction is only ever applied to the exact config it was measured on.
+    let probe = chat.render(&serde_json::json!([{"role": "user", "content": "QWENNY_CALIB_PROBE"}]), None, &kwargs)?;
+    let template_hash = probe.bytes().fold(0xcbf29ce484222325u64, |hsh, b| (hsh ^ b as u64).wrapping_mul(0x100000001b3));
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("groups".into(), group_names.join(","));
     meta.insert("n_prompts".into(), rows.len().to_string());
     meta.insert("n_layers".into(), nl.to_string());
     meta.insert("k".into(), k.to_string());
     meta.insert("hidden".into(), h.to_string());
+    meta.insert("model_dir".into(), dir.to_string());
+    meta.insert("int8".into(), opts.int8.to_string());
+    meta.insert("template_hash".into(), format!("{template_hash:016x}"));
     let views: Vec<_> = out_vec.iter()
         .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
         .collect::<Result<_>>()?;
@@ -480,8 +508,11 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     for (g, c) in &counts {
         println!("group {g}: {c} prompts");
     }
-    let rms_line: Vec<String> = (0..nl).step_by(8).map(|layer| format!("L{layer}={:.1}", rms0[layer])).collect();
-    println!("prompt 0 residual RMS (last position) by layer: {}", rms_line.join(" "));
+    for pos in 0..k {
+        let rms_line: Vec<String> =
+            (0..nl).step_by(8).map(|layer| format!("L{layer}={:.1}", rms0[pos * nl + layer])).collect();
+        println!("prompt 0 residual RMS (suffix pos {pos} of {k}) by layer: {}", rms_line.join(" "));
+    }
     println!("wrote {out}: {} prompts x [{nl}][{k}][{h}] f32", rows.len());
     Ok(())
 }
