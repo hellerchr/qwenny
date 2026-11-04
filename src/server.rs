@@ -622,8 +622,12 @@ pub struct App {
     pub jobs: UnboundedSender<Job>,
     pub name: String,
     pub max_ctx: usize,
-    /// the name the LoRA adapter is served under, if one is loaded (`"model"` of a request; the base is `name`)
+    /// the name the LoRA adapter is served under IN ADDITION to the base, if dual (`"model"` of a request; the base
+    /// is `name`); None when there is no adapter or it is applied to the single served model (adapter_default)
     pub adapter: Option<String>,
+    /// the loaded adapter is always applied to the one served model (`name`); any requested "model" maps to it and
+    /// no pristine base is selectable
+    pub adapter_default: bool,
     /// named decision tasks (question, options, threshold, ...) for the page and for requests with "preset"
     pub presets: Json,
     /// pages from the chat (`POST /v1/artifacts`), newest last
@@ -666,10 +670,15 @@ async fn get_artifact(State(app): State<Arc<App>>, Path(id): Path<String>) -> Re
 }
 
 impl App {
-    /// The model a request names (`"model"`): whether it is the adapter, and the name to answer with. Without an
-    /// adapter any name is the base model; with one, a name that is neither is an error.
+    /// The model a request names (`"model"`): whether to use the adapter, and the name to answer with. With
+    /// `adapter_default` there is one model (the base with the adapter always applied), served under `name`, and any
+    /// requested model maps to it. Otherwise: without an adapter any name is the base; with a dual adapter a name
+    /// that is neither the base nor the adapter is an error.
     pub fn model(&self, body: &Json) -> Result<(bool, String)> {
         let asked = body.get("model").and_then(Json::as_str);
+        if self.adapter_default {
+            return Ok((true, self.name.clone()));
+        }
         match (&self.adapter, asked) {
             (Some(a), Some(m)) if m == a => Ok((true, a.clone())),
             (Some(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
@@ -900,8 +909,12 @@ pub struct ServeOpts {
     pub host: String,
     pub port: u16,
     pub name: String,
-    /// the name the LoRA adapter (if one is loaded) is served under
+    /// the name a loaded LoRA adapter is served under IN ADDITION to the base (dual mode); None when there is no
+    /// adapter, or when it is applied to the one served model (adapter_default)
     pub adapter: Option<String>,
+    /// the loaded adapter is applied to the single served model (served under `name`, no separate pristine base);
+    /// set when --adapter has no explicit name=
+    pub adapter_default: bool,
     /// draft tokens per step at most (speculative decoding; 0: off)
     pub spec: usize,
     /// the sessions (--slots) asked for, each promised the whole context; None: as many as fit
@@ -1133,6 +1146,7 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     let chat = Arc::new(chat);
     let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.spec, opts.sessions, opts.fit_ctx)?;
     let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
+                             adapter_default: opts.adapter_default,
                              presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
     // the base model first (the page shows the first), then the adapter
     let names: Vec<String> = std::iter::once(opts.name.clone()).chain(opts.adapter.clone()).collect();
@@ -1167,7 +1181,8 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await?;
         println!("serving {}{} on http://{}:{} (context {max_ctx}{}{})", opts.name,
-                 opts.adapter.as_ref().map_or(String::new(), |a| format!(" and its adapter {a}")), opts.host, opts.port,
+                 if opts.adapter_default { " (adapter applied)".to_string() }
+                 else { opts.adapter.as_ref().map_or(String::new(), |a| format!(" and its adapter {a}")) }, opts.host, opts.port,
                  if opts.ui { ", web page at /" } else { "" },
                  if auth.require_key()? { ", the API requires a key" } else { "" });
         axum::serve(listener, router).await?;
@@ -1282,8 +1297,8 @@ mod tests {
             engine(Box::new(m), None, engine_chat, rx, spec)
         });
         let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
-        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: None, presets: json!([]), artifacts: Mutex::default(),
-                                 auth: Arc::new(Auth::open(&db).unwrap()) });
+        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: None, adapter_default: false,
+                                 presets: json!([]), artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db).unwrap()) });
         // the scripted engine only takes the argmax: greedy, and no presence penalty (Qwen's default would sample)
         body["temperature"] = json!(0);
         body["presence_penalty"] = json!(0);

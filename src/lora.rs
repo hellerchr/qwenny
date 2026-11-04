@@ -3,7 +3,10 @@
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value as Json;
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, path::{Path, PathBuf}};
+
+/// LoRA ranks the serving kernel has (src/cuda/qwen/lora.rs RANKS); a composed adapter pads to one of these.
+const RANKS: [usize; 4] = [8, 16, 32, 64];
 
 pub struct Adapter {
     scale: f32,
@@ -39,8 +42,15 @@ impl Adapter {
         ensure!(cfg["use_rslora"].as_bool() != Some(true) && cfg["use_dora"].as_bool() != Some(true), "rsLoRA/DoRA adapter");
         let empty = |k: &str| cfg[k].is_null() || cfg[k].as_object().is_some_and(|o| o.is_empty());
         ensure!(empty("rank_pattern") && empty("alpha_pattern"), "an adapter with a rank_pattern or alpha_pattern");
+        // modules_to_save replaces whole weights, not an additive BA delta: it cannot be served unmerged or composed.
+        let empty_list = |k: &str| empty(k) || cfg[k].as_array().is_some_and(|a| a.is_empty());
+        ensure!(empty_list("modules_to_save"), "an adapter with modules_to_save (a full-weight replacement, not a \
+                stackable additive delta)");
+        ensure!(cfg["lora_bias"].as_bool() != Some(true), "a LoRA adapter with lora_bias (bias terms are not served)");
         let bytes = fs::read(dir.join("adapter_model.safetensors"))?;
         let st = SafeTensors::deserialize(&bytes)?;
+        ensure!(!st.names().iter().any(|n| n.contains(".lora_") && n.ends_with(".bias")),
+                "a LoRA adapter with bias tensors (bias terms are not served)");
         let mut pairs = HashMap::new();
         for name in st.names() {
             let Some(stem) = name.strip_suffix(".lora_A.weight") else { continue };
@@ -53,6 +63,97 @@ impl Adapter {
         ensure!(!pairs.is_empty(), "no LoRA tensors in {}", dir.display());
         let base = cfg["base_model_name_or_path"].as_str().unwrap_or("?").to_string();
         Ok(Adapter { scale: (alpha / r) as f32, base, pairs })
+    }
+
+    /// Load and compose adapter directories into one served adapter. A single directory is loaded exactly as `load`
+    /// (byte-identical serving: it does NOT go through `compose`); two or more are composed with `compose`.
+    pub fn compose_dirs(dirs: &[PathBuf]) -> Result<Adapter> {
+        ensure!(!dirs.is_empty(), "compose: no adapter directories");
+        if dirs.len() == 1 {
+            return Adapter::load(&dirs[0]);
+        }
+        let parts = dirs.iter().map(|d| Adapter::load(d)).collect::<Result<Vec<_>>>()?;
+        Adapter::compose(&parts)
+    }
+
+    /// Compose loaded adapters into one additive low-rank update per target matrix. LoRA deltas on the same base add:
+    /// W + Σ (alpha_i/r_i) Bᵢ Aᵢ. For each matrix we concatenate the adapters' factors — A rows stacked
+    /// vertically, B columns stacked horizontally — and fold each adapter's own scale alpha_i/r_i INTO its B block
+    /// (in f32) before concatenation; the composed adapter stores r = alpha = R_pad so `scale()` is exactly 1 and the
+    /// serving kernel's apply-scale is 1 (every stacked adapter keeps its own scale). Each adapter's own zero-padding
+    /// is stripped to its TRUE rank first (a rank slot whose A row or B column is all-zero contributes nothing), the
+    /// true ranks are summed, and the sum is padded ONCE to the next served rank {8,16,32,64}; a sum above 64 is an
+    /// error. Every target matrix is padded to the same R_pad with zero A rows AND zero B columns (both sides, so a
+    /// matrix a given adapter does not touch contributes an exact zero block, never a 0·inf). Handling is per concrete
+    /// matrix name, so the kernel's grouped stacks (q/k/v, gate/up) and single matrices (o_proj/out_proj/down_proj)
+    /// all come out at the same uniform R_pad, which is exactly what the grouped loader requires.
+    ///
+    /// This is exact for LoRAs trained on the SAME base — including a future capability LoRA trained ON the
+    /// abliterated base, which is the practice we follow so additive composition equals the model actually trained.
+    /// A capability LoRA trained on the UN-abliterated base would instead want a load-time (I − r rᵀ) projection of
+    /// its B onto the complement of the refusal direction r to stay orthogonal to the abliteration; that projection
+    /// (and SVD re-compression when Σr > 64) is deliberately NOT built here — this comment is the guard note.
+    fn compose(parts: &[Adapter]) -> Result<Adapter> {
+        ensure!(parts.len() >= 2, "compose expects at least two adapters");
+        let base = parts[0].base.clone();
+        for p in parts {
+            ensure!(p.base == base, "composing adapters of different base models: {base:?} and {:?}", p.base);
+        }
+        // the rank slots an adapter actually contributes for a matrix: outer product Bᵢ[:,k]·Aᵢ[k,:] is nonzero
+        let kept = |a: &[f32], b: &[f32], r: usize| -> Vec<usize> {
+            let (cols, rows) = (a.len() / r, b.len() / r);
+            (0..r).filter(|&k| {
+                a[k * cols..(k + 1) * cols].iter().any(|&x| x != 0.0) && (0..rows).any(|o| b[o * r + k] != 0.0)
+            }).collect()
+        };
+        // every target matrix, deterministic order
+        let mut names: Vec<&String> = parts.iter().flat_map(|p| p.pairs.keys()).collect();
+        names.sort();
+        names.dedup();
+        // per matrix: output rows, input cols, the adapters (index + kept slots) that touch it; and the largest sum
+        let mut plan: Vec<(&String, usize, usize, Vec<(usize, Vec<usize>)>)> = Vec::new();
+        let mut max_sum = 0usize;
+        for name in names {
+            let (mut rows, mut cols, mut blocks, mut sum) = (None, None, Vec::new(), 0usize);
+            for (pi, p) in parts.iter().enumerate() {
+                let Some((a, b, r)) = p.pairs.get(name).map(|(a, b, r)| (a.as_slice(), b.as_slice(), *r)) else { continue };
+                let (c, ro) = (a.len() / r, b.len() / r);
+                if let Some(pc) = cols { ensure!(pc == c, "{name}: input dim {c} vs {pc} across stacked adapters"); }
+                if let Some(pr) = rows { ensure!(pr == ro, "{name}: output dim {ro} vs {pr} across stacked adapters"); }
+                cols = Some(c);
+                rows = Some(ro);
+                let ks = kept(a, b, r);
+                sum += ks.len();
+                if !ks.is_empty() { blocks.push((pi, ks)); }
+            }
+            if blocks.is_empty() { continue; }
+            max_sum = max_sum.max(sum);
+            plan.push((name, rows.unwrap(), cols.unwrap(), blocks));
+        }
+        ensure!(max_sum > 0, "the composed adapters change nothing (all factors zero)");
+        let r_pad = *RANKS.iter().find(|&&r| r >= max_sum)
+            .with_context(|| format!("combined LoRA rank {max_sum} exceeds the largest served rank {}", RANKS[RANKS.len() - 1]))?;
+        let mut pairs = HashMap::new();
+        for (name, rows, cols, blocks) in plan {
+            let mut a = vec![0f32; r_pad * cols]; // [R_pad][in], real rows packed first, rest zero
+            let mut b = vec![0f32; rows * r_pad]; // [out][R_pad], real cols packed first, rest zero
+            let mut off = 0usize;
+            for (pi, ks) in blocks {
+                let (pa, pb, pr) = parts[pi].pairs.get(name).map(|(a, b, r)| (a.as_slice(), b.as_slice(), *r)).unwrap();
+                let scale = parts[pi].scale;
+                for (j, &k) in ks.iter().enumerate() {
+                    let dst = off + j;
+                    a[dst * cols..(dst + 1) * cols].copy_from_slice(&pa[k * cols..(k + 1) * cols]);
+                    for o in 0..rows {
+                        b[o * r_pad + dst] = scale * pb[o * pr + k]; // fold this adapter's scale into B, in f32
+                    }
+                }
+                off += ks.len();
+            }
+            pairs.insert(name.clone(), (a, b, r_pad));
+        }
+        // r = alpha = R_pad -> scale() == 1: the per-adapter scales are already folded into B
+        Ok(Adapter { scale: 1.0, base, pairs })
     }
 
     /// That every matrix the adapter changes is in the model (else it is an adapter of another model, which would

@@ -51,8 +51,10 @@ const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] 
   qwenny datacheck <data dir> <data reference>  token ids and loss masks vs. Unsloth's
   qwenny dpocheck <dpo reference>               preference training: RPO loss, log-probabilities, gradients vs. PyTorch
                                                 + PEFT (tools/make_dpo_reference.py; --precision, --packed)
-options: --adapter=[<name>=]<dir> (a LoRA, served unmerged: serve answers \"model\": <name> with it and --name without
-         it; name default: the directory's, or its parent's for runs/<data>-N/adapter; the checks and bench run it),
+options: --adapter=[<name>=]<dir>[,<dir>...] (a LoRA, served unmerged. Without <name>=: applied to the one served
+         model (--name), no separate base. With <name>=: serve answers \"model\": <name> with it and --name without
+         it (the base). Several comma-separated dirs COMPOSE (stack) into one adapter: their deltas add, each keeping
+         its own scale, combined rank <= 64. The checks and bench run it),
          --backend=cuda|mlx (default: CUDA when built in, else MLX), --bf16 (16-bit weights instead of int8),
          bench: --pos=0 (context before decoding) --slots=1 --ctx=4096,
          serve: --ui (the web page at /), --host=0.0.0.0 --port=18023 --name=qwenny, --ctx=<tokens> (default: the
@@ -103,23 +105,34 @@ impl Opts {
         self.values.iter().find(|(k, _)| k == key).map(|(_, v)| v.into())
     }
 
-    /// --adapter=[<name>=]<dir>: a LoRA (served unmerged) and the name it is served under: by default its directory's
-    /// name, or its parent's for qwenny train's `runs/<data>-N/adapter`
-    fn adapter(&self) -> Result<Option<(String, lora::Adapter)>> {
-        let Some(v) = self.values.iter().find(|(k, _)| k == "adapter").map(|(_, v)| v.as_str()) else { return Ok(None) };
-        let (name, dir) = match v.split_once('=') {
-            Some((n, d)) if !n.is_empty() && !n.contains('/') && !Path::new(v).exists() => (Some(n.to_string()), Path::new(d)),
-            _ => (None, Path::new(v)),
+    /// --adapter=[<name>=]<dir>[,<dir>...]: a LoRA (served unmerged). Several comma-separated dirs COMPOSE (stack)
+    /// into one adapter (lora::Adapter::compose). WITHOUT <name>= the adapter(s) are applied to the one served model
+    /// (the --name default) with no separate pristine base; WITH <name>= the base is served under --name and the
+    /// adapted model additionally under <name>, both selectable. Returns the explicit name (None: applied to the
+    /// default model) and the adapter. Repeating --adapter for several DISTINCT served adapters is not supported yet.
+    fn adapter(&self) -> Result<Option<(Option<String>, lora::Adapter)>> {
+        let vals: Vec<&str> = self.values.iter().filter(|(k, _)| k == "adapter").map(|(_, v)| v.as_str()).collect();
+        let v = match vals.as_slice() {
+            [] => return Ok(None),
+            [v] => *v,
+            _ => bail!("serving several distinct named adapters at once is not supported yet; compose several into \
+                        one with --adapter=<name>=<dir1>,<dir2>,..."),
         };
-        let dir = std::fs::canonicalize(dir).with_context(|| format!("--adapter: {}", dir.display()))?;
-        let name = name.unwrap_or_else(|| {
-            let last = |p: &Path| p.file_name().map(|f| f.to_string_lossy().into_owned());
-            match last(&dir) {
-                Some(n) if n == "adapter" => dir.parent().and_then(last).unwrap_or(n),
-                n => n.unwrap_or_else(|| "adapter".into()),
-            }
-        });
-        Ok(Some((name, lora::Adapter::load(&dir)?)))
+        // [<name>=]<dir>[,<dir>...]: a leading <name>= only when it is not itself a path or a comma-list
+        let (name, rest) = match v.split_once('=') {
+            Some((n, d)) if !n.is_empty() && !n.contains('/') && !n.contains(',') && !Path::new(v).exists() => (Some(n.to_string()), d),
+            _ => (None, v),
+        };
+        // the shell leaves ~ alone after `=`; expand it per directory
+        let tilde = |p: &str| match (p.strip_prefix("~/"), env::var("HOME")) {
+            (Some(r), Ok(h)) => format!("{h}/{r}"),
+            _ => p.to_string(),
+        };
+        let dirs: Vec<std::path::PathBuf> = rest.split(',').filter(|s| !s.is_empty())
+            .map(|d| std::fs::canonicalize(tilde(d)).with_context(|| format!("--adapter: {d}")))
+            .collect::<Result<_>>()?;
+        ensure!(!dirs.is_empty(), "--adapter: no directory given");
+        Ok(Some((name, lora::Adapter::compose_dirs(&dirs)?)))
     }
 
     #[cfg(has_cuda)]
@@ -262,7 +275,8 @@ fn main() -> Result<()> {
             let native = native_ctx(&model).unwrap_or(32768);
             let (ctx, slots, int8) = (opts.get("ctx", native)?, opts.get("slots", 16)?, opts.int8);
             let so = server::ServeOpts { host: opts.get("host", "0.0.0.0".to_string())?, port: opts.get("port", 18023)?,
-                                         name: opts.get("name", "qwenny".to_string())?, adapter: None, spec: opts.get("spec", 7)?,
+                                         name: opts.get("name", "qwenny".to_string())?, adapter: None, adapter_default: false,
+                                         spec: opts.get("spec", 7)?,
                                          sessions: opts.path("slots").map(|_| slots), ui: flags.iter().any(|f| *f == "--ui"),
                                          presets: match opts.get("decisions", String::new())? {
                                              // several files, comma-separated: their presets one after the other
@@ -274,12 +288,14 @@ fn main() -> Result<()> {
                                          db: opts.path("db").unwrap_or_else(auth::default_path),
                                          fit_ctx: opts.path("ctx").is_none() };
             let (adapter, name) = match opts.adapter()? {
-                Some((n, a)) => (Some(a), Some(n)),
+                Some((n, a)) => (Some(a), n),
                 None => (None, None),
             };
             ensure!(name.as_ref().is_none_or(|n| *n != so.name), "the adapter's name is the base model's (--name): give it \
                      another with --adapter=<name>=<dir>");
-            let so = server::ServeOpts { adapter: name, ..so };
+            // no explicit name= : apply the adapter to the one served model (no separate pristine base)
+            let adapter_default = adapter.is_some() && name.is_none();
+            let so = server::ServeOpts { adapter: name, adapter_default, ..so };
             server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
         }
         #[cfg(has_cuda)]

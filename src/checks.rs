@@ -502,7 +502,7 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     meta.insert("k".into(), k.to_string());
     meta.insert("hidden".into(), h.to_string());
     if let Some((name, ad)) = &adapter {
-        meta.insert("adapter".into(), name.clone());
+        meta.insert("adapter".into(), name.clone().unwrap_or_else(|| "adapter".into()));
         meta.insert("adapter_matrices".into(), ad.len().to_string());
     }
     meta.insert("model_dir".into(), dir.to_string());
