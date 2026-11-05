@@ -1,14 +1,14 @@
 #pragma once
 #include <type_traits>
 // Full attention over the KV cache, GQA with NH query and NKV key/value heads of HD dims (the including file defines
-// them and the model's attn_prep). The KV cache is int8 with an f32 scale per key (and value) and head,
+// them and attn_prep). The KV cache is int8 with an f32 scale per key (and value) and head,
 // [slot][NKV][cap] (k = q * scale, q = round(k / scale), scale = max |k| / 127 over the head's dims), laid out for the
 // mma fragments of the decode attention: keys [slot][NKV][cap][HD] with the dims of each 64-dim block reordered
 // (kslot), values in blocks of 16 keys [slot][NKV][cap / 16][HD][16] with the keys of a block reordered (vslot). A step
 // runs attn_prep (q, k, v of every token; k, v into the cache; into the output what the attention multiplies it by:
-// Qwen's sigmoid gate, else 1), then the decode tokens (attn_decode by key splits, attn_combine) and the prompt tiles
+// the sigmoid gate), then the decode tokens (attn_decode by key splits, attn_combine) and the prompt tiles
 // (attn_prefill on tensor cores), which multiply their result into that output. Scores are in base 2: attn_prep scales
-// q by log2(e) times the model's scale.
+// q by log2(e) over sqrt(HD).
 
 #define KPS 32          // decode: keys per split at least (the host sizes grids the same way: attn.rs)
 #define PK 64  // prefill: keys per stage

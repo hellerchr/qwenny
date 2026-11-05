@@ -613,7 +613,7 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     // sampled drafts (the draft layer's): drawn on the GPU from its distribution q under the row's sampling, then
     // accepted with min(1, p / q) or resampled from max(0, p - q): the GPU's tokens must be the host reference's
     // (sample::sample_row_q, whose output follows p: the unit test) for the q the GPU kept, draw for draw
-    if m.has_draft() && m.samples_drafts() {
+    if m.has_draft() {
         let h = &hist[0];
         let n = h.len();
         let (mut same, mut total, mut acc) = (0, 0, 0);
@@ -747,41 +747,6 @@ pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
         let got = run(&mut *m, 1, k, &reference)?;
         let same = got.iter().zip(&reference).take_while(|(a, b)| a == b).count();
         println!("drafts of {k}: first {same}/{} tokens as one token per step", reference.len());
-    }
-    Ok(())
-}
-
-/// A DFlash2 drafter (--dflash2) vs. tools/make_dflash2_reference.py: the same target tokens, teacher-forced in chunks, then the
-/// selector's seven drafts after each anchor the reference names. The target is int8 or 16-bit here, float32 there: near-ties
-/// differ, a wrong computation differs nearly everywhere.
-pub fn dflash2check(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
-    ensure!(crate::engine::drafter().is_some(), "dflash2check: give the drafter with --dflash2=<dir>");
-    let bytes = std::fs::read(reference)?;
-    let r = SafeTensors::deserialize(&bytes)?;
-    let mut m = opts.load_at(dir, 8192, 1)?;
-    let mut p = 0;
-    while r.tensor(&format!("ids_{p}")).is_ok() {
-        let ids = ints(&r, &format!("ids_{p}"))?;
-        let anchors = ints(&r, &format!("anchors_{p}"))?;
-        let path = ints(&r, &format!("path_{p}"))?;
-        let (mut first, mut all, mut total, mut at) = (0, 0, 0, 0usize);
-        m.release(0)?;
-        for (b, &a) in anchors.iter().enumerate() {
-            let a = a as usize;
-            // the target over the positions up to the anchor's predecessor; the drafter takes them in as `draft` does
-            let toks: Vec<Tok> = (at..a).map(|q| Tok { id: ids[q], slot: 0, pos: q as u32 }).collect();
-            m.run(&toks, &[])?;
-            let dt: Vec<Tok> = (at..a).map(|q| Tok { id: ids[q + 1], slot: 0, pos: q as u32 }).collect();
-            let rows: Vec<usize> = (0..dt.len()).collect();
-            let d = m.draft(&dt, &rows, &[dt.len() - 1], 7, &[])?;
-            at = a;
-            let want = &path[b * 7..(b + 1) * 7];
-            first += (d[0][0] == want[0]) as usize;
-            all += d[0].iter().zip(want).filter(|(g, w)| g == w).count();
-            total += 1;
-        }
-        println!("prompt {p}: {} tokens, {total} blocks: first draft agrees at {first}/{total}, drafts at {all}/{}", ids.len(), total * 7);
-        p += 1;
     }
     Ok(())
 }

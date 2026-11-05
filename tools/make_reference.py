@@ -15,8 +15,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 model_dir, tests, out = sys.argv[1:4]
 gpu, cpu = (sys.argv[4:6] + ["9GiB", "24GiB"][len(sys.argv[4:6]):])
 text_config = AutoConfig.from_pretrained(model_dir).get_text_config()
-# Qwen: linear, full, linear, full attention. Granite: every layer is attention, the first and the last
-LAYERS = [0, 3, 30, 31] if getattr(text_config, "layer_types", None) else [0, text_config.num_hidden_layers - 1]
+# linear, full, linear, full attention
+LAYERS = [0, 3, 30, 31]
 tok = AutoTokenizer.from_pretrained(model_dir)
 # fp32 does not fit the 16 GB GPU: the rest of the layers run on the CPU, and from disk past its limit
 offload = tempfile.TemporaryDirectory(prefix=out.rsplit("/", 1)[-1] + ".", dir=out.rsplit("/", 1)[0] if "/" in out else ".")

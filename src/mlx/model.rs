@@ -7,9 +7,8 @@
 //! that step; per layer the slot keeps the state at the checkpoint ck = max(first position, end - KEEP), the delta
 //! rule's inputs of the positions ck .. end and the raw convolution inputs of the last KEEP + 3 positions, and a
 //! restart replays the accepted tokens from the checkpoint (delta::token, the same operations as the step's own).
-use super::delta;
 #[cfg(not(has_metal))]
-use super::delta::CH;
+use super::delta::{self, CH};
 use super::weights::{self as w, CONV_K, Fused, HD, Layer, LKD, LK_HEADS, LVD, MResult, NKV, ROT, THETA, Weights};
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{kept_dist, sample_row, sample_row_q};

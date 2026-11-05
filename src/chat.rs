@@ -1,7 +1,6 @@
 //! Prompts from the model's own chat template, tokenization, and parsing of the model's output into reasoning,
 //! content and tool calls, with Qwen3.5's details: Python's `str()` in the template, the XML tool format of
 //! Qwen3-Coder with typed parameters, two end tokens, a think block that ends with a newline.
-use crate::engine::Family;
 use anyhow::{Context, Result, bail, ensure};
 use minijinja::value::{Kwargs, Serde, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value, syntax::SyntaxConfig};
@@ -13,7 +12,6 @@ pub struct Chat {
     env: Environment<'static>,
     pub tok: Tokenizer,
     bos: Json,
-    pub family: Family,
     /// Every token that ends a reply: the tokenizer's eos token (`<|im_end|>`), `<|endoftext|>` and config.json's
     /// eos_token_id.
     ends: Vec<u32>,
@@ -133,7 +131,6 @@ impl Chat {
     pub fn load(dir: &Path) -> Result<Self> {
         let config: Json = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).context("config.json")?)
             .context("config.json")?;
-        let family = Family::of(&config).with_context(|| dir.display().to_string())?;
         let src = fs::read_to_string(dir.join("chat_template.jinja")).context("chat_template.jinja")?;
         // as Transformers renders templates (a line with only a tag or comment leaves nothing behind)
         let mut env = Environment::new();
@@ -178,7 +175,7 @@ impl Chat {
         ends.extend(ids.as_u64().into_iter().chain(ids.as_array().into_iter().flatten().filter_map(Json::as_u64)).map(|i| i as u32));
         ends.sort_unstable();
         ends.dedup();
-        Ok(Chat { env, tok, bos, family, ends })
+        Ok(Chat { env, tok, bos, ends })
     }
 
     /// The token that opens a turn of the conversation (`<|im_start|>`), if the vocabulary has it: a
@@ -718,16 +715,5 @@ mod tests {
         // <|im_end|> and <|endoftext|> end a reply, <|im_start|> does not
         assert!(chat.is_eos(248046) && chat.is_eos(248044) && !chat.is_eos(248045));
         assert!(chat.check(&reference).unwrap());
-    }
-
-    #[test]
-    fn unknown_model_types_are_an_error() {
-        let dir = std::env::temp_dir().join(format!("qwenny-chat-unknown-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
-        fs::write(dir.join("chat_template.jinja"), "").unwrap();
-        let e = Chat::load(&dir).err().expect("a llama model must not load");
-        fs::remove_dir_all(&dir).unwrap();
-        assert!(format!("{e:#}").contains("llama"), "{e:#}");
     }
 }

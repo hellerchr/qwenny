@@ -25,8 +25,7 @@ use engine::Engine;
 use std::{env, path::Path};
 
 const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] ...  (default Qwen/Qwen3.5-4B, downloaded once;
-                      Qwen3.5-4B, Qwen3.5-9B and Qwen3.8-27B, also compressed-tensors int4/int8 checkpoints;
-                      Granite 8B, e.g. webAI-Official/TwIL-8B, for inference)
+                      Qwen3.5-4B, Qwen3.5-9B and Qwen3.8-27B, also compressed-tensors int4/int8 checkpoints;)
   qwenny serve                                  OpenAI-compatible server (--ui: also the chat and decision page)
   qwenny train <data> [out dir]                 LoRA fine-tune (data: a dir with train.jsonl and optionally dev.jsonl,
                                                 or one .jsonl; out: runs/<data>-N); rows with \"chosen\" and
@@ -48,7 +47,6 @@ const USAGE: &str = "usage: qwenny <command> [--model=<dir or Hugging Face id>] 
   qwenny chatcheck <tokref.json>                chat template and tokenizer vs. Transformers (tools/make_tokref.py)
   qwenny samplecheck                            GPU sampler vs. the host reference
   qwenny speccheck                              steps with drafts vs. one token per step
-  qwenny dflash2check <reference.safetensors>   a DFlash2 drafter vs. tools/make_dflash2_reference.py
   qwenny longcheck                              long context: decode steps vs. prompt chunks
   qwenny cachecheck, swapcheck                  slots saved, loaded and swapped to host memory continue identically
   qwenny traincheck <grads reference>           loss, gradients, AdamW step vs. PEFT (--precision, --packed)
@@ -60,7 +58,6 @@ options: --adapter=[<name>=]<dir>[,<dir>...] (a LoRA, served unmerged. Without <
          it (the base). Several comma-separated dirs COMPOSE (stack) into one adapter: their deltas add, each keeping
          its own scale, combined rank <= 64. The checks and bench run it),
          --backend=cuda|mlx (default: CUDA when built in, else MLX), --bf16 (16-bit weights instead of int8),
-         --dflash2=<dir> (a DFlash2 drafter for speculative decoding, tools/train_dflash2.py),
          bench: --pos=0 (context before decoding) --slots=1 --ctx=4096,
          serve: --ui (the web page at /), --host=0.0.0.0 --port=18023 --name=qwenny, --ctx=<tokens> (default: the
                 model's native context, or what one session can hold on the GPU if less), --slots=16 (sessions at
@@ -171,7 +168,7 @@ const SWITCHES: [&str; 3] = ["bf16", "packed", "ui"];
 /// Options, switches and positional arguments (after the command) of every command, checked before anything runs.
 /// Every command takes --model (a directory or a Hugging Face id; default Qwen/Qwen3.5-4B).
 fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::RangeInclusive<usize>)> {
-    const LOAD: [&str; 5] = ["model", "adapter", "ctx", "slots", "dflash2"];
+    const LOAD: [&str; 4] = ["model", "adapter", "ctx", "slots"];
     let bf16 = vec!["bf16"];
     let lora = ["model", "rank", "alpha", "dropout", "precision"];
     Some(match cmd {
@@ -188,10 +185,9 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
         "adaptercheck" => (vec!["model", "adapter"], bf16, 1..=1),
         "tokcheck" => (vec!["model"], vec![], 2..=2),
         "chatcheck" => (vec!["model"], vec![], 1..=1),
-        "speccheck" => (vec!["model", "dflash2"], bf16, 0..=0),
-        "dflash2check" => (vec!["model", "dflash2"], bf16, 1..=1),
-        "samplecheck" | "longcheck" | "cachecheck" => (vec!["model", "dflash2"], bf16, 0..=0),
-        "swapcheck" => (vec!["model", "len", "dflash2"], bf16, 0..=0),
+        "speccheck" => (vec!["model"], bf16, 0..=0),
+        "samplecheck" | "longcheck" | "cachecheck" => (vec!["model"], bf16, 0..=0),
+        "swapcheck" => (vec!["model", "len"], bf16, 0..=0),
         "traincheck" => (lora.to_vec(), vec!["packed"], 1..=1),
         "datacheck" => (vec!["model"], vec![], 2..=2),
         "dpocheck" => (lora.to_vec(), vec!["packed"], 1..=1),
@@ -269,20 +265,12 @@ fn main() -> Result<()> {
         None => engine::backend().name().to_string(),
     };
     engine::set_backend(engine::Backend::parse(&selected)?);
-    if let Some(dir) = opts.path("dflash2") {
-        engine::set_drafter(dir);
-    }
     if cmd == "password" {
         return password(&opts);
     }
     // the model: a directory or a Hugging Face id, downloaded once
     let model = hub::resolve(&opts.get("model", hub::DEFAULT_MODEL.to_string())?)?;
     let (m, p) = (model.to_str().context("model path is not UTF-8")?, |i: usize| Path::new(a[i]));
-    const QWEN_ONLY: [&str; 8] =
-        ["train", "traincheck", "datacheck", "dpocheck", "merge", "capture", "bake-direction", "adaptercheck"];
-    if QWEN_ONLY.contains(&cmd) {
-        ensure!(engine::Family::of_dir(&model)? == engine::Family::Qwen, "{cmd}: Qwen models only so far");
-    }
     match cmd {
         "serve" => {
             let chat = chat::Chat::load(&model)?;
@@ -349,7 +337,6 @@ fn main() -> Result<()> {
         }
         "samplecheck" => checks::samplecheck(&opts, m),
         "speccheck" => checks::speccheck(&opts, m),
-        "dflash2check" => checks::dflash2check(&opts, m, a[0]),
         "longcheck" => checks::longcheck(&opts, m),
         "cachecheck" => checks::cachecheck(&opts, m),
         "swapcheck" => checks::swapcheck(&opts, m),

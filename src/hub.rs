@@ -13,7 +13,7 @@ const NEEDED: [&str; 3] = ["config.json", "tokenizer.json", "tokenizer_config.js
 /// A local model directory as given, or the directory of a Hugging Face id (`Qwen/Qwen3.5-4B`) in the cache,
 /// downloaded first when missing (the repository's top-level files but GGUF ones, all of one commit: a model repository
 /// may also hold other variants in folders and GGUF builds, tens of GB the engine does not read). Either must be a model the engine runs
-/// (`engine::Family`).
+/// (`engine::ensure_qwen`).
 pub fn resolve(model: &str) -> Result<PathBuf> {
     resolve_files(model, &NEEDED, true)
 }
@@ -33,7 +33,7 @@ fn resolve_files(model: &str, needed: &[&str], target_arch: bool) -> Result<Path
     ensure!(dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists(),
             "{} has no model.safetensors(.index.json): not a model directory", dir.display());
     if target_arch {
-        crate::engine::Family::of_dir(&dir)?;
+        crate::engine::ensure_qwen(&dir)?;
     }
     Ok(dir)
 }
@@ -110,7 +110,7 @@ mod tests {
         for f in ["config.json", "model-balanced.safetensors", "model.safetensors.index.json", "mtp_draft_vocab_ids.pt"] {
             assert!(engine_reads(f), "{f}");
         }
-        for f in ["TwIL-8B-F16-verbose.gguf", "verbose/model-verbose.safetensors", "assets/logo.png"] {
+        for f in ["model-F16.gguf", "verbose/model-verbose.safetensors", "assets/logo.png"] {
             assert!(!engine_reads(f), "{f}");
         }
     }

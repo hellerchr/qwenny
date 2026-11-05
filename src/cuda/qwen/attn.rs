@@ -1,14 +1,13 @@
 //! Full attention: q, k, v from the in-projection, RoPE on the first `rot` dims of each head, GQA over an int8 KV
 //! cache. Qwen3.5's (every 4th layer) adds a per-dim output gate on q (sigmoid) and RMSNorm (1 + w) on q and k per head.
-//! Kernels: attn_prep in kernels/qwen.cu and kernels/granite.cu (every token: q to a scratch buffer, k and v into the
+//! Kernels: attn_prep in kernels/qwen.cu (every token: q to a scratch buffer, k and v into the
 //! cache, the gate or 1 into the output); in kernels/attn.cuh attn_decode + attn_combine (single-token segments:
 //! flash-decoding over key splits) and attn_prefill + attn_combine_tiles (longer segments in tiles of 16 tokens on
 //! tensor cores, split by keys when few tiles).
-use super::{Ctx, Dims};
+use super::{Ctx, Dims, HD, NKV, ROT};
 use crate::checkpoint::Checkpoint;
 use crate::cuda::core::{MAX_TOK, Segments, Step, cfg};
 use crate::cuda::vmm::{Pool, Region};
-use crate::engine::Family;
 use anyhow::{Result, ensure};
 use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
@@ -65,15 +64,15 @@ pub struct Kernels {
 impl Kernels {
     pub fn load(_s: &Arc<CudaStream>, m: &Arc<CudaModule>, d: &Dims) -> Result<Self> {
         let prefill = m.load_function("attn_prefill")?;
-        prefill.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, prefill_smem(d.hd) as i32)?;
+        prefill.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, prefill_smem(HD) as i32)?;
         let decode = [m.load_function("attn_mq1")?, m.load_function("attn_mq2")?, m.load_function("attn_mq3")?];
         for (rt, f) in decode.iter().enumerate() {
-            f.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mq_smem(rt + 1, d.hd) as i32)?;
+            f.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mq_smem(rt + 1, HD) as i32)?;
         }
         Ok(Kernels {
             prep: m.load_function("attn_prep")?,
             decode,
-            group: d.nh / d.nkv,
+            group: d.nh / NKV,
             combine: m.load_function("attn_combine")?,
             prefill,
             combine_tiles: m.load_function("attn_combine_tiles")?,
@@ -91,8 +90,8 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(s: &Arc<CudaStream>, d: &Dims) -> Result<Self> {
         let rows = PAIRS.max(TPAIRS * 16) * d.nh;
-        Ok(Scratch { q: s.alloc_zeros(MAX_TOK * d.nh * d.hd)?, ml: s.alloc_zeros(rows * 2)?,
-                     acc: s.alloc_zeros(rows * d.hd)? })
+        Ok(Scratch { q: s.alloc_zeros(MAX_TOK * d.nh * HD)?, ml: s.alloc_zeros(rows * 2)?,
+                     acc: s.alloc_zeros(rows * HD)? })
     }
 }
 
@@ -102,9 +101,9 @@ const CAP_ALIGN: usize = 131072;
 
 /// One full-attention layer: its norms, RoPE table and KV cache.
 pub struct Attn {
-    d: Dims,
     /// Qwen's q_norm and k_norm
-    norms: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
+    q_norm: CudaSlice<f32>,
+    k_norm: CudaSlice<f32>,
     inv_freq: CudaSlice<f32>,
     /// int8 [slot][nkv][cap][hd], an f32 scale per position: ks, vs [slot][nkv][cap]; mapped per slot for the
     /// positions it holds (`mapped`, a multiple of a page's positions), the scales of a slot as a whole
@@ -118,27 +117,20 @@ pub struct Attn {
 
 impl Attn {
     /// `prefix`: e.g. "model.language_model.layers.3.self_attn"
-    pub fn new(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, d: &Dims, prefix: &str, slots: usize,
+    pub fn new(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, prefix: &str, slots: usize,
                max_ctx: usize) -> Result<Self> {
-        let (hd, nkv, rot) = (d.hd, d.nkv, d.rot);
-        let norms = match d.family {
-            Family::Qwen => {
-                let q_norm = super::norm(w, &format!("{prefix}.q_norm.weight"))?;
-                let k_norm = super::norm(w, &format!("{prefix}.k_norm.weight"))?;
-                ensure!(q_norm.len() == hd && k_norm.len() == hd, "{prefix}: norms of {} and {}", q_norm.len(),
-                        k_norm.len());
-                Some((s.clone_htod(&q_norm)?, s.clone_htod(&k_norm)?))
-            }
-            Family::Granite => None,
-        };
+        let (hd, nkv, rot) = (HD, NKV, ROT);
+        let q_norm = super::norm(w, &format!("{prefix}.q_norm.weight"))?;
+        let k_norm = super::norm(w, &format!("{prefix}.k_norm.weight"))?;
+        ensure!(q_norm.len() == hd && k_norm.len() == hd, "{prefix}: norms of {} and {}", q_norm.len(), k_norm.len());
         let inv_freq: Vec<f32> = (0..rot / 2).map(|i| THETA.powf(-2.0 * i as f64 / rot as f64) as f32).collect();
         let cap = max_ctx.div_ceil(CAP_ALIGN) * CAP_ALIGN;
         ensure!((nkv * cap * 4).is_multiple_of(pool.page()) && (cap * hd).is_multiple_of(pool.page()), "pages of {} bytes",
                 pool.page());
         let cache = slots * nkv * cap * hd;
         Ok(Attn {
-            d: *d,
-            norms,
+            q_norm: s.clone_htod(&q_norm)?,
+            k_norm: s.clone_htod(&k_norm)?,
             inv_freq: s.clone_htod(&inv_freq)?,
             kc: Region::reserve(s, pool, cache)?,
             vc: Region::reserve(s, pool, cache)?,
@@ -151,12 +143,12 @@ impl Attn {
 
     /// Positions per page of a head's keys (or values)
     fn page_pos(&self) -> usize {
-        self.kc.page_size() / self.d.hd
+        self.kc.page_size() / HD
     }
 
     /// Map slot `slot`'s cache for positions [0, len) (and its scales); false when the pages ran out
     pub fn map(&mut self, slot: usize, len: usize) -> Result<bool> {
-        let (nkv, hd) = (self.d.nkv, self.d.hd);
+        let (nkv, hd) = (NKV, HD);
         let len = len.min(self.cap).div_ceil(self.page_pos()) * self.page_pos();
         if len <= self.mapped[slot] {
             return Ok(true);
@@ -178,7 +170,7 @@ impl Attn {
 
     /// Device bytes slot `slot` maps holding `len` positions: whole pages of positions, the scales of the slot whole
     pub fn slot_bytes(&self, len: usize) -> usize {
-        let (nkv, hd) = (self.d.nkv, self.d.hd);
+        let (nkv, hd) = (NKV, HD);
         let len = len.min(self.cap).div_ceil(self.page_pos()) * self.page_pos();
         2 * nkv * (len * hd + self.cap * 4)
     }
@@ -186,13 +178,13 @@ impl Attn {
     /// Bytes of a slot's cache for positions [from, to) (save, load; `from` a multiple of 16): per kv head its keys,
     /// values (in blocks of 16 positions) and their scales
     pub fn saved_bytes(&self, from: usize, to: usize) -> usize {
-        let hd = self.d.hd;
-        self.d.nkv * ((to - from) * hd + (to.div_ceil(16) * 16 - from) * hd + 2 * (to - from) * 4)
+        let hd = HD;
+        NKV * ((to - from) * hd + (to.div_ceil(16) * 16 - from) * hd + 2 * (to - from) * 4)
     }
 
     /// Slot `slot`'s cache for positions [from, to) (mapped) into `out` (saved_bytes long)
     pub fn save(&self, slot: usize, from: usize, to: usize, out: &mut [u8]) -> Result<()> {
-        let (nkv, hd) = (self.d.nkv, self.d.hd);
+        let (nkv, hd) = (NKV, HD);
         ensure!(from.is_multiple_of(16) && from <= to && to <= self.mapped[slot], "slot {slot}: positions {from}..{to} of {}", self.mapped[slot]);
         ensure!(out.len() == self.saved_bytes(from, to), "{} bytes for positions {from}..{to}", out.len());
         let (vl, n, mut o) = (to.div_ceil(16) * 16 - from, to - from, out);
@@ -213,7 +205,7 @@ impl Attn {
 
     /// Put a cache from save for positions [from, to) into slot `slot`; the bytes it took; None when the pages ran out
     pub fn load(&mut self, slot: usize, from: usize, to: usize, data: &[u8]) -> Result<Option<usize>> {
-        let (nkv, hd) = (self.d.nkv, self.d.hd);
+        let (nkv, hd) = (NKV, HD);
         let nb = self.saved_bytes(from, to);
         ensure!(from.is_multiple_of(16) && data.len() >= nb, "a cache of {} bytes for positions {from}..{to}, not {nb}", data.len());
         if !self.map(slot, to)? {
@@ -237,7 +229,7 @@ impl Attn {
 
     /// Unmap slot `slot`'s cache from position `from` on (0: all of it, with its scales)
     pub fn unmap(&mut self, slot: usize, from: usize) -> Result<()> {
-        let (nkv, hd) = (self.d.nkv, self.d.hd);
+        let (nkv, hd) = (NKV, HD);
         let from = from.div_ceil(self.page_pos()) * self.page_pos();
         for g in 0..nkv {
             let at = (slot * nkv + g) * self.cap * hd;
@@ -281,20 +273,14 @@ impl Attn {
     /// write `b.o`, then to_xin).
     pub fn run(&self, c: &Ctx, split: usize) -> Result<()> {
         let (s, st, b, k, sc) = (c.s, c.st, c.b, &c.k.attn, &c.b.attn);
-        let (nh, nkv, hd, group) = (c.d.nh, c.d.nkv, c.d.hd, c.d.nh / c.d.nkv);
+        let (nh, nkv, hd, group) = (c.d.nh, NKV, HD, c.d.nh / NKV);
         let (sp, n, cap) = (split as i32, st.n as i32, self.cap as i32);
-        let qscale = std::f32::consts::LOG2_E * c.d.scale;
+        let qscale = std::f32::consts::LOG2_E / 16.0;  // scores in base 2, over sqrt(HD)
         let (kc, vc, ks, vs) = (self.kc.ptr(), self.vc.ptr(), self.ks.ptr(), self.vs.ptr());
         unsafe {
-            match &self.norms {
-                Some((q_norm, k_norm)) => s.launch_builder(&k.prep).arg(&b.part).arg(&sp).arg(&n).arg(q_norm)
-                    .arg(k_norm).arg(&self.inv_freq).arg(&qscale).arg(&sc.q).arg(&b.o).arg(&kc).arg(&vc).arg(&ks).arg(&vs)
-                    .arg(&st.tok_slot).arg(&st.tok_pos).arg(&cap).launch(cfg((st.n, 1, 1), 32 * (nh + 2 * nkv)))?,
-                // a block per head: they do not fit one block per token (attn_prep in kernels/granite.cu)
-                None => s.launch_builder(&k.prep).arg(&b.part).arg(&sp).arg(&n).arg(&self.inv_freq).arg(&qscale)
-                    .arg(&sc.q).arg(&b.o).arg(&kc).arg(&vc).arg(&ks).arg(&vs).arg(&st.tok_slot).arg(&st.tok_pos)
-                    .arg(&cap).launch(cfg((st.n, nh + 2 * nkv, 1), 32))?,
-            };
+            s.launch_builder(&k.prep).arg(&b.part).arg(&sp).arg(&n).arg(&self.q_norm).arg(&self.k_norm).arg(&self.inv_freq)
+                .arg(&qscale).arg(&sc.q).arg(&b.o).arg(&kc).arg(&vc).arg(&ks).arg(&vs).arg(&st.tok_slot).arg(&st.tok_pos)
+                .arg(&cap).launch(cfg((st.n, 1, 1), 32 * (nh + 2 * nkv)))?;
             if st.ndec > 0 {
                 let z = Self::splits(st);
                 let zi = z as i32;

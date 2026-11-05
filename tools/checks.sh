@@ -3,8 +3,8 @@
 # with a pass criterion each, after `cargo test`: OK / FAIL per check, exit status 1 if any failed.
 #
 #   tools/checks.sh changed          the areas the uncommitted changes touch (git diff HEAD); see `areas_of`
-#   tools/checks.sh <area>...        qwen-train qwen-dpo qwen-train-27b chat qwen-infer granite-infer mlx, or all (all
-#                                    but qwen-train-27b, granite-infer and mlx)
+#   tools/checks.sh <area>...        qwen-train qwen-dpo qwen-train-27b chat qwen-infer mlx, or all (all
+#                                    but qwen-train-27b and mlx)
 #   --make                           make missing references (else a missing one is a FAIL that prints its command)
 #
 # qwen-train-27b runs on the RTX 3090 VM only (the 27B needs 24 GB): tools/vm.sh tools/checks.sh qwen-train-27b, after
@@ -23,8 +23,6 @@ VREF=$HOME/qref                        # Qwen3.8-27B (VM)
 FJ=$HOME/.cache/qwenny/fjordhaus-data/data   # Fjordhaus train.jsonl / dev.jsonl
 Q27=/opt/qwen38/models/Qwen3.8-27B-W4A16-AutoRound
 W4A16=RedHatAI/Qwen3.5-4B-quantized.w4a16
-TWIL=webAI-Official/TwIL-8B
-TREF=$QREF/twil-reference.safetensors  # TwIL-8B
 LORA=$QREF/lora-adapter               # the LoRA references' adapter (rank 16, every linear layer, random B)
 
 snapshot() { "$PY" -c "from huggingface_hub import snapshot_download as s; print(s('$1', local_files_only=True))"; }
@@ -42,7 +40,6 @@ make_ref() {
         $QREF/data-ref.safetensors) echo "$PY tools/make_train_reference.py data Qwen/Qwen3.5-4B $FJ $1" ;;
         $QREF/reference.safetensors) echo "$PY tools/make_reference_qwen.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         # fp32 is 33 GiB: the memory limits keep it from the dev box's swap (the rest runs from disk, on the GPU layer by layer)
-        $TREF) echo "$PY -I tools/make_reference.py $TWIL $FJ/dev.jsonl $1 8GiB 10GiB" ;;
         $QREF/mtp-ref.safetensors) echo "$PY tools/make_reference_mtp.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         # the LoRA references share one random adapter ($LORA, written by the first one made): remake all together
         $QREF/lora-ref-w4a16.safetensors)
@@ -308,40 +305,10 @@ area() {
             longcheck 0.1 --bf16 --model=Qwen/Qwen3.5-4B
             sessions cachecheck "slots continue identically after save and load" --model=Qwen/Qwen3.5-4B
             sessions swapcheck "sequences continue identically" --model=Qwen/Qwen3.5-4B --len=32768
+            serve --model=Qwen/Qwen3.5-4B --slots=4 --ctx=32768 --bf16
             if need "$QREF/mtp-ref.safetensors"; then   # no pass criterion yet: its result, to compare by eye
                 echo "INFO  mtpcheck: $($BIN mtpcheck "$QREF/mtp-ref.safetensors" --model=Qwen/Qwen3.5-4B 2>&1 | tail -1)"
             fi ;;
-        granite-infer)
-            # TwIL-8B on int8, its serving format: template and tokens, logits, one layer at either end, the self-checks and
-            # a real server. Its logits are larger than the 4B's (its trained final norm), so are the limits (16-bit measures
-            # 0.10, int8 0.12: the weights' format is the smaller part of it, on either side of the KV cache); layer 39's
-            # output is 25 times layer 0's. It has no MTP layer: samplecheck covers the sampler only, speccheck the drafts
-            # a server takes from n-gram chains. 16-bit weights take 18 GB and a slot at least 1.6 GiB (640 pages of KV and
-            # the scales): those two checks on a larger GPU only
-            chatcheck tools/tokref-twil.json --model=$TWIL
-            tokcheck "$TREF" "$TWIL"
-            logits "TwIL-8B int8" "$TREF" 0.15 --model=$TWIL --ctx=8192 --slots=4
-            # steps the size of its n-gram chains' (the server's drafts): as close to the reference as single tokens
-            logits "TwIL-8B int8, chunks of 8" "$TREF" 0.15 8 --model=$TWIL --ctx=8192 --slots=4
-            local large=0
-            [ "$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)" -ge 20000 ] && large=1
-            if [ $large = 1 ]; then
-                logits "TwIL-8B 16-bit" "$TREF" 0.12 --model=$TWIL --bf16 --ctx=8192 --slots=4
-            else
-                echo "INFO  check TwIL-8B 16-bit: skipped, its weights do not fit this GPU"
-            fi
-            layercheck 0 "$TREF" "$TWIL"
-            layercheck 39 "$TREF" "$TWIL" 2.5
-            speccheck --model=$TWIL
-            samplecheck --model=$TWIL
-            longcheck 0.5 --model=$TWIL
-            sessions cachecheck "slots continue identically after save and load" --model=$TWIL
-            if [ $large = 1 ]; then
-                sessions swapcheck "sequences continue identically" --model=$TWIL --len=32768
-            else
-                echo "INFO  swapcheck TwIL-8B: skipped, its three slots of 32k tokens do not fit this GPU"
-            fi
-            serve --model=$TWIL ;;
         mlx)
             # the MLX backend (built with --features mlx): the reference limits CUDA has, MLX's logits within about 1.6x the
             # distance to CUDA's measured on the 5080 (16-bit 0.016, int8 0.025, int4 0.021), the rollback, and (INFO)
@@ -376,11 +343,10 @@ areas_of() {
         src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-dpo qwen-infer ;;
         src/mlx/*|src/draft_vocab.rs|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
         src/chat.rs) echo chat qwen-train qwen-dpo ;;
-        kernels/granite.cu|tools/tokref-twil.json) echo granite-infer ;;
         kernels/*|src/cuda/*) echo qwen-infer ;;
         src/sample.rs|src/sessions.rs|src/checks.rs|src/server.rs) echo qwen-infer mlx ;;
         tools/make_reference*.py|tools/make_tokref.py|tools/tokref-*.json) echo chat qwen-infer ;;
-        tools/serve_check.py) echo granite-infer ;;
+        tools/serve_check.py) echo qwen-infer ;;
     esac
 }
 
@@ -396,9 +362,6 @@ for a in "$@"; do
             echo "changed: $(echo $files | tr '\n' ' ')-> ${found[*]}"
             if grep -qE '^(kernels/qwen_train.cu|src/cuda/qwen/(train|mod).rs|src/checkpoint.rs)$' <<<"$files"; then
                 echo "NOTE  these files reach the 27B too: also run tools/vm.sh tools/checks.sh qwen-train-27b (on the 3090)"
-            fi
-            if grep -qE '^(kernels/(attn|stack|dense|common|gemm|marlin|sampling|lora)\.cuh|src/cuda/(core\.rs|qwen/(mod|attn)\.rs)|src/(checkpoint|chat|engine|hub|server|sessions)\.rs)$' <<<"$files"; then
-                echo "NOTE  these files reach Granite too: also run tools/checks.sh granite-infer (18 GB of model, 12 GB of GPU)"
             fi
             args+=("${found[@]}") ;;
         *) args+=("$a") ;;

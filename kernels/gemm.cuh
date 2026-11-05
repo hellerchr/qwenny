@@ -1,4 +1,4 @@
-// Matrix products on tensor cores, shared by every model. Each model's .cu instantiates them with GEMM_SET.
+// Matrix products on tensor cores, .cu files instantiate them with GEMM_SET.
 #pragma once
 #include "common.cuh"
 

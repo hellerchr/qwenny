@@ -1,25 +1,22 @@
-//! The models on one CUDA GPU, each layer a mixer and a SwiGLU MLP with pre-norm residuals. Qwen3.5 (text; Qwen3.8 has
-//! the same architecture): 3 of every 4 layers Gated DeltaNet (deltanet.rs), every 4th gated full attention (attn.rs),
-//! RMSNorm scaling by 1 + weight. Granite: plain attention in every layer, RMSNorm scaling by the weight. The mixers
-//! read the split-K partial products of their in-projection from `Bufs::part` and write MIX columns per token to
-//! `Bufs::attn`; the out-projection, the residual and the MLP run here. Kernels: kernels/qwen.cu (per model size),
-//! kernels/granite.cu.
+//! Qwen3.5 (text; Qwen3.8 has the same architecture) on one CUDA GPU: each layer a mixer and a SwiGLU MLP with pre-norm
+//! residuals, 3 of every 4 mixers Gated DeltaNet (deltanet.rs), every 4th gated full attention (attn.rs), RMSNorm scaling
+//! by 1 + weight. The mixers read the split-K partial products of their in-projection from `Bufs::part` and write MIX
+//! columns per token to `Bufs::attn`; the out-projection, the residual and the MLP run here. Kernels: kernels/qwen.cu
+//! (per model size).
 mod attn;
 mod deltanet;
-mod dflash2;
 mod draft;
 mod lora;
 pub mod train;
 
 use super::core::{self, Epi, Gemm, Graphs, MAX_OUT, MAX_TOK, Mat, SPEC_TOK, Step, cfg};
-use crate::engine::{DraftSampling, Engine, Family, Tok};
+use crate::engine::{DraftSampling, Engine, Tok};
 use crate::checkpoint::Checkpoint;
 use crate::lora::Adapter;
 use anyhow::{Context, Result, bail, ensure};
 use attn::Attn;
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, PushKernelArg};
 use deltanet::DeltaNet;
-use dflash2::DFlash2;
 use draft::DraftHead;
 use crate::cuda::vmm::{HostMapped, Pool};
 
@@ -39,8 +36,8 @@ fn cache_mem_cap() -> Result<Option<usize>> {
     }
 }
 
-/// Qwen's full attention: key/value heads, head dim and rotary dims of a head; Gated DeltaNet: key heads, key and value
-/// head dims (all sizes)
+/// Full attention: key/value heads, head dim and rotary dims of a head; Gated DeltaNet: key heads, key and value head
+/// dims; the vocabulary (all sizes)
 const NKV: usize = 4;
 const HD: usize = 256;
 const ROT: usize = 64;
@@ -48,53 +45,39 @@ const LK_HEADS: usize = 16;
 const LKD: usize = 128;
 const LVD: usize = 128;
 pub const CONV_K: usize = 4;
-/// Qwen's RMSNorm epsilon; must match EPS in kernels/qwen.cu (attn_prep and the DeltaNet kernels; rmsnorm takes it)
+const VOCAB: usize = 248320;
+/// RMSNorm's epsilon; must match EPS in kernels/qwen.cu (attn_prep and the DeltaNet kernels; rmsnorm takes it)
 const EPS: f32 = 1e-6;
-/// Granite's RMSNorm epsilon (only rmsnorm and add_rmsnorm use one, as an argument)
-const GRANITE_EPS: f32 = 1e-5;
+/// Where the checkpoint keeps the text model's tensors
+const ROOT: &str = "model.language_model";
 
-/// What differs between the models (config.json); the kernels are built for each (kernels/qwen.cu, kernels/granite.cu).
+/// What differs between the sizes (config.json); the kernels are built for each (kernels/qwen.cu).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Dims {
-    pub family: Family,
     pub h: usize,
     pub ff: usize,
-    /// full attention: query heads, key/value heads, head dim, rotary dims of a head
+    /// full attention: query heads
     pub nh: usize,
-    pub nkv: usize,
-    pub hd: usize,
-    pub rot: usize,
-    /// full attention: what q K^T is multiplied by before the softmax
-    pub scale: f32,
-    /// Gated DeltaNet: value heads (0: none)
+    /// Gated DeltaNet: value heads
     pub lv_heads: usize,
-    pub vocab: usize,
 }
 
 impl Dims {
-    /// A Qwen size
-    const fn qwen(h: usize, ff: usize, nh: usize, lv_heads: usize) -> Dims {
-        Dims { family: Family::Qwen, h, ff, nh, nkv: NKV, hd: HD, rot: ROT, scale: 1.0 / 16.0, lv_heads, vocab: 248320 }
-    }
-
     /// The sizes with kernels: name, dims, PTX
-    const SIZES: [(&str, Dims, &str); 4] = [
-        ("Qwen3.5-4B", Dims::qwen(2560, 9216, 16, 32), include_str!(concat!(env!("OUT_DIR"), "/qwen4b.ptx"))),
-        ("Qwen3.5-9B", Dims::qwen(4096, 12288, 16, 32), include_str!(concat!(env!("OUT_DIR"), "/qwen9b.ptx"))),
-        ("Qwen3.8-27B", Dims::qwen(5120, 17408, 24, 48), include_str!(concat!(env!("OUT_DIR"), "/qwen27b.ptx"))),
-        ("Granite 8B", Dims { family: Family::Granite, h: 4096, ff: 12800, nh: 32, nkv: 8, hd: 128, rot: 128,
-                              scale: 1.0 / 128.0, lv_heads: 0, vocab: 100352 },
-         include_str!(concat!(env!("OUT_DIR"), "/granite8b.ptx"))),
+    const SIZES: [(&str, Dims, &str); 3] = [
+        ("Qwen3.5-4B", Dims { h: 2560, ff: 9216, nh: 16, lv_heads: 32 }, include_str!(concat!(env!("OUT_DIR"), "/qwen4b.ptx"))),
+        ("Qwen3.5-9B", Dims { h: 4096, ff: 12288, nh: 16, lv_heads: 32 }, include_str!(concat!(env!("OUT_DIR"), "/qwen9b.ptx"))),
+        ("Qwen3.8-27B", Dims { h: 5120, ff: 17408, nh: 24, lv_heads: 48 }, include_str!(concat!(env!("OUT_DIR"), "/qwen27b.ptx"))),
     ];
 
-    /// q_proj's rows: Qwen's are per head [q; gate]
+    /// q_proj's rows: per head [q; gate]
     fn q_rows(&self) -> usize {
-        self.nh * self.hd * if self.family == Family::Qwen { 2 } else { 1 }
+        self.nh * HD * 2
     }
 
     /// In-projection rows: [q_proj; k_proj; v_proj]
     fn attn_in(&self) -> usize {
-        self.q_rows() + 2 * self.nkv * self.hd
+        self.q_rows() + 2 * NKV * HD
     }
 
     /// Conv channels of the Gated DeltaNet: q, k, v
@@ -110,74 +93,20 @@ impl Dims {
 
     /// Mixer output width (both kinds): o_proj / out_proj input
     fn mix(&self) -> usize {
-        self.nh * self.hd
+        self.nh * HD
     }
 
-    /// RMSNorm's epsilon
-    fn eps(&self) -> f32 {
-        if self.family == Family::Qwen { EPS } else { GRANITE_EPS }
-    }
-
-    /// Where the checkpoint keeps the text model's tensors
-    fn root(&self) -> &'static str {
-        if self.family == Family::Qwen { "model.language_model" } else { "model" }
-    }
-
-    /// The weight of a layer or final RMSNorm as the kernels take it: Qwen's scales by 1 + weight (`norm`), Granite's by
-    /// the weight
-    fn layer_norm(&self, w: &Checkpoint, name: &str) -> Result<Vec<f32>> {
-        match self.family {
-            Family::Qwen => norm(w, name),
-            Family::Granite => Ok(w.floats(name)?.0),
-        }
-    }
-
-    /// The kind of each layer of a text config: Qwen lists them, Granite's are all attention
-    fn layer_kinds(&self, tc: &serde_json::Value) -> Result<Vec<String>> {
-        Ok(match self.family {
-            Family::Qwen => tc["layer_types"].as_array().context("layer_types")?.iter()
-                .map(|k| k.as_str().unwrap_or("?").to_string()).collect(),
-            Family::Granite => {
-                let n = tc["num_hidden_layers"].as_u64().context("num_hidden_layers")? as usize;
-                vec!["full_attention".to_string(); n]
-            }
-        })
-    }
-
-    /// The model of a checkpoint's config.json and its inference kernels
+    /// The size of a checkpoint's config.json and its inference kernels
     fn of(config: &serde_json::Value) -> Result<(Dims, &'static str)> {
-        let d = match Family::of(config)? {
-            Family::Qwen => Self::parse(config.get("text_config").unwrap_or(config))?,
-            Family::Granite => Self::parse_granite(config)?,
-        };
+        let d = Self::parse(config.get("text_config").unwrap_or(config))?;
         match Self::SIZES.iter().find(|(_, s, _)| *s == d) {
             Some(&(_, _, ptx)) => Ok((d, ptx)),
-            None => bail!("a {:?} model of hidden size {}, {} query and {} key/value heads: kernels are built for {}",
-                          d.family, d.h, d.nh, d.nkv, Self::SIZES.map(|s| s.0).join(", ")),
+            None => bail!("a model of hidden size {}, {} query heads: kernels are built for {}", d.h, d.nh,
+                          Self::SIZES.map(|s| s.0).join(", ")),
         }
     }
 
-    /// A Granite config.json, checked against what the kernels and the steps fix (any size)
-    fn parse_granite(c: &serde_json::Value) -> Result<Dims> {
-        let get = |k: &str| c[k].as_u64().map(|v| v as usize).with_context(|| format!("config {k}"));
-        let (h, nh) = (get("hidden_size")?, get("num_attention_heads")?);
-        for k in ["embedding_multiplier", "residual_multiplier", "logits_scaling"] {
-            ensure!(c[k].as_f64() == Some(1.0), "config {k} = {}, expected 1", c[k]);
-        }
-        ensure!(c["attention_bias"].as_bool() == Some(false) && c["mlp_bias"].as_bool() == Some(false), "biases");
-        ensure!(c["hidden_act"] == "silu", "hidden_act {}", c["hidden_act"]);
-        ensure!(c["rms_norm_eps"].as_f64().is_some_and(|e| (e - GRANITE_EPS as f64).abs() < 1e-12), "rms_norm_eps {}",
-                c["rms_norm_eps"]);
-        let rope = &c["rope_parameters"];
-        ensure!(rope["rope_type"] == "default" && rope["rope_theta"].as_f64() == Some(attn::THETA), "rope {rope}");
-        let hd = h / nh;
-        Ok(Dims { family: Family::Granite, h, ff: get("intermediate_size")?, nh, nkv: get("num_key_value_heads")?, hd,
-                  rot: hd, scale: c["attention_multiplier"].as_f64().context("config attention_multiplier")? as f32, lv_heads: 0,
-                  vocab: get("vocab_size")? })
-    }
-
-    /// The size of a Qwen text config (`text_config` of the checkpoint's config.json), checked against what the kernels
-    /// fix (any size)
+    /// A text config (`text_config` of the checkpoint's config.json), checked against what the kernels fix (any size)
     fn parse(tc: &serde_json::Value) -> Result<Dims> {
         let get = |k: &str| tc[k].as_u64().map(|v| v as usize);
         let fixed = [("num_key_value_heads", NKV), ("head_dim", HD), ("linear_num_key_heads", LK_HEADS),
@@ -191,10 +120,10 @@ impl Dims {
         let rope = &tc["rope_parameters"];
         ensure!(rope["rope_type"] == "default" && rope["rope_theta"].as_f64() == Some(attn::THETA)
                 && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64), "rope {rope}");
-        ensure!(get("vocab_size") == Some(248320), "vocab_size {}: the kernels are built for 248320", tc["vocab_size"]);
-        Ok(Dims::qwen(get("hidden_size").context("hidden_size")?, get("intermediate_size").context("intermediate_size")?,
-                      get("num_attention_heads").context("num_attention_heads")?,
-                      get("linear_num_value_heads").context("linear_num_value_heads")?))
+        ensure!(get("vocab_size") == Some(VOCAB), "vocab_size {}: the kernels are built for {VOCAB}", tc["vocab_size"]);
+        Ok(Dims { h: get("hidden_size").context("hidden_size")?, ff: get("intermediate_size").context("intermediate_size")?,
+                  nh: get("num_attention_heads").context("num_attention_heads")?,
+                  lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")? })
     }
 }
 
@@ -212,8 +141,7 @@ struct Kernels {
     mtp_in: CudaFunction,
     sum_parts: CudaFunction,
     attn: attn::Kernels,
-    /// Qwen's (Granite's module has no DeltaNet)
-    delta: Option<deltanet::Kernels>,
+    delta: deltanet::Kernels,
 }
 
 enum Mixer {
@@ -247,7 +175,6 @@ impl Layer {
     #[allow(clippy::too_many_arguments)]
     fn load(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, d: &Dims, p: &str, kind: &str, slots: usize,
             max_ctx: usize, int8: bool, adapter: Lora) -> Result<Self> {
-        ensure!(d.family == Family::Qwen || adapter.is_none(), "LoRA adapters: Qwen models only so far");
         let names = |a: &str, ns: &[&str]| ns.iter().map(|n| format!("{p}.{a}.{n}.weight")).collect::<Vec<_>>();
         let mat = |a: &str, ns: &[&str], silu: bool| Mat::stack(s, w, &names(a, ns), silu, int8);
         let in_ba = match kind {
@@ -262,7 +189,7 @@ impl Layer {
                 d.delta_in(),
             ),
             "full_attention" => (
-                Mixer::Attn(Attn::new(s, pool, w, d, &format!("{p}.self_attn"), slots, max_ctx)?),
+                Mixer::Attn(Attn::new(s, pool, w, &format!("{p}.self_attn"), slots, max_ctx)?),
                 mat("self_attn", &["q_proj", "k_proj", "v_proj"], false)?,
                 mat("self_attn", &["o_proj"], false)?,
                 d.attn_in(),
@@ -270,12 +197,12 @@ impl Layer {
             other => bail!("{p}: unknown type {other:?}"),
         };
         ensure!(in_proj.tiles * 16 == rows && out_proj.cols == d.mix(), "{p}: in-projection of {} rows", in_proj.tiles * 16);
-        let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&d.layer_norm(w, &format!("{p}.{n}.weight"))?)?) };
+        let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(w, &format!("{p}.{n}.weight"))?)?) };
         // the adapter's A and B of the layer's products, in their row order
         let lora = match adapter {
             Some((ad, used)) => {
                 let st = |a: &str, ns: &[&str], rows: &[usize], silu: bool| lora::Stacked { names: names(a, ns), rows: rows.to_vec(), silu };
-                let (lv, kv) = (d.lv_heads, d.nkv * d.hd);
+                let (lv, kv) = (d.lv_heads, NKV * HD);
                 let (inp, ba, out) = match kind {
                     "linear_attention" => (st("linear_attn", &["in_proj_qkv", "in_proj_z"], &[d.lqkv(), lv * LVD], false),
                                            Some(st("linear_attn", &["in_proj_b", "in_proj_a"], &[lv, lv], false)),
@@ -347,7 +274,6 @@ pub struct Ctx<'a> {
 /// (layercheck).
 struct Stack {
     s: Arc<CudaStream>,
-    m: Arc<cudarc::driver::CudaModule>,
     /// the pages of the per-slot caches (KV, DeltaNet states)
     pool: Arc<Pool>,
     k: Kernels,
@@ -376,11 +302,12 @@ impl Stack {
         let k = Kernels { embed: f("embed")?, embed_q8: f("embed_q8")?, rmsnorm: f("rmsnorm")?, add_rmsnorm: f("add_rmsnorm")?,
                           to_xin: f("to_xin")?, mtp_in: f("mtp_in")?, sum_parts: f("sum_parts")?,
                           attn: attn::Kernels::load(&s, &m, &d)?,
-                          delta: if d.lv_heads > 0 { Some(deltanet::Kernels::load(&m)?) } else { None } };
+                          delta: deltanet::Kernels::load(&m)? };
         let w = Checkpoint::open(dir)?;
         let pool = Pool::new(&s)?;
-        let layers = d.layer_kinds(tc)?.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i))
-            .map(|(i, kind)| Layer::load(&s, &pool, &w, &d, &format!("{}.layers.{i}", d.root()), kind, slots,
+        let kinds: Vec<&str> = tc["layer_types"].as_array().context("layer_types")?.iter().map(|k| k.as_str().unwrap_or("?")).collect();
+        let layers = kinds.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i))
+            .map(|(i, kind)| Layer::load(&s, &pool, &w, &d, &format!("{ROOT}.layers.{i}"), kind, slots,
                                 max_ctx, int8, adapter.as_mut().map(|(a, u)| (*a, &mut **u))))
             .collect::<Result<Vec<_>>>()?;
         ensure!(!layers.is_empty(), "no layer {only:?}");
@@ -402,9 +329,9 @@ impl Stack {
             attn: attn::Scratch::new(&s, &d)?,
             cv: z(if d.lv_heads > 0 { MAX_TOK * deltanet::cv_width(&d) } else { 1 })?,
         };
-        let st = Step::new(&s, &m, slots, max_ctx, d.vocab, attn::segments(d.nh / d.nkv))?;
+        let st = Step::new(&s, &m, slots, max_ctx, VOCAB, attn::segments(d.nh / NKV))?;
         let x = Stack { mm: Gemm::load(&s, &m, true, d.h)?, lk: lora::Kernels::load(&m)?, scales: z(slots)?, k, st, d,
-                        layers, b, s, m, pool };
+                        layers, b, s, pool };
         x.set_budget()?;
         Ok((x, w))
     }
@@ -449,19 +376,13 @@ impl Stack {
     }
 
     fn gemm<Y: cudarc::driver::DeviceRepr>(&self, w: &Mat, x: &CudaSlice<u16>, y: &CudaSlice<Y>, epi: Epi) -> Result<usize> {
-        self.gemm_with(&self.st, w, x, y, epi)
-    }
-
-    /// The same products on a step of its own (DFlash2's)
-    fn gemm_with<Y: cudarc::driver::DeviceRepr>(&self, st: &Step, w: &Mat, x: &CudaSlice<u16>, y: &CudaSlice<Y>, epi: Epi)
-    -> Result<usize> {
-        self.mm.run(&self.s, st, w, x, y, epi)
+        self.mm.run(&self.s, &self.st, w, x, y, epi)
     }
 
     /// h += the partial products in `part`; xn = w_next * h / rms(h)
     fn add_rmsnorm(&self, split: usize, w_next: &CudaSlice<f32>) -> Result<()> {
         let (b, n) = (&self.b, self.st.n);
-        let (split, ni, eps) = (split as i32, n as i32, self.d.eps());
+        let (split, ni, eps) = (split as i32, n as i32, EPS);
         unsafe {
             self.s.launch_builder(&self.k.add_rmsnorm).arg(&b.h).arg(&b.part).arg(&split).arg(&ni).arg(w_next)
                 .arg(&b.xn).arg(&eps).launch(cfg((n, 1, 1), 512))?;
@@ -607,10 +528,6 @@ pub struct Model {
     final_norm: CudaSlice<f32>,
     graphs: Graphs<GraphKey>,
     mtp: Option<Mtp>,
-    /// a DFlash2 drafter (--dflash2): proposes the drafts instead of the MTP layer
-    dflash: Option<DFlash2>,
-    /// the raw residual stream after DFlash2's target layers, [tap][step's tokens][H]
-    taps: Option<CudaSlice<u16>>,
     /// per slot: whether it uses the adapter (set_adapter); None: no adapter loaded
     adapter: Option<(Vec<bool>, f32)>,
 }
@@ -630,12 +547,12 @@ impl Model {
                      only: Option<usize>) -> Result<Self> {
         let mut used = HashSet::new();
         let (x, w) = Stack::load(dir, max_ctx, slots, int8, only, adapter.map(|a| (a, &mut used)))?;
-        let e = format!("{}.embed_tokens.weight", x.d.root());
+        let e = format!("{ROOT}.embed_tokens.weight");
         let head = if w.has("lm_head.weight") { "lm_head.weight".to_string() } else { e.clone() };
         let mtp = match w.has("mtp.fc.weight") {
             true => {
                 let (s, d) = (&x.s, &x.d);
-                let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&d.layer_norm(&w, &format!("mtp.{n}.weight"))?)?) };
+                let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(&w, &format!("mtp.{n}.weight"))?)?) };
                 Some(Mtp {
                     // unadapted: drafts are checked by the adapted model (an adapter of the MTP layer: refused below)
                     layer: Layer::load(s, &x.pool, &w, d, "mtp.layers.0", "full_attention", x.st.slots, x.st.max_ctx, int8,
@@ -646,7 +563,7 @@ impl Model {
                     norm: fl("norm")?,
                     xin: s.alloc_zeros(MAX_TOK * 2 * d.h)?,
                     rows: s.alloc_zeros(MAX_TOK)?,
-                    head: DraftHead::load(s, &w, dir, d.vocab)?,
+                    head: DraftHead::load(s, &w, dir, VOCAB)?,
                 })
             }
             false => None,
@@ -659,13 +576,10 @@ impl Model {
                      language model's linear modules are (qwenny merge folds it into a bf16 model)", left.len(), left[0]);
         }
         let lm_head = Mat::stack(&x.s, &w, &[head], false, int8)?;
-        let final_norm = x.s.clone_htod(&x.d.layer_norm(&w, &format!("{}.norm.weight", x.d.root()))?)?;
+        let final_norm = x.s.clone_htod(&norm(&w, &format!("{ROOT}.norm.weight"))?)?;
         let adapter = adapter.map(|a| (vec![false; x.st.slots], a.scale()));
         let graphs = Graphs::new(Some(x.pool.clone()));
-        let dflash = crate::engine::drafter().map(|p| DFlash2::load(&x, &lm_head, p, int8)).transpose()?;
-        ensure!(dflash.is_none() || mtp.is_none(), "a DFlash2 drafter (--dflash2) beside the model's MTP layer");
-        let taps = dflash.as_ref().map(|d| x.s.alloc_zeros(MAX_TOK * d.taps().len() * x.d.h)).transpose()?;
-        let model = Model { embed, lm_head, final_norm, graphs, x, mtp, dflash, taps, adapter };
+        let model = Model { embed, lm_head, final_norm, graphs, x, mtp, adapter };
         // the whole model loaded: the caches' pages made at once (Pool::fill)
         model.x.set_budget()?;
         model.x.pool.fill()?;
@@ -679,7 +593,7 @@ impl Model {
     fn launch_step(&self) -> Result<()> {
         let x = &self.x;
         let (s, k, b, st) = (&x.s, &x.k, &x.b, &x.st);
-        let (eps, nk) = (x.d.eps(), st.n_out as i32);
+        let (eps, nk) = (EPS, st.n_out as i32);
         st.mark_seen(s)?;
         unsafe {
             self.embed.launch(s, k, &st.ids, &b.h, &st.keys, nk, st.n)?;
@@ -691,15 +605,6 @@ impl Model {
             x.add_rmsnorm(sp, &l.post_norm)?;
             let sp = x.mlp(l)?;
             x.add_rmsnorm(sp, x.layers.get(i + 1).map_or(&self.final_norm, |l| &l.input_norm))?;
-            if let (Some(d), Some(taps)) = (&self.dflash, &self.taps)
-                && let Some(tap) = d.taps().iter().position(|&t| t == i)
-            {
-                let len = st.n * x.d.h;
-                unsafe {
-                    s.launch_builder(&k.to_xin).arg(&b.h).arg(&taps.slice(tap * len..(tap + 1) * len)).arg(&(len as i32))
-                        .launch(cfg((len.div_ceil(1024).min(1024), 1, 1), 256))?;
-                }
-            }
         }
         if st.n_out > 0 {
             x.gemm(&self.lm_head, &b.xn, &st.logits, Epi::Argmax)?;
@@ -728,7 +633,7 @@ impl Model {
         self.x.st.lora = self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]));
         let (x, h) = (&self.x, self.x.d.h);
         let (s, kern, b, st) = (&x.s, &x.k, &x.b, &x.st);
-        let (eps, n) = (x.d.eps(), st.n);
+        let (eps, n) = (EPS, st.n);
         ensure!(k >= 1 && k < n, "last={k} suffix rows of a {n}-token prompt (need 1 <= k < n, never position 0)");
         st.mark_seen(s)?;
         unsafe {
@@ -752,7 +657,7 @@ impl Model {
     fn launch_mtp(&self, m: &Mtp, own: bool) -> Result<()> {
         let x = &self.x;
         let (s, k, b, st, d) = (&x.s, &x.k, &x.b, &x.st, &x.d);
-        let (eps, nk, n, h) = (d.eps(), st.n_out as i32, st.n as i32, d.h as i32);
+        let (eps, nk, n, h) = (EPS, st.n_out as i32, st.n as i32, d.h as i32);
         let fw = if own { &m.norm } else { &self.final_norm };
         // the tokens' embeddings into b.o (scratch here), then fc's input
         self.embed.launch(s, k, &st.ids, &b.o, &st.keys, nk, st.n)?;
@@ -781,7 +686,7 @@ impl Model {
     /// Bytes of KV cache per position of a slot (keys, values and their scales, every attention layer)
     fn kv_bytes_per_token(&self) -> usize {
         let attn = self.x.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)).filter(|l| matches!(l.mixer, Mixer::Attn(_)));
-        attn.count() * self.x.d.nkv * (2 * self.x.d.hd + 8)
+        attn.count() * NKV * (2 * HD + 8)
     }
 
     /// Map the per-slot memory a step over `toks` writes (in the MTP's layer too)
@@ -829,7 +734,7 @@ impl Model {
         let m = self.mtp.as_ref().context("no MTP layer in this model")?;
         let (width, ld, ids) = match &m.head {
             Some(h) => (h.mat.valid, h.mat.tiles * 16, Some(&h.ids)),
-            None => (self.x.d.vocab, self.x.d.vocab, None),
+            None => (VOCAB, VOCAB, None),
         };
         self.x.st.draft_sample(&self.x.s, width, ld, ids, &params)
     }
@@ -915,9 +820,6 @@ impl Engine for Model {
                 at = Some(p);
             }
         }
-        if let Some(d) = &self.dflash {
-            d.save(&s, slot, &mut data)?;
-        }
         for w in self.x.st.seen(&s, slot)? {
             data.extend_from_slice(&w.to_le_bytes());
         }
@@ -937,9 +839,6 @@ impl Engine for Model {
                 d.load(&s, slot, &o[..n], pos as i32)?;
                 o = &o[n..];
             }
-        }
-        if let Some(d) = &mut self.dflash {
-            o = &o[d.load_state(&s, slot, o)?..];
         }
         let words: Vec<u32> = o.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         self.x.st.set_seen(&s, slot, &words)?;
@@ -982,7 +881,7 @@ impl Engine for Model {
         layers.map(|l| match &l.mixer {
             Mixer::Attn(a) => a.saved_bytes(0, len),
             Mixer::Delta(d) => d.saved_bytes(),
-        }).sum::<usize>() + self.x.st.vocab / 8 + self.dflash.as_ref().map_or(0, DFlash2::image_bytes)
+        }).sum::<usize>() + self.x.st.vocab / 8
     }
 
     fn truncate(&mut self, slot: u32, from: usize) -> Result<()> {
@@ -1032,7 +931,7 @@ impl Engine for Model {
     }
 
     fn vocab(&self) -> usize {
-        self.x.d.vocab
+        VOCAB
     }
 
     fn step(&mut self, toks: &[Tok], out: &[usize], marks: Option<&[Vec<u32>]>) -> Result<()> {
@@ -1084,11 +983,7 @@ impl Engine for Model {
     }
 
     fn has_draft(&self) -> bool {
-        self.mtp.is_some() || self.dflash.is_some()
-    }
-
-    fn samples_drafts(&self) -> bool {
-        self.dflash.is_none()
+        self.mtp.is_some()
     }
 
     fn has_adapter(&self) -> bool {
@@ -1107,61 +1002,12 @@ impl Engine for Model {
         Ok(())
     }
 
-    /// 4: a step of 5 tokens is still two tiles of the 27B's decode attention, which reads the cache once for all of
-    /// them
-    fn draft_tokens(&self) -> usize {
-        if self.dflash.is_some() { dflash2::DRAFTS } else { 4 }
-    }
-
     /// xn after a step holds the final norm of every token of the step (f16)
     fn draft(&mut self, toks: &[Tok], rows: &[usize], out: &[usize], k: usize, sampling: &[Option<DraftSampling>])
     -> Result<Vec<Vec<u32>>> {
         ensure!(sampling.is_empty() || sampling.len() == out.len(), "{} draft samplings for {} rows",
                 sampling.len(), out.len());
-        if let (Some(d), Some(taps)) = (&mut self.dflash, &self.taps) {
-            return d.draft(&self.x, &self.embed, &self.lm_head, taps, self.x.st.n, toks, rows, out, k);
-        }
         let argmax = vec![None; out.len()];
         self.draft_chains(toks, rows, out, k, if sampling.is_empty() { &argmax } else { sampling })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// TwIL-8B's config.json, as far as the engine reads it
-    fn granite() -> serde_json::Value {
-        json!({"model_type": "granite", "attention_bias": false, "attention_multiplier": 0.0078125,
-               "embedding_multiplier": 1.0, "hidden_act": "silu", "hidden_size": 4096, "intermediate_size": 12800,
-               "logits_scaling": 1.0, "mlp_bias": false, "num_attention_heads": 32, "num_hidden_layers": 40,
-               "num_key_value_heads": 8, "residual_multiplier": 1.0, "rms_norm_eps": 1e-05,
-               "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"}, "vocab_size": 100352})
-    }
-
-    #[test]
-    fn granite_config_gets_its_kernels_and_layers() {
-        let (d, _) = Dims::of(&granite()).unwrap();
-        assert_eq!((d.hd, d.rot, d.nkv, d.scale, d.attn_in(), d.mix()), (128, 128, 8, 1.0 / 128.0, 6144, 4096));
-        assert_eq!(d.layer_kinds(&granite()).unwrap(), vec!["full_attention"; 40]);
-    }
-
-    #[test]
-    fn granite_config_the_kernels_do_not_compute_is_refused() {
-        let sizes = [("attention_multiplier", json!(0.5)), ("num_key_value_heads", json!(4)), ("vocab_size", json!(1024))];
-        for (key, value) in sizes {
-            let mut c = granite();
-            c[key] = value;
-            assert!(Dims::of(&c).is_err(), "{key}");
-        }
-        let forward = [("residual_multiplier", json!(2.0)), ("logits_scaling", json!(2.0)),
-                       ("embedding_multiplier", json!(2.0)), ("attention_bias", json!(true)), ("hidden_act", json!("gelu")),
-                       ("rms_norm_eps", json!(1e-6))];
-        for (key, value) in forward {
-            let mut c = granite();
-            c[key] = value;
-            assert!(Dims::parse_granite(&c).is_err(), "{key}");
-        }
     }
 }

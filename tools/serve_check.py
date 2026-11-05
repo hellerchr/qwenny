@@ -2,7 +2,6 @@
 """A real server end to end, as a client sees it: starts `qwenny serve` on a model, sends requests over HTTP and checks
 the replies. Prints OK or FAIL per case and exits 1 if any failed. Standard library only.
 
-  python3 -I tools/serve_check.py --model=webAI-Official/TwIL-8B
   python3 -I tools/serve_check.py --model=Qwen/Qwen3.5-4B --bin=target/release/qwenny --slots=4 --ctx=32768 --bf16
 
 Greedy requests are compared with each other: streamed against not, alone against concurrent, a continued conversation

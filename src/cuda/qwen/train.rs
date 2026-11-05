@@ -9,7 +9,7 @@
 //! AutoRound Qwen3.8-27B), dequantized into one scratch matrix just before each product (`Weight`); the output layer
 //! in slices of vocabulary rows. The embedding stays in the checkpoint on the host: a micro-batch's rows are read from
 //! it and uploaded.
-use super::{Dims, EPS, HD, LK_HEADS, LKD, LVD, NKV, attn, norm};
+use super::{Dims, EPS, HD, LK_HEADS, LKD, LVD, NKV, ROT, VOCAB, attn, norm};
 use crate::checkpoint::Checkpoint;
 use crate::cuda::learn::{Arg::{F, I, P}, Buf, Group, Layout, Learn, Scratch};
 use crate::training::{Micro, Opts, f32_bytes};
@@ -315,7 +315,7 @@ impl Trainer {
             .map(|w| w.rows * w.cols).sum::<usize>()).max().unwrap_or(0);
         let scr_elems = if lm_head.in_place() { widest } else { widest.max(32768 * d.h) };
         let ck_rows = tmax.div_ceil(C_CK);
-        let inv_freq: Vec<f32> = (0..d.rot / 2).map(|i| attn::THETA.powf(-2.0 * i as f64 / d.rot as f64) as f32).collect();
+        let inv_freq: Vec<f32> = (0..ROT / 2).map(|i| attn::THETA.powf(-2.0 * i as f64 / ROT as f64) as f32).collect();
         let t = Trainer {
             lm_head,
             scr: alloc(scr_elems * es)?,
@@ -366,8 +366,8 @@ impl Trainer {
             rows: alloc(tmax * 4)?,
             targets: alloc(tmax * 4)?,
             gath: alloc(tmax * h * es)?,
-            logits: alloc(CHUNK * d.vocab * 4)?,
-            dlog: alloc(CHUNK * d.vocab * es)?,
+            logits: alloc(CHUNK * VOCAB * 4)?,
+            dlog: alloc(CHUNK * VOCAB * es)?,
             loss_row: alloc(tmax * 4)?,
             correct: alloc(tmax * 4)?,
             row_w: alloc(tmax * 4)?,
@@ -651,7 +651,7 @@ impl Trainer {
         }
         // the output layer in slices of vocabulary rows that fit the scratch (one slice when it is used in place)
         let lm = &self.lm_head;
-        let vocab = self.d.vocab;
+        let vocab = VOCAB;
         let slice = if lm.in_place() { vocab } else { self.scr_elems / h };
         let out_w = |v0: usize, v1: usize| self.wrows(lm, v0, v1);
         for c0 in (0..na).step_by(CHUNK) {
