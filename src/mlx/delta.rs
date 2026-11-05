@@ -7,7 +7,7 @@
 //!   chunk the deltas solve a unit lower triangular system that does not depend on the state, so all chunks of a
 //!   prompt are set up at once with matrix products and only CH-token steps between chunks remain sequential. All in
 //!   f32 (TF32 is off: weights::init); decays enter only as exp of differences of cumulative log decays (<= 0).
-use super::weights::MResult;
+use super::weights::{LK_HEADS, LKD, MResult};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, ops};
 
@@ -24,6 +24,31 @@ pub struct Tok<'a> {
     pub e: &'a Array,
     pub b: &'a Array,
     pub dot: &'a Array,
+}
+
+/// q or k [len][Lk][Dk] for each value head [len][Hv][Dk]: every value head reads its key head (adjacent groups)
+pub fn repeat(x: &Array, lv: i32) -> MResult<Array> {
+    let len = x.shape()[0];
+    ops::broadcast_to(ops::expand_dims(x, 2)?, &[len, LK_HEADS, lv / LK_HEADS, LKD])?.reshape(&[len, lv, LKD])
+}
+
+/// `front` zero rows in front and `back` behind of x [len][..]
+pub fn pad_rows(x: &Array, front: i32, back: i32) -> MResult<Array> {
+    if front == 0 && back == 0 {
+        return Ok(x.clone());
+    }
+    let mut sh = x.shape().to_vec();
+    let mut parts = Vec::with_capacity(3);
+    if front > 0 {
+        sh[0] = front;
+        parts.push(ops::zeros::<f32>(&sh)?);
+    }
+    parts.push(x.clone());
+    if back > 0 {
+        sh[0] = back;
+        parts.push(ops::zeros::<f32>(&sh)?);
+    }
+    ops::concatenate(&parts, 0)
 }
 
 /// Row i of x (a view: integer indices are gathers in mlx-rs)
@@ -179,7 +204,7 @@ mod tests {
         let kq = ops::stack(&[&k1, &q1], -1).unwrap();
         let mut st = s0.clone();
         let mut worst = 0f32;
-        let max = |a: &Array, b: &Array| ops::max(ops::abs(ops::subtract(a, b).unwrap()).unwrap(), None).unwrap().item::<f32>();
+        let max = |a: &Array, b: &Array| ops::max(ops::abs(ops::subtract(a, b).unwrap()).unwrap(), None).unwrap().item_exact::<f32>();
         for i in 0..n {
             let r = |x: &Array| row(x, i).unwrap();
             let (s2, oi) = token(&st, Tok { kq: &r(&kq), v: &r(&v), e: &r(&e), b: &r(&b), dot: &r(&dot) }).unwrap();

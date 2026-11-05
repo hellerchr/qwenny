@@ -1,6 +1,6 @@
 //! Qwen3.5 / Qwen3.8 weights and the residual stack as MLX operations. Matrix products use f16 inputs (dense or the
 //! checkpoint's affine quantization), with f32 residual streams, norms, mixer state and element-wise gates. The
-//! backend-specific cache operations are supplied by `Mix`, as in lfm3-engine's MLX backend.
+//! backend-specific cache operations are supplied by `Mix`.
 use crate::checkpoint::{Checkpoint, Matrix, Quant};
 use crate::draft_vocab::{Adaptive, draft_ids};
 use anyhow::{Context, Result, bail, ensure};
@@ -65,13 +65,9 @@ pub enum Linear {
 }
 
 impl Linear {
-    fn new(w: Array) -> MResult<Self> {
-        Ok(Linear::Dense(w))
-    }
-
     /// MLX's quantized products take groups of 32, 64 or 128: a larger group that 128 divides (per channel, 256, ...)
     /// is the same matrix in groups of 128 with its scale and offset repeated
-    fn stored(q: &Quant, dtype: Dtype) -> Result<Self> {
+    fn stored(q: &Quant) -> Result<Self> {
         let (scales, offsets, group) = if [32, 64, 128].contains(&q.group) {
             (q.scales.clone(), q.offsets.clone(), q.group)
         } else {
@@ -82,8 +78,8 @@ impl Linear {
         let (rows, groups) = (q.rows as i32, (q.cols / group) as i32);
         Ok(Linear::Quant {
             w: Array::from_slice(&q.q, &[rows, (q.cols * q.bits / 32) as i32]),
-            scales: Array::from_slice(&scales, &[rows, groups]).as_dtype(dtype)?,
-            biases: Array::from_slice(&offsets, &[rows, groups]).as_dtype(dtype)?,
+            scales: Array::from_slice(&scales, &[rows, groups]).as_dtype(Dtype::Float16)?,
+            biases: Array::from_slice(&offsets, &[rows, groups]).as_dtype(Dtype::Float16)?,
             group: group as i32,
             bits: q.bits as i32,
         })
@@ -299,7 +295,7 @@ impl Stages {
             let xn = rms(&h, &rest[0])?.as_dtype(Dtype::Float16)?;
             let (gu, rest) = sgu.apply_take(&rest[1..], &xn)?;
             let ab = ops::split_equal(&gu, 2, -1)?;
-            let f = sdown.apply(rest, &swiglu(&ab[0], &ab[1], Dtype::Float16)?)?;
+            let f = sdown.apply(rest, &swiglu(&ab[0], &ab[1])?)?;
             Ok(vec![ops::add(&h, &f)?])
         });
         Ok(Stages { pre, pre_args, tail, tail_args })
@@ -335,7 +331,6 @@ pub struct Layer {
 }
 
 pub struct Weights {
-    pub dtype: Dtype,
     pub d: Dims,
     /// [V][H], used for lookup and for a dense tied output layer.
     pub embed: Array,
@@ -407,14 +402,13 @@ fn symmetric_int8(m: Matrix) -> Result<Quant> {
     Ok(Quant { bits: 8, group, rows, cols, q, scales, offsets })
 }
 
-fn array(bits: &[u16], shape: &[i32], dtype: Dtype) -> MResult<Array> {
+fn array(bits: &[u16], shape: &[i32]) -> MResult<Array> {
     let v: Vec<bf16> = bits.iter().map(|&b| bf16::from_bits(b)).collect();
-    Array::from_slice(&v, shape).as_dtype(dtype)
+    Array::from_slice(&v, shape).as_dtype(Dtype::Float16)
 }
 
 impl Weights {
-    pub fn load(dir: &Path, dtype: Dtype, int8: bool) -> Result<Self> {
-        ensure!(dtype == Dtype::Float16, "the MLX inference backend currently uses f16 matrix inputs");
+    pub fn load(dir: &Path, int8: bool) -> Result<Self> {
         let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
         let tc = config.get("text_config").unwrap_or(&config);
         let d = Dims::of(&config)?;
@@ -455,21 +449,21 @@ impl Weights {
                 cols = c;
                 all.extend(w);
             }
-            Ok(array(&all, &[(all.len() / cols) as i32, cols as i32], dtype)?)
+            Ok(array(&all, &[(all.len() / cols) as i32, cols as i32])?)
         };
         let lin = |names: &[String]| -> Result<Linear> {
             let ms = mats(names)?;
             if ms.iter().all(|m| matches!(m, Matrix::Quant(_))) {
                 let qs = ms.into_iter().filter_map(|m| if let Matrix::Quant(q) = m { Some(q) } else { None }).collect();
-                return Linear::stored(&Quant::stack(qs)?, dtype);
+                return Linear::stored(&Quant::stack(qs)?);
             }
             if quantize {
                 // CUDA's pack(), not MLX's affine min/max quantization: symmetric q in [-127,127], stored +128,
                 // an f32 max/127 scale per row and group of 128, and round/clamp in exactly that order.
                 let qs = ms.into_iter().map(symmetric_int8).collect::<Result<Vec<_>>>()?;
-                return Linear::stored(&Quant::stack(qs)?, dtype);
+                return Linear::stored(&Quant::stack(qs)?);
             }
-            Ok(Linear::new(dense(names, ms)?)?)
+            Ok(Linear::Dense(dense(names, ms)?))
         };
         let vec = |n: &str| -> Result<Array> {
             let (w, shape) = ck.floats(n)?;
@@ -561,7 +555,7 @@ impl Weights {
             }
         }
         let stages = layers.iter().map(|l| Stages::of(l, d, false)).collect::<MResult<Vec<_>>>()?;
-        let w = Weights { dtype, d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers, stages, mtp };
+        let w = Weights { d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers, stages, mtp };
         w.eval()?;
         Ok(w)
     }
@@ -633,7 +627,7 @@ impl Weights {
             if pending.len() == 2 {
                 pending.pop_front().unwrap().eval()?;
             }
-            h = self.layer(at, m, &h, small)?;
+            h = run_layer(&self.layers[at.li], &mut self.stages[at.li], at, m, &h, small)?;
             if prefill {
                 m.submit(&h)?;
                 pending.push_back(h.clone());
@@ -642,26 +636,23 @@ impl Weights {
         Ok(h)
     }
 
-    fn layer(&mut self, at: At, m: &mut impl Mix, h: &Array, small: bool) -> MResult<Array> {
-        run_layer(&self.layers[at.li], &mut self.stages[at.li], at, m, h, small)
-    }
 }
 
 fn run_layer(l: &Layer, st: &mut Stages, at: At, m: &mut impl Mix, h: &Array, small: bool) -> MResult<Array> {
-        let with = |front: Vec<Array>, rest: &[Array]| -> Vec<Array> { front.into_iter().chain(rest.iter().cloned()).collect() };
-        match l.kind {
-            Kind::Attn => {
-                let (cos, sin) = m.rope();
-                let r = st.pre.call(small, &with(vec![h.clone(), cos, sin], &st.pre_args))?;
-                let o = m.attend(at.ai, &r[0], &r[2], &r[3], &r[4], &r[5])?;
-                Ok(st.tail.call(small, &with(vec![h.clone(), o, r[1].clone()], &st.tail_args))?.remove(0))
-            }
-            Kind::Delta => {
-                let r = st.pre.call(small, &with(vec![h.clone()], &st.pre_args))?;
-                let y = m.delta(at.di, l, small, &r[0], &r[1], &r[2], &r[3], &r[4])?;
-                Ok(st.tail.call(small, &with(vec![h.clone(), y], &st.tail_args))?.remove(0))
-            }
+    let with = |front: Vec<Array>, rest: &[Array]| -> Vec<Array> { front.into_iter().chain(rest.iter().cloned()).collect() };
+    match l.kind {
+        Kind::Attn => {
+            let (cos, sin) = m.rope();
+            let r = st.pre.call(small, &with(vec![h.clone(), cos, sin], &st.pre_args))?;
+            let o = m.attend(at.ai, &r[0], &r[2], &r[3], &r[4], &r[5])?;
+            Ok(st.tail.call(small, &with(vec![h.clone(), o, r[1].clone()], &st.tail_args))?.remove(0))
         }
+        Kind::Delta => {
+            let r = st.pre.call(small, &with(vec![h.clone()], &st.pre_args))?;
+            let y = m.delta(at.di, l, small, &r[0], &r[1], &r[2], &r[3], &r[4])?;
+            Ok(st.tail.call(small, &with(vec![h.clone(), y], &st.tail_args))?.remove(0))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -713,13 +704,12 @@ pub fn gate(o: &Array, g: &Array) -> MResult<Array> {
     ops::multiply(o, nn::sigmoid(g.as_dtype(Dtype::Float32)?)?)
 }
 
-/// silu(a) * b in f32, rounded to the matrix input dtype.
-pub fn swiglu(a: &Array, b: &Array, dtype: Dtype) -> MResult<Array> {
-    ops::multiply(nn::silu(a.as_dtype(Dtype::Float32)?)?, b.as_dtype(Dtype::Float32)?)?.as_dtype(dtype)
+/// silu(a) * b in f32, rounded to f16 (the next matrix's input).
+pub fn swiglu(a: &Array, b: &Array) -> MResult<Array> {
+    ops::multiply(nn::silu(a.as_dtype(Dtype::Float32)?)?, b.as_dtype(Dtype::Float32)?)?.as_dtype(Dtype::Float16)
 }
 
-/// Once per process, before MLX's first operation. The switches mirror lfm3-engine: changing prompt shapes must not
-/// trip the graph-cache warning, and freed buffers must not accumulate without a bound. MLX_ENABLE_TF32 (on by default)
+/// Once per process, before MLX's first operation. Changing prompt shapes must not trip the graph-cache warning, and freed buffers must not accumulate without a bound. MLX_ENABLE_TF32 (on by default)
 /// would run f32 matrix products in TF32 (10-bit mantissas): off, the products stay f32.
 pub fn init() -> MResult<()> {
     static ONCE: std::sync::Once = std::sync::Once::new();

@@ -8,7 +8,7 @@
 //! rule's inputs of the positions ck .. end and the raw convolution inputs of the last KEEP + 3 positions, and a
 //! restart replays the accepted tokens from the checkpoint (delta::token, the same operations as the step's own).
 #[cfg(not(has_metal))]
-use super::delta::{self, CH};
+use super::delta::{self, CH, pad_rows, repeat};
 use super::weights::{self as w, CONV_K, Fused, HD, Layer, LKD, LK_HEADS, LVD, MResult, NKV, ROT, THETA, Weights};
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{kept_dist, sample_row, sample_row_q};
@@ -76,6 +76,30 @@ struct DeltaState {
     hist: Array,
 }
 
+impl DeltaState {
+    fn new(zero_state: &Array, zero_hist: &Array) -> Self {
+        DeltaState { state: zero_state.clone(), ck_state: zero_state.clone(), bank: None, hist: zero_hist.clone() }
+    }
+}
+
+/// Every KV cache's arrays (to evaluate)
+fn kv_arrays(kv: &[Vec<Kv>]) -> impl Iterator<Item = &Array> {
+    kv.iter().flatten().flat_map(|c| [&c.k, &c.ks, &c.v, &c.vs])
+}
+
+/// Every DeltaNet state's arrays (to evaluate)
+fn delta_arrays(delta: &[Vec<DeltaState>]) -> impl Iterator<Item = &Array> {
+    delta.iter().flatten().flat_map(|st| {
+        [&st.state, &st.ck_state, &st.hist].into_iter().chain(st.bank.iter().flat_map(|b| [&b.kq, &b.v, &b.e, &b.b, &b.dot]))
+    })
+}
+
+/// Rows `rows` of x
+fn take_rows(x: &Array, rows: impl Iterator<Item = usize>) -> MResult<Array> {
+    let rows: Vec<i32> = rows.map(|r| r as i32).collect();
+    x.take_axis(&Array::from_slice(&rows, &[rows.len() as i32]), 0)
+}
+
 pub struct Model {
     w: Weights,
     slots: usize,
@@ -102,12 +126,12 @@ pub struct Model {
     /// per logit row: (slot, first token of its segment, its token)
     rows: Vec<(usize, usize, usize)>,
     ids: Vec<u32>,
-    /// compiled per-token stages shared by all DeltaNet layers (delta::token; the segment's convolution and inputs;
-    /// its output norm and gate)
-    fused: SegFns,
+    fused: DeltaStages,
 }
 
-struct SegFns {
+/// Compiled stages of a segment shared by all DeltaNet layers: per token the delta rule (delta::token; Metal has its own
+/// kernels), the convolution and inputs, the output norm and gate
+struct DeltaStages {
     #[cfg(not(has_metal))]
     token: Fused,
     prep: Fused,
@@ -118,20 +142,28 @@ impl Model {
     pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool) -> Result<Self> {
         ensure!(max_ctx > 0 && slots > 0, "context and slots must be positive");
         w::init()?;
-        let w = Weights::load(dir, Dtype::Float16, int8)?;
+        let w = Weights::load(dir, int8)?;
         let (_, n_delta) = w.counts();
         let d = w.d;
         let zero_state = ops::zeros::<f32>(&[d.lv_heads, LVD, LKD])?;
         let zero_hist = ops::zeros::<f32>(&[CONV_K - 1, d.conv_width()])?;
-        let fresh = || DeltaState { state: zero_state.clone(), ck_state: zero_state.clone(), bank: None,
-                                    hist: zero_hist.clone() };
-        let delta = (0..slots).map(|_| (0..n_delta).map(|_| fresh()).collect()).collect();
+        let delta = (0..slots).map(|_| (0..n_delta).map(|_| DeltaState::new(&zero_state, &zero_hist)).collect()).collect();
         let vocab = d.vocab;
         Ok(Model { w, slots, max_ctx, kv: (0..slots).map(|_| Vec::new()).collect(), cap: vec![0; slots], delta,
                    zero_state, zero_hist, end: vec![0; slots], ck: vec![0; slots], hpos: vec![-3; slots],
                    seen: vec![vec![0; vocab.div_ceil(64)]; slots], outs: vec![vec![0; vocab / 32]; slots],
                    logits: None, hidden: None, draft_dist: vec![Vec::new(); slots], draft_end: vec![0; slots],
-                   rows: Vec::new(), ids: Vec::new(), fused: SegFns::new(d) })
+                   rows: Vec::new(), ids: Vec::new(), fused: DeltaStages::new(d) })
+    }
+
+    /// Whether token `id` is in slot `slot`'s seen set (repetition penalty)
+    fn is_seen(&self, slot: usize, id: u32) -> bool {
+        self.seen[slot][id as usize / 64] >> (id % 64) & 1 == 1
+    }
+
+    /// Whether token `id` is among slot `slot`'s outputs (presence penalty)
+    fn is_output(&self, slot: usize, id: u32) -> bool {
+        self.outs[slot][id as usize / 32] >> (id % 32) & 1 == 1
     }
 
     fn reserve(&mut self, slot: usize, end: usize) -> Result<()> {
@@ -162,8 +194,7 @@ impl Model {
     /// A new sequence in `slot`: zero recurrent state and conv history
     fn reset(&mut self, slot: usize) {
         for st in self.delta[slot].iter_mut() {
-            *st = DeltaState { state: self.zero_state.clone(), ck_state: self.zero_state.clone(), bank: None,
-                               hist: self.zero_hist.clone() };
+            *st = DeltaState::new(&self.zero_state, &self.zero_hist);
         }
         self.end[slot] = 0;
         self.ck[slot] = 0;
@@ -173,28 +204,33 @@ impl Model {
         self.draft_dist[slot].clear();
     }
 
-    /// One teacher-forced MTP step, or one link using the preceding MTP link's residual stream.
-    fn mtp_forward(&mut self, toks: &[Tok], h: &Array, out: &[usize]) -> Result<(Array, Option<Array>)> {
+    /// A step's segments: per contiguous run of positions of a slot, each slot once
+    fn segments(&self, toks: &[Tok]) -> Result<Vec<Segment>> {
         let mut segs: Vec<Segment> = Vec::new();
         let mut used = vec![false; self.slots];
         for (i, t) in toks.iter().enumerate() {
             let s = t.slot as usize;
             ensure!(s < self.slots && (t.pos as usize) < self.max_ctx && (t.id as usize) < self.w.d.vocab,
-                    "MTP token {t:?} out of range");
+                    "token {t:?} out of range");
             match segs.last_mut() {
                 Some(g) if g.slot == s && g.pos0 + g.b - g.a == t.pos as usize => g.b = i + 1,
                 _ => {
-                    ensure!(!std::mem::replace(&mut used[s], true), "MTP slot {s} twice");
+                    ensure!(!std::mem::replace(&mut used[s], true), "slot {s} twice in one step");
                     segs.push(Segment { a: i, b: i + 1, slot: s, pos0: t.pos as usize,
                                         replay: None, hfrom: 0, ck: 0, hpos: 0 });
                 }
             }
         }
+        Ok(segs)
+    }
+
+    /// One teacher-forced MTP step, or one link using the preceding MTP link's residual stream.
+    fn mtp_forward(&mut self, toks: &[Tok], h: &Array, out: &[usize]) -> Result<(Array, Option<Array>)> {
+        let segs = self.segments(toks)?;
         for g in &segs {
             self.reserve(g.slot, g.pos0 + g.b - g.a)?;
         }
-        let ids: Vec<i32> = toks.iter().map(|t| t.id as i32).collect();
-        let e = self.w.embed.take_axis(&Array::from_slice(&ids, &[ids.len() as i32]), 0)?;
+        let e = take_rows(&self.w.embed, toks.iter().map(|t| t.id as usize))?;
         let ai = self.w.counts().0;
         let m = self.w.mtp.as_mut().context("no MTP layer")?;
         let fused = ops::concatenate(&[w::rms(&e.as_dtype(Dtype::Float32)?, &m.pre_e)?, w::rms(h, &m.pre_h)?], -1)?
@@ -205,25 +241,20 @@ impl Model {
                                 rope: rope_tables(&pos)?, d: self.w.d, fused: &mut self.fused };
         let h = m.forward(&mut cache, &x, ai)?;
         let logits = if out.is_empty() { None } else {
-            let rows: Vec<i32> = out.iter().map(|&r| r as i32).collect();
-            let hf = w::rms(&h.take_axis(&Array::from_slice(&rows, &[rows.len() as i32]), 0)?, &m.norm)?
-                .as_dtype(Dtype::Float16)?;
+            let hf = w::rms(&take_rows(&h, out.iter().copied())?, &m.norm)?.as_dtype(Dtype::Float16)?;
             let head = m.head.as_ref().or(self.w.head.as_ref());
             Some(match head {
                 Some(head) => head.apply_draft(&hf)?,
                 None => ops::matmul(&hf, ops::transpose(&self.w.embed)?)?.as_dtype(Dtype::Float32)?,
             })
         };
-        let kv = self.kv.iter().flatten().flat_map(|c| [&c.k, &c.ks, &c.v, &c.vs]);
-        transforms::eval([&h].into_iter().chain(logits.iter()).chain(kv))?;
+        transforms::eval([&h].into_iter().chain(logits.iter()).chain(kv_arrays(&self.kv)))?;
         for g in &segs { self.draft_end[g.slot] = g.pos0 + g.b - g.a; }
         Ok((h, logits))
     }
 
     fn forward(&mut self, toks: &[Tok], segs: &[Segment], out: &[usize]) -> MResult<Option<Array>> {
-        let t = toks.len() as i32;
-        let ids: Vec<i32> = toks.iter().map(|x| x.id as i32).collect();
-        let h = self.w.embed.take_axis(&Array::from_slice(&ids, &[t]), 0)?.as_dtype(Dtype::Float32)?;
+        let h = take_rows(&self.w.embed, toks.iter().map(|t| t.id as usize))?.as_dtype(Dtype::Float32)?;
         let pos: Vec<i32> = toks.iter().map(|x| x.pos as i32).collect();
         let rope = rope_tables(&pos)?;
         let mut cache = Cache { kv: &mut self.kv, delta: &mut self.delta, segs, rope, d: self.w.d,
@@ -234,9 +265,7 @@ impl Model {
         if out.is_empty() {
             return Ok(None);
         }
-        let rows: Vec<i32> = out.iter().map(|&r| r as i32).collect();
-        let hf = w::rms(&h.take_axis(&Array::from_slice(&rows, &[rows.len() as i32]), 0)?, &self.w.final_norm)?
-            .as_dtype(self.w.dtype)?;
+        let hf = w::rms(&take_rows(&h, out.iter().copied())?, &self.w.final_norm)?.as_dtype(Dtype::Float16)?;
         let logits = match &self.w.head {
             Some(head) => head.apply(&hf),
             None => ops::matmul(&hf, ops::transpose(&self.w.embed)?)?.as_dtype(Dtype::Float32),
@@ -246,7 +275,7 @@ impl Model {
 }
 
 /// cos and sin [T][1][ROT], split-half (nontraditional) RoPE, theta 10^7 and 64 rotary dimensions.
-fn rope_tables(pos: &[i32]) -> MResult<[(Array, Array); 2]> {
+fn rope_tables(pos: &[i32]) -> MResult<(Array, Array)> {
     let inv: Vec<f32> = (0..ROT / 2).map(|d| THETA.powf(-2.0 * d as f64 / ROT as f64) as f32).collect();
     let (mut c, mut s) = (Vec::with_capacity(pos.len() * ROT as usize), Vec::with_capacity(pos.len() * ROT as usize));
     for &p in pos {
@@ -260,21 +289,21 @@ fn rope_tables(pos: &[i32]) -> MResult<[(Array, Array); 2]> {
     }
     let c = Array::from_slice(&c, &[pos.len() as i32, ROT]).reshape(&[pos.len() as i32, 1, ROT])?;
     let s = Array::from_slice(&s, &[pos.len() as i32, ROT]).reshape(&[pos.len() as i32, 1, ROT])?;
-    Ok([(c.clone(), s.clone()), (c, s)])
+    Ok((c, s))
 }
 
 struct Cache<'a> {
     kv: &'a mut [Vec<Kv>],
     delta: &'a mut [Vec<DeltaState>],
     segs: &'a [Segment],
-    rope: [(Array, Array); 2],
+    rope: (Array, Array),
     d: w::Dims,
-    fused: &'a mut SegFns,
+    fused: &'a mut DeltaStages,
 }
 
-impl SegFns {
+impl DeltaStages {
     fn new(d: w::Dims) -> Self {
-        SegFns {
+        DeltaStages {
             // [s, kq, v, e, b, dot] -> [s, o]
             #[cfg(not(has_metal))]
             token: Fused::new(|a: &[Array]| {
@@ -318,13 +347,6 @@ fn conv_qkv(hist: &Array, raw: &Array, cw: &Array, d: w::Dims) -> MResult<(Array
     Ok((q, k, qkvw[2].reshape(&[len, lv, LVD])?, ext))
 }
 
-/// q or k [len][Lk][Dk] for each value head [len][Hv][Dk]: every value head reads its key head (adjacent groups)
-#[cfg(not(has_metal))]
-fn repeat(x: &Array, lv: i32) -> MResult<Array> {
-    let len = x.shape()[0];
-    ops::broadcast_to(ops::expand_dims(x, 2)?, &[len, LK_HEADS, lv / LK_HEADS, LKD])?.reshape(&[len, lv, LKD])
-}
-
 /// norm_w * o / rms(o) * silu(z) per value head: o [len][Hv][Dv], z [len][Hv * Dv]
 fn out_gate(o: &Array, norm_w: &Array, z: &Array, d: w::Dims) -> MResult<Array> {
     let len = o.shape()[0];
@@ -337,38 +359,13 @@ fn own(x: &Array) -> MResult<Array> {
     ops::multiply(x, Array::from_f32(1.0))
 }
 
-/// n zero rows in front and `back` behind of x [len][..]
-#[cfg(not(has_metal))]
-fn pad_rows(x: &Array, front: i32, back: i32) -> MResult<Array> {
-    if front == 0 && back == 0 {
-        return Ok(x.clone());
-    }
-    let mut sh = x.shape().to_vec();
-    let mut parts = Vec::with_capacity(3);
-    if front > 0 {
-        sh[0] = front;
-        parts.push(ops::zeros::<f32>(&sh)?);
-    }
-    parts.push(x.clone());
-    if back > 0 {
-        sh[0] = back;
-        parts.push(ops::zeros::<f32>(&sh)?);
-    }
-    ops::concatenate(&parts, 0)
-}
-
 impl w::Mix for Cache<'_> {
     fn submit(&self, h: &Array) -> MResult<()> {
-        let kv = self.kv.iter().flatten().flat_map(|c| [&c.k, &c.ks, &c.v, &c.vs]);
-        let delta = self.delta.iter().flatten().flat_map(|st| {
-            [&st.state, &st.ck_state, &st.hist].into_iter()
-                .chain(st.bank.iter().flat_map(|b| [&b.kq, &b.v, &b.e, &b.b, &b.dot]))
-        });
-        transforms::async_eval([h].into_iter().chain(kv).chain(delta))
+        transforms::async_eval([h].into_iter().chain(kv_arrays(self.kv)).chain(delta_arrays(self.delta)))
     }
 
     fn rope(&self) -> (Array, Array) {
-        self.rope[0].clone()
+        self.rope.clone()
     }
 
     fn attend(&mut self, ai: usize, q: &Array, kq: &Array, ks: &Array, vq: &Array, vs: &Array) -> MResult<Array> {
@@ -527,21 +524,8 @@ impl Engine for Model {
     fn step(&mut self, toks: &[Tok], out: &[usize], marks: Option<&[Vec<u32>]>) -> Result<()> {
         ensure!((1..=MAX_TOK).contains(&toks.len()) && out.len() <= MAX_OUT, "step of {} tokens, {} rows", toks.len(), out.len());
         ensure!(out.iter().all(|&r| r < toks.len()), "an output row beyond the step");
-        let mut segs: Vec<Segment> = Vec::new();
-        for (i, t) in toks.iter().enumerate() {
-            ensure!((t.slot as usize) < self.slots && (t.pos as usize) < self.max_ctx && (t.id as usize) < self.w.d.vocab,
-                    "token {t:?} out of range");
-            match segs.last_mut() {
-                Some(g) if g.slot == t.slot as usize && g.pos0 + (g.b - g.a) == t.pos as usize => g.b = i + 1,
-                _ => segs.push(Segment { a: i, b: i + 1, slot: t.slot as usize, pos0: t.pos as usize, replay: None,
-                                         hfrom: 0, ck: 0, hpos: 0 }),
-            }
-        }
+        let mut segs = self.segments(toks)?;
         ensure!(marks.is_none_or(|m| m.len() == segs.len()), "marks per segment");
-        let mut used = vec![false; self.slots];
-        for g in &segs {
-            ensure!(!std::mem::replace(&mut used[g.slot], true), "slot {} twice in one step", g.slot);
-        }
         for (k, g) in segs.iter_mut().enumerate() {
             let s = g.slot;
             if g.pos0 == 0 {
@@ -576,12 +560,7 @@ impl Engine for Model {
         self.w.learn_drafts(&committed)?;
         let logits = self.forward(toks, &segs, out)?;
         // Commit logits and all lazy state writes together; no graph may span engine steps.
-        let kv = self.kv.iter().flatten().flat_map(|c| [&c.k, &c.ks, &c.v, &c.vs]);
-        let delta = self.delta.iter().flatten().flat_map(|st| {
-            [&st.state, &st.ck_state, &st.hist].into_iter()
-                .chain(st.bank.iter().flat_map(|b| [&b.kq, &b.v, &b.e, &b.b, &b.dot]))
-        });
-        transforms::eval(logits.iter().chain(self.hidden.iter()).chain(kv).chain(delta))?;
+        transforms::eval(logits.iter().chain(self.hidden.iter()).chain(kv_arrays(&self.kv)).chain(delta_arrays(&self.delta)))?;
         for g in &segs {
             self.end[g.slot] = g.pos0 + g.b - g.a;
             self.ck[g.slot] = g.ck;
@@ -626,8 +605,8 @@ impl Engine for Model {
         let vocab = self.w.d.vocab;
         Ok(self.rows.iter().zip(params).enumerate().map(|(j, (&(slot, first, tok), p))| {
             let step = |id: u32| self.ids[first + 1..=tok].contains(&id);
-            let seen = |id: u32| self.seen[slot][id as usize / 64] >> (id % 64) & 1 == 1 || step(id);
-            let generated = |id: u32| self.outs[slot][id as usize / 32] >> (id % 32) & 1 == 1 || step(id);
+            let seen = |id: u32| self.is_seen(slot, id) || step(id);
+            let generated = |id: u32| self.is_output(slot, id) || step(id);
             if p[6] <= -2.0 {
                 let mut row = *p;
                 row[6] = -p[6] - 2.0;
@@ -651,10 +630,8 @@ impl Engine for Model {
         ensure!(sampling.is_empty() || sampling.len() == out.len(), "MTP sampling rows mismatch");
         let hidden = self.hidden.as_ref().context("MTP needs a target step")?;
         ensure!(rows.iter().all(|&r| r < hidden.shape()[0] as usize), "MTP hidden row beyond target step");
-        let idx: Vec<i32> = rows.iter().map(|&r| r as i32).collect();
         // Match qwenny's MTP reference: the backbone's final hidden state, after its final norm.
-        let hidden_rows = hidden.take_axis(&Array::from_slice(&idx, &[idx.len() as i32]), 0)?;
-        let h = w::rms(&hidden_rows, &self.w.final_norm)?;
+        let h = w::rms(&take_rows(hidden, rows.iter().copied())?, &self.w.final_norm)?;
         let mut chains = vec![Vec::new(); out.len()];
         for &r in out { self.draft_dist[toks[r].slot as usize].clear(); }
         let (mut h, mut logits) = self.mtp_forward(toks, &h, if k == 0 { &[] } else { out })?;
@@ -674,10 +651,9 @@ impl Engine for Model {
                     // Expand the fixed head into token-id order: ties and penalty membership use real ids.
                     let mut full = vec![f32::NEG_INFINITY; self.w.d.vocab];
                     for (&id, &v) in ids.iter().zip(&log) { full[id as usize] = v; }
-                    let seen = |id: u32| self.seen[slot][id as usize / 64] >> (id % 64) & 1 == 1
-                        || toks.iter().any(|x| x.slot as usize == slot && x.id == id) || chains[j].contains(&id);
-                    let generated = |id: u32| self.outs[slot][id as usize / 32] >> (id % 32) & 1 == 1
+                    let seen = |id: u32| self.is_seen(slot, id) || toks.iter().any(|x| x.slot as usize == slot && x.id == id)
                         || chains[j].contains(&id);
+                    let generated = |id: u32| self.is_output(slot, id) || chains[j].contains(&id);
                     let (p, kept) = kept_dist(&full, &seen, &generated, &s.row);
                     let u = s.u.get(t).copied().unwrap_or(0.5);
                     let mut cum = 0.0;
@@ -694,8 +670,7 @@ impl Engine for Model {
             }
             if t + 1 < k {
                 if t == 0 {
-                    let idx: Vec<i32> = out.iter().map(|&r| r as i32).collect();
-                    h = h.take_axis(&Array::from_slice(&idx, &[idx.len() as i32]), 0)?;
+                    h = take_rows(&h, out.iter().copied())?;
                 }
                 let hnorm = w::rms(&h, &self.w.mtp.as_ref().unwrap().norm)?;
                 let all: Vec<usize> = (0..cur.len()).collect();
