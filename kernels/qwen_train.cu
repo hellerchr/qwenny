@@ -167,7 +167,6 @@ extern "C" __global__ void __launch_bounds__(128) dn_conv(const act* P, const fl
 #define DLPC 8
 #define DRPT (LKD / DLPC)
 #define DNT (DCPB * DLPC)
-#define DNSLICE (LVD / DCPB)
 #define TCH 8
 static_assert(DNT == 128 && DRPT == 16, "dn_rule layout");
 
@@ -215,7 +214,7 @@ __device__ __forceinline__ void load_chunk(const float* cv, const float* gb, int
     }
 }
 
-// grid (DNSLICE, LV_HEADS, docs), block DNT: the raw output o [T][MIX] (f32); ck: checkpoints (null: none)
+// grid (LVD / DCPB, LV_HEADS, docs), block DNT: the raw output o [T][MIX] (f32); ck: checkpoints (null: none)
 extern "C" __global__ void __launch_bounds__(DNT) dn_rule(const float* cv, const float* gb, float* o, float* ck,
                                                           const int* doc_start, const int* doc_len, const int* doc_ck) {
     __shared__ __align__(16) float sq[TCH][LKD], sk[TCH][LKD], sv[TCH][DCPB], se[TCH], sb[TCH];

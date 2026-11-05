@@ -118,6 +118,9 @@ fn doc_sums(mb: &Micro, rows: &[f32]) -> Vec<f64> {
 /// The summed log-probability of each pair's responses (chosen, rejected) under the trainer's adapter: forward passes
 pub fn logps(tr: &Trainer, pairs: &[&Pair]) -> Result<Vec<(f64, f64)>> {
     let mut lp = Vec::new();
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
     for mb in training::pack(seqs(pairs).into_iter(), tr.tmax) {
         let (rows, _) = tr.pass(&mb, false, 0.0, 0, 0)?;
         lp.extend(doc_sums(&mb, &rows).into_iter().map(|s| -s));

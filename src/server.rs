@@ -297,10 +297,9 @@ fn engine(m: Box<dyn Engine>, store: Option<Store>, chat: Arc<Chat>, mut rx: Unb
             continue;
         }
         let step = e.build_step();
-        let stepped = e.run_step(&step);
-        e.read_decisions(&step);
-        match stepped {
+        match e.run_step(&step) {
             Ok(next) => {
+                e.read_decisions(&step);
                 let accepted = e.commit(&step, &next);
                 e.draft_next(&step, &accepted);
                 e.end_finished();

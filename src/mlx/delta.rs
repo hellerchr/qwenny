@@ -6,7 +6,7 @@
 //! - `chunked`: the same recurrence over chunks of CH tokens (the WY form of FLA's chunked gated delta rule): within a
 //!   chunk the deltas solve a unit lower triangular system that does not depend on the state, so all chunks of a
 //!   prompt are set up at once with matrix products and only CH-token steps between chunks remain sequential. All in
-//!   f32 (TF32 is off: weights::init); decays enter only as exp of differences of cumulative log decays (<= 0).
+//!   f32 (TF32 is off: main); decays enter only as exp of differences of cumulative log decays (<= 0).
 use super::weights::{LK_HEADS, LKD, MResult};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, ops};

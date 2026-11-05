@@ -709,13 +709,13 @@ pub fn swiglu(a: &Array, b: &Array) -> MResult<Array> {
     ops::multiply(nn::silu(a.as_dtype(Dtype::Float32)?)?, b.as_dtype(Dtype::Float32)?)?.as_dtype(Dtype::Float16)
 }
 
-/// Once per process, before MLX's first operation. Changing prompt shapes must not trip the graph-cache warning, and freed buffers must not accumulate without a bound. MLX_ENABLE_TF32 (on by default)
-/// would run f32 matrix products in TF32 (10-bit mantissas): off, the products stay f32.
+/// Once per process, before MLX's first operation. Changing prompt shapes must not trip the graph-cache warning, and freed buffers
+/// must not accumulate without a bound.
 pub fn init() -> MResult<()> {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let mut r = Ok(());
     ONCE.call_once(|| {
-        for (k, v) in [("MLX_ENABLE_CACHE_THRASHING_CHECK", "0"), ("MLX_USE_CUDA_GRAPHS", "0"), ("MLX_ENABLE_TF32", "0")] {
+        for (k, v) in [("MLX_ENABLE_CACHE_THRASHING_CHECK", "0"), ("MLX_USE_CUDA_GRAPHS", "0")] {
             if std::env::var_os(k).is_none() {
                 // SAFETY: startup, before MLX and before any thread that reads these variables.
                 unsafe { std::env::set_var(k, v) };
