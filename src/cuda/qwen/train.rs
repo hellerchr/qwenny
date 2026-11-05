@@ -29,9 +29,8 @@ const PTX_27B: [&str; 3] = [include_str!(concat!(env!("OUT_DIR"), "/qwen27b_trai
                             include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_f32.ptx")),
                             include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_f16.ptx"))];
 
-const KERNELS: [&str; 23] = [
+const KERNELS: [&str; 22] = [
     "dequant", "rms_fwd", "add_rms", "rms_bwd_pre", "rms_bwd_final", "swiglu_fwd", "swiglu_bwd", "scatter_rows",
-    "scatter_rows_scaled",
     "cross_entropy", "dn_conv", "dn_rule", "dn_rule_bwd", "dn_norm", "dn_norm_bwd", "dn_conv_bwd", "dn_conv_in_bwd",
     "at_prep", "at_prep_bwd", "at_softmax", "at_softmax_bwd", "at_gate", "at_gate_bwd",
 ];
@@ -689,13 +688,11 @@ impl Trainer {
             None => None,
         };
         if na > 0 {
-            match &weights {
-                None => l.launch("scatter_rows", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.dh.p)])?,
-                Some(w) => {
-                    l.htod(self.row_w.p, w)?;
-                    l.launch("scatter_rows_scaled", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.row_w.p), P(self.dh.p)])?;
-                }
+            if let Some(w) = &weights {
+                l.htod(self.row_w.p, w)?;
             }
+            let w = if weights.is_some() { self.row_w.p } else { 0 };
+            l.launch("scatter_rows", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(w), P(self.dh.p)])?;
         }
         let n = self.layers.len();
         l.launch("rms_bwd_final", t, 256, &[P(self.hs(n)), P(self.rs_fin.p), P(self.final_norm.p), P(self.dh.p)])?;

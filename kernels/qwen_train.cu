@@ -195,6 +195,26 @@ __device__ __forceinline__ size_t ck_at(const int* doc_ck, int d, int c, int h, 
     return (((size_t)(doc_ck[d] + c - 1) * LV_HEADS + h) * LVD + col) * LKD;
 }
 
+// The m tokens from row `t` of a chunk into shared memory: q and k of key head kh, the value columns of the slice, and
+// the gates e and beta of value head h (the caller synchronizes around it)
+__device__ __forceinline__ void load_chunk(const float* cv, const float* gb, int t, int m, int kh, int h, int slice,
+                                           float (*sq)[LKD], float (*sk)[LKD], float (*sv)[DCPB], float* se, float* sb) {
+    for (int x = threadIdx.x; x < m * LKD / 4; x += DNT) {
+        int tk = x / (LKD / 4), dd = (x % (LKD / 4)) * 4;
+        const float* row = cv + (size_t)(t + tk) * LQKV + kh * LKD + dd;
+        *(float4*)&sq[tk][dd] = ld4(row);
+        *(float4*)&sk[tk][dd] = ld4(row + LK_HEADS * LKD);
+    }
+    for (int x = threadIdx.x; x < m * DCPB; x += DNT) {
+        int tk = x / DCPB, j = x % DCPB;
+        sv[tk][j] = cv[(size_t)(t + tk) * LQKV + QK + h * LVD + slice * DCPB + j];
+    }
+    if (threadIdx.x < m) {
+        se[threadIdx.x] = gb[(size_t)(t + threadIdx.x) * 2 * LV_HEADS + h];
+        sb[threadIdx.x] = gb[(size_t)(t + threadIdx.x) * 2 * LV_HEADS + LV_HEADS + h];
+    }
+}
+
 // grid (DNSLICE, LV_HEADS, docs), block DNT: the raw output o [T][MIX] (f32); ck: checkpoints (null: none)
 extern "C" __global__ void __launch_bounds__(DNT) dn_rule(const float* cv, const float* gb, float* o, float* ck,
                                                           const int* doc_start, const int* doc_len, const int* doc_ck) {
@@ -208,20 +228,7 @@ extern "C" __global__ void __launch_bounds__(DNT) dn_rule(const float* cv, const
     for (int c0 = 0; c0 < len; c0 += TCH) {
         int m = min(TCH, len - c0);
         __syncthreads();
-        for (int x = tid; x < m * LKD / 4; x += DNT) {
-            int tk = x / (LKD / 4), dd = (x % (LKD / 4)) * 4;
-            const float* row = cv + (size_t)(t0 + c0 + tk) * LQKV + kh * LKD + dd;
-            *(float4*)&sq[tk][dd] = ld4(row);
-            *(float4*)&sk[tk][dd] = ld4(row + LK_HEADS * LKD);
-        }
-        for (int x = tid; x < m * DCPB; x += DNT) {
-            int tk = x / DCPB, j = x % DCPB;
-            sv[tk][j] = cv[(size_t)(t0 + c0 + tk) * LQKV + QK + h * LVD + slice * DCPB + j];
-        }
-        if (tid < m) {
-            se[tid] = gb[(size_t)(t0 + c0 + tid) * 2 * LV_HEADS + h];
-            sb[tid] = gb[(size_t)(t0 + c0 + tid) * 2 * LV_HEADS + LV_HEADS + h];
-        }
+        load_chunk(cv, gb, t0 + c0, m, kh, h, slice, sq, sk, sv, se, sb);
         __syncthreads();
         for (int tk = 0; tk < m; tk++) {
             int p = c0 + tk;
@@ -263,21 +270,10 @@ extern "C" __global__ void __launch_bounds__(DNT) dn_rule_bwd(const float* cv, c
     for (int c = (len - 1) / C_CK; c >= 0; c--) {
         int c0 = c * C_CK, m = min(C_CK, len - c0);
         __syncthreads();
-        for (int x = tid; x < m * LKD / 4; x += DNT) {
-            int tk = x / (LKD / 4), dd = (x % (LKD / 4)) * 4;
-            const float* row = cv + (size_t)(t0 + c0 + tk) * LQKV + kh * LKD + dd;
-            *(float4*)&sq[tk][dd] = ld4(row);
-            *(float4*)&sk[tk][dd] = ld4(row + LK_HEADS * LKD);
-        }
+        load_chunk(cv, gb, t0 + c0, m, kh, h, slice, sq, sk, sv, se, sb);
         for (int x = tid; x < m * DCPB; x += DNT) {
             int tk = x / DCPB, j = x % DCPB;
-            size_t t = t0 + c0 + tk;
-            sv[tk][j] = cv[t * LQKV + QK + h * LVD + slice * DCPB + j];
-            sd[tk][j] = dO[t * MIX + h * LVD + slice * DCPB + j];
-        }
-        if (tid < m) {
-            se[tid] = gb[(size_t)(t0 + c0 + tid) * 2 * LV_HEADS + h];
-            sb[tid] = gb[(size_t)(t0 + c0 + tid) * 2 * LV_HEADS + LV_HEADS + h];
+            sd[tk][j] = dO[(size_t)(t0 + c0 + tk) * MIX + h * LVD + slice * DCPB + j];
         }
         __syncthreads();
         float S0[DRPT];
