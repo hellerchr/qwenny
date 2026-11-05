@@ -9,7 +9,7 @@ use crate::cuda::qwen::Model;
 use crate::engine::{self, Engine, Tok};
 use crate::lora::{self, Adapter};
 use crate::server::{AdapterUse, Local};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value as Json, json};
 use std::fmt::Write as _;
 use std::fs;
@@ -23,7 +23,7 @@ const MIN_DERIVE: usize = 32;
 const MIN_HELD: usize = 8;
 /// Layers tried with their own direction everywhere, how many candidates are tried again stronger (STRONGER: alpha
 /// times), and how many get the full comparison
-const CANDIDATES: usize = 6;
+const CANDIDATES: usize = 3;
 const RETRIED: usize = 2;
 const STRONGER: f32 = 1.5;
 const FINALISTS: usize = 2;
@@ -33,12 +33,20 @@ const SCREEN_TOKENS: usize = 128;
 const FINAL_TOKENS: usize = 512;
 /// Tokens per answer with thinking: the thought and the answer after it
 const THINKING_TOKENS: usize = 3072;
-/// Passing: held-out harmful answers without a refusal phrase, and how many fewer harmless prompts may be answered
-/// than by the base model. Candidates whose first token on harmless prompts moves further than MAX_KL (nats) are not
-/// tried further.
+/// Passing: held-out harmful answers without a refusal phrase, how many fewer harmless prompts may be answered than by
+/// the base model, and how far the edit may move the next-token distribution (KL, nats per token) on the base model's
+/// own answers to held-out harmless prompts: what it knows and says there stays
 const MIN_NO_PHRASE: f64 = 0.8;
 const MAX_HARMLESS_LOSS: f64 = 0.02;
-const MAX_KL: f64 = 0.5;
+const MAX_KL: f64 = 0.10;
+/// Harmless answers the KL reads, and their tokens at most
+const KL_ANSWERS: usize = 16;
+const KL_TOKENS: usize = 256;
+/// The directions the harmless prompts spread along most (their topics), taken out of a candidate's direction
+const TOPICS: [usize; 2] = [8, 32];
+/// A candidate's rank: what it removes of the refusals (answers without a refusal phrase plus answers judged answered),
+/// less KL_WEIGHT times its KL: of two that remove about as much, the one that keeps the model's answers wins
+const KL_WEIGHT: f64 = 2.0;
 
 struct Prompts {
     derive: Vec<String>,
@@ -164,32 +172,86 @@ fn best_layers(dirs: &[Direction]) -> Vec<&Direction> {
     out
 }
 
-/// Mean KL(base || edited) of the first token's distribution, the adapter switched per step in one slot
-fn first_token_kl(m: &mut dyn Engine, prompts: &[Vec<u32>]) -> Result<f64> {
-    let log_softmax = |row: Vec<f32>| {
-        let top = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let total = row.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
-        row.into_iter().map(move |x| x as f64 - top - total).collect::<Vec<f64>>()
-    };
-    let mut sum = 0.0;
-    for ids in prompts {
-        let mut rows = Vec::with_capacity(2);
-        for on in [false, true] {
-            m.set_adapter(0, on)?;
-            let t = toks(ids);
-            let chunks: Vec<&[Tok]> = t.chunks(m.max_tok()).collect();
-            for (i, c) in chunks.iter().enumerate() {
-                let last = i + 1 == chunks.len();
-                let out = [c.len() - 1];
-                m.run(c, if last { &out } else { &[] })?;
-            }
-            rows.push(log_softmax(m.logits_row(0)?));
-            m.release(0)?;
-        }
-        sum += rows[0].iter().zip(&rows[1]).map(|(b, e)| b.exp() * (b - e)).sum::<f64>();
-    }
+fn log_softmax(row: Vec<f32>) -> Vec<f64> {
+    let top = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let total = row.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
+    row.into_iter().map(|x| x as f64 - top - total).collect()
+}
+
+/// Mean KL(base || edited) per token of `seqs` (ids, the first position read), teacher-forced: slot 0 runs the base
+/// model and slot 1 the edit side by side, a chunk of each sequence per step
+fn kl(m: &mut dyn Engine, seqs: &[(Vec<u32>, usize)]) -> Result<f64> {
+    // both slots' rows of a chunk are read in one step
+    let chunk = (m.max_out() / 2).min(m.max_tok() / 2).max(1);
     m.set_adapter(0, false)?;
-    Ok(sum / prompts.len() as f64)
+    m.set_adapter(1, true)?;
+    let (mut sum, mut n) = (0.0, 0usize);
+    for (ids, from) in seqs {
+        for start in (0..ids.len()).step_by(chunk) {
+            let end = (start + chunk).min(ids.len());
+            let (mut step, mut out) = (Vec::new(), Vec::new());
+            for slot in 0..2 {
+                for (p, &id) in ids.iter().enumerate().take(end).skip(start) {
+                    if p >= *from {
+                        out.push(step.len());
+                    }
+                    step.push(Tok { id, slot, pos: p as u32 });
+                }
+            }
+            m.run(&step, &out)?;
+            let rows = out.len() / 2;
+            for j in 0..rows {
+                let (b, e) = (log_softmax(m.logits_row(j)?), log_softmax(m.logits_row(rows + j)?));
+                sum += b.iter().zip(&e).map(|(b, e)| b.exp() * (b - e)).sum::<f64>();
+                n += 1;
+            }
+        }
+        m.release(0)?;
+        m.release(1)?;
+    }
+    m.set_adapter(1, false)?;
+    Ok(sum / n.max(1) as f64)
+}
+
+/// `r` without its parts along the `k` directions `rows` spread along most (their principal components), unit length:
+/// what the harmless prompts differ in (their topics) is left to them
+fn without_spread(r: &[f32], rows: &[&[f32]], k: usize) -> Vec<f32> {
+    let (n, h) = (rows.len(), r.len());
+    let mean: Vec<f64> = (0..h).map(|c| rows.iter().map(|x| x[c] as f64).sum::<f64>() / n as f64).collect();
+    let x: Vec<Vec<f64>> = rows.iter().map(|row| row.iter().zip(&mean).map(|(&v, m)| v as f64 - m).collect()).collect();
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
+    // the components from the n x n Gram matrix, by power iteration with deflation
+    let mut gram: Vec<Vec<f64>> = (0..n).map(|i| (0..n).map(|j| dot(&x[i], &x[j])).collect()).collect();
+    let mut out: Vec<f64> = r.iter().map(|&v| v as f64).collect();
+    for _ in 0..k.min(n) {
+        let mut v = vec![1.0 / (n as f64).sqrt(); n];
+        let mut lambda = 0.0;
+        for _ in 0..200 {
+            let w: Vec<f64> = gram.iter().map(|row| dot(row, &v)).collect();
+            lambda = dot(&w, &w).sqrt();
+            if lambda == 0.0 {
+                break;
+            }
+            v = w.iter().map(|w| w / lambda).collect();
+        }
+        if lambda == 0.0 {
+            break;
+        }
+        for i in 0..n {
+            for j in 0..n {
+                gram[i][j] -= lambda * v[i] * v[j];
+            }
+        }
+        let mut u = vec![0f64; h];
+        for (xi, vi) in x.iter().zip(&v) {
+            u.iter_mut().zip(xi).for_each(|(u, x)| *u += vi * x);
+        }
+        let norm = dot(&u, &u).sqrt();
+        let along = dot(&out, &u) / (norm * norm);
+        out.iter_mut().zip(&u).for_each(|(o, u)| *o -= along * u);
+    }
+    let norm = dot(&out, &out).sqrt();
+    out.iter().map(|&v| (v / norm) as f32).collect()
 }
 
 /// The judge's question about one reply, asked of the unedited model
@@ -259,17 +321,21 @@ fn answered(
     Ok((yes as f64 / prompts.len() as f64, rows))
 }
 
-/// An edit to try: one layer's direction removed from every layer's writes (`layer`), or each middle layer's own
+/// An edit to try: per layer, the unit direction taken out of what the layer writes (None: the layer is left alone)
 #[derive(Clone)]
 struct Candidate {
     name: String,
-    layer: Option<usize>,
     alpha: f32,
+    dirs: std::sync::Arc<Vec<Option<Vec<f32>>>>,
 }
 
 impl Candidate {
     fn dir_name(&self) -> String {
         format!("{}-alpha{}", self.name, self.alpha)
+    }
+
+    fn r<'a>(&'a self) -> impl Fn(usize) -> Option<&'a [f32]> + 'a {
+        |l| self.dirs.get(l).and_then(|d| d.as_deref())
     }
 }
 
@@ -277,69 +343,34 @@ fn write_answers(path: &Path, rows: &[Json]) -> Result<()> {
     Ok(fs::write(path, rows.iter().map(|r| format!("{r}\n")).collect::<String>())?)
 }
 
+/// The prompts the base model answers (`answers`) or does not, judged on short answers
+fn base_kept(local: &Local, prompts: &[String], answers: bool) -> Result<Vec<String>> {
+    let (_, rows) = answered(local, "qwenny", "qwenny", prompts, SCREEN_TOKENS, false)?;
+    Ok(prompts
+        .iter()
+        .zip(&rows)
+        .filter(|(_, r)| (r["verdict"] == "answered") == answers)
+        .map(|(p, _)| p.clone())
+        .collect())
+}
+
 pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32, int8: bool) -> Result<()> {
-    let (harmful, harmless) = (read_prompts(harmful)?, read_prompts(harmless)?);
+    let (mut harmful, mut harmless) = (read_prompts(harmful)?, read_prompts(harmless)?);
     fs::create_dir_all(out.join("candidates"))?;
     let mut report = String::new();
     let mut say = |line: String| {
         println!("{line}");
         writeln!(report, "{line}").unwrap();
     };
-    say(format!(
-        "harmful: {} + {} held out, harmless: {} + {} held out",
-        harmful.derive.len(),
-        harmful.held.len(),
-        harmless.derive.len(),
-        harmless.held.len()
-    ));
-
     let chat = std::sync::Arc::new(Chat::load(model)?);
-    let (dirs, layers) = {
-        let mut m = Model::load(model, CTX, 1, int8, None)?;
-        let (nl, h) = (m.n_layers(), m.hidden());
-        let dirs = directions(
-            &activations(&mut m, &chat, &harmful.derive)?,
-            &activations(&mut m, &chat, &harmless.derive)?,
-            &activations(&mut m, &chat, &harmful.held)?,
-            &activations(&mut m, &chat, &harmless.held)?,
-            nl,
-            h,
-        );
-        (dirs, nl)
-    };
-    let best = best_layers(&dirs);
-    ensure!(
-        best.first().is_some_and(|c| c.d >= 2.0),
-        "the two sets do not separate at any layer (best d {:.2}): check \
-            that the harmful prompts are ones this model refuses",
-        best.first().map_or(0.0, |c| c.d)
-    );
-    say(format!(
-        "{layers} layers; best separating (layer, d): {}",
-        best.iter().map(|c| format!("L{} {:.1}", c.layer, c.d)).collect::<Vec<_>>().join(", ")
-    ));
-    // one layer's direction removed from every layer's writes, or each middle layer's own direction from its writes
-    let mut cands: Vec<Candidate> =
-        best.iter().map(|c| Candidate { name: format!("L{}", c.layer), layer: Some(c.layer), alpha }).collect();
-    cands.push(Candidate { name: "per-layer".into(), layer: None, alpha });
-    let r_of = |c: &Candidate| {
-        let dirs = &dirs;
-        let layer = c.layer;
-        move |l: usize| match layer {
-            Some(at) => Some(&dirs[at].r[..]),
-            None => middle(l, layers).then(|| &dirs[l].r[..]),
-        }
-    };
-
-    let screen = &harmful.held[..harmful.held.len().min(SCREEN_PROMPTS)];
-    let start = |adapter: Option<Adapter>| -> Result<(Local, f64)> {
+    let mut kl_seqs: Vec<(Vec<u32>, usize)> = Vec::new();
+    let start = |adapter: Option<Adapter>, seqs: &[(Vec<u32>, usize)]| -> Result<(Local, f64)> {
         let (kl_tx, kl_rx) = std::sync::mpsc::channel();
-        let ids = harmless.held.iter().take(SCREEN_PROMPTS).map(|p| encode(&chat, p)).collect::<Result<Vec<_>>>()?;
-        let (dir, on) = (model.to_path_buf(), adapter.is_some());
+        let (dir, on, seqs) = (model.to_path_buf(), adapter.is_some(), seqs.to_vec());
         let local = Local::start(
             move || {
                 let mut m = engine::load(&dir, CTX, SLOTS, int8, adapter.as_ref())?;
-                let _ = kl_tx.send(if on { first_token_kl(&mut *m, &ids)? } else { 0.0 });
+                let _ = kl_tx.send(if on { kl(&mut *m, &seqs)? } else { 0.0 });
                 Ok(m)
             },
             chat.clone(),
@@ -349,7 +380,33 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
         Ok((local, kl_rx.recv()?))
     };
 
-    let (base, _) = start(None)?;
+    // Only what the base model refuses is harmful here, and only what it answers is harmless: the direction then
+    // separates refusing from answering, not one topic from another
+    let (base, _) = start(None, &[])?;
+    let before = [harmful.derive.len() + harmful.held.len(), harmless.derive.len() + harmless.held.len()];
+    for (set, answers) in [(&mut harmful, false), (&mut harmless, true)] {
+        set.derive = base_kept(&base, &set.derive, answers)?;
+        set.held = base_kept(&base, &set.held, answers)?;
+    }
+    say(format!(
+        "kept what the base model refuses of {} harmful and answers of {} harmless prompts: harmful {} + {} held out, \
+         harmless {} + {} held out",
+        before[0],
+        before[1],
+        harmful.derive.len(),
+        harmful.held.len(),
+        harmless.derive.len(),
+        harmless.held.len()
+    ));
+    ensure!(
+        harmful.derive.len() >= MIN_DERIVE
+            && harmful.held.len() >= MIN_HELD
+            && harmless.derive.len() >= MIN_DERIVE
+            && harmless.held.len() >= MIN_HELD,
+        "too few prompts left ({MIN_DERIVE} + {MIN_HELD} per set are the least to go by): the harmful set needs prompts \
+         this model refuses, the harmless set prompts it answers"
+    );
+    let screen = &harmful.held[..harmful.held.len().min(SCREEN_PROMPTS)];
     let (base_screen, _) = answered(&base, "qwenny", "qwenny", screen, SCREEN_TOKENS, false)?;
     let (base_harmful, rows) = answered(&base, "qwenny", "qwenny", &harmful.held, FINAL_TOKENS, false)?;
     let base_phrases = without_phrases(&rows);
@@ -357,45 +414,98 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
     let (base_harmless, rows) = answered(&base, "qwenny", "qwenny", &harmless.held, FINAL_TOKENS, false)?;
     write_answers(&out.join("base-harmless.jsonl"), &rows)?;
     base.stop();
+    // the KL reads the base model's own answers to harmless prompts, as it gave them
+    for r in rows.iter().filter(|r| r["verdict"] == "answered").take(KL_ANSWERS) {
+        let mut ids = encode(&chat, r["prompt"].as_str().unwrap_or(""))?;
+        let from = ids.len() - 1;
+        ids.extend(chat.encode(r["answer"].as_str().unwrap_or(""))?.into_iter().take(KL_TOKENS));
+        kl_seqs.push((ids, from));
+    }
     say(format!(
         "base model answers: {:.0}% of held-out harmful (no refusal phrase: {:.0}%), {:.0}% of held-out harmless",
         100.0 * base_harmful,
         100.0 * base_phrases,
         100.0 * base_harmless
     ));
-    if base_harmful > 0.5 {
-        bail!(
-            "the base model already answers {:.0}% of the harmful prompts: there is little to remove",
-            100.0 * base_harmful
+
+    let (dirs, spread_rows, layers, hidden) = {
+        let mut m = Model::load(model, CTX, 1, int8, None)?;
+        let (nl, h) = (m.n_layers(), m.hidden());
+        let harmless_rows = activations(&mut m, &chat, &harmless.derive)?;
+        let dirs = directions(
+            &activations(&mut m, &chat, &harmful.derive)?,
+            &harmless_rows,
+            &activations(&mut m, &chat, &harmful.held)?,
+            &activations(&mut m, &chat, &harmless.held)?,
+            nl,
+            h,
         );
-    }
-    if base_harmless < 0.5 {
-        bail!(
-            "the judge finds only {:.0}% of the harmless prompts answered by the base model: not a usable measure",
-            100.0 * base_harmless
-        );
+        (dirs, harmless_rows, nl, h)
+    };
+    let best = best_layers(&dirs);
+    ensure!(
+        best.first().is_some_and(|c| c.d >= 2.0),
+        "the two sets do not separate at any layer (best d {:.2}): check that the harmful prompts are ones this model \
+         refuses",
+        best.first().map_or(0.0, |c| c.d)
+    );
+    say(format!(
+        "{layers} layers; best separating (layer, d): {}",
+        best.iter().map(|c| format!("L{} {:.1}", c.layer, c.d)).collect::<Vec<_>>().join(", ")
+    ));
+    // One layer's direction taken out of every layer's writes; each middle layer's own direction out of its writes;
+    // and the same without the directions the harmless prompts spread along most (what sets their topics apart)
+    let per_layer = |topics: usize| -> Vec<Option<Vec<f32>>> {
+        (0..layers)
+            .map(|l| {
+                middle(l, layers).then(|| {
+                    if topics == 0 {
+                        return dirs[l].r.clone();
+                    }
+                    let rows: Vec<&[f32]> = spread_rows.iter().map(|row| &row[l * hidden..(l + 1) * hidden]).collect();
+                    without_spread(&dirs[l].r, &rows, topics)
+                })
+            })
+            .collect()
+    };
+    let mut cands: Vec<Candidate> = best
+        .iter()
+        .map(|c| Candidate {
+            name: format!("L{}", c.layer),
+            alpha,
+            dirs: std::sync::Arc::new(vec![Some(c.r.clone()); layers]),
+        })
+        .collect();
+    cands.push(Candidate { name: "per-layer".into(), alpha, dirs: std::sync::Arc::new(per_layer(0)) });
+    for k in TOPICS {
+        cands.push(Candidate { name: format!("per-layer-topics{k}"), alpha, dirs: std::sync::Arc::new(per_layer(k)) });
     }
 
-    say(format!("screen: {} prompts, {SCREEN_TOKENS} tokens (base {:.0}%)", screen.len(), 100.0 * base_screen));
+    say(format!(
+        "screen: {} prompts, {SCREEN_TOKENS} tokens (base {:.0}%); KL on {} harmless answers",
+        screen.len(),
+        100.0 * base_screen,
+        kl_seqs.len()
+    ));
     let adapter_dir = |c: &Candidate| out.join("candidates").join(c.dir_name());
-    // (candidate, answered + answers without a refusal phrase, first-token KL)
+    // (candidate, rank, KL)
     let mut screened: Vec<(Candidate, f64, f64)> = Vec::new();
     let try_one =
         |c: Candidate, screened: &mut Vec<(Candidate, f64, f64)>, say: &mut dyn FnMut(String)| -> Result<()> {
             let dir = adapter_dir(&c);
-            lora::bake(model, &r_of(&c), &dir, c.alpha)?;
-            let (local, kl) = start(Some(Adapter::load(&dir)?))?;
+            lora::bake(model, &c.r(), &dir, c.alpha)?;
+            let (local, kl) = start(Some(Adapter::load(&dir)?), &kl_seqs)?;
             let (rate, rows) = answered(&local, EDITED, "qwenny", screen, SCREEN_TOKENS, false)?;
             local.stop();
             write_answers(&dir.join("screen.jsonl"), &rows)?;
             let phrases = without_phrases(&rows);
             say(format!(
-                "  {}: no refusal phrase {:.0}%, answered {:.0}%, first-token KL {kl:.3}",
+                "  {}: no refusal phrase {:.0}%, answered {:.0}%, KL {kl:.3}",
                 c.dir_name(),
                 100.0 * phrases,
                 100.0 * rate
             ));
-            screened.push((c, phrases + rate, kl));
+            screened.push((c, phrases + rate - KL_WEIGHT * kl, kl));
             Ok(())
         };
     for c in cands {
@@ -417,7 +527,7 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
     let mut best: Option<(Candidate, f64)> = None;
     for (c, _, kl) in screened.iter().filter(|s| s.2 <= MAX_KL).take(FINALISTS) {
         let (dir, kl) = (adapter_dir(c), *kl);
-        let (local, _) = start(Some(Adapter::load(&dir)?))?;
+        let (local, _) = start(Some(Adapter::load(&dir)?), &[])?;
         let (on_harmful, rows) = answered(&local, EDITED, "qwenny", &harmful.held, FINAL_TOKENS, false)?;
         let phrases = without_phrases(&rows);
         write_answers(&dir.join("harmful.jsonl"), &rows)?;
@@ -426,7 +536,7 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
         let (thinking, rows) = answered(&local, EDITED, "qwenny", screen, THINKING_TOKENS, true)?;
         write_answers(&dir.join("thinking.jsonl"), &rows)?;
         local.stop();
-        let passed = phrases >= MIN_NO_PHRASE && on_harmless >= base_harmless - MAX_HARMLESS_LOSS;
+        let passed = phrases >= MIN_NO_PHRASE && on_harmless >= base_harmless - MAX_HARMLESS_LOSS && kl <= MAX_KL;
         say(format!(
             "final {}: harmful without a refusal phrase {:.0}%, answered {:.0}% ({:.0}% with thinking); harmless \
              answered {:.0}% (base {:.0}%), KL {kl:.3}: {}",
@@ -438,19 +548,20 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
             100.0 * base_harmless,
             if passed { "pass" } else { "FAIL" }
         ));
-        if passed && best.as_ref().is_none_or(|b| phrases + on_harmful > b.1) {
-            best = Some((c.clone(), phrases + on_harmful));
+        let rank = phrases + on_harmful - KL_WEIGHT * kl;
+        if passed && best.as_ref().is_none_or(|b| rank > b.1) {
+            best = Some((c.clone(), rank));
         }
     }
     let verdict = match &best {
         Some((c, _)) => {
             let to = out.join("adapter");
-            lora::bake(model, &r_of(c), &to, c.alpha)?;
+            lora::bake(model, &c.r(), &to, c.alpha)?;
             format!("adapter: {}, from {}", to.display(), c.dir_name())
         }
         None => format!(
-            "nothing passed (at least {:.0}% without a refusal phrase, harmless answered as by the base model): no \
-             adapter. The candidates are in {}",
+            "nothing passed (at least {:.0}% without a refusal phrase, harmless answered as by the base model, KL <= \
+             {MAX_KL}): no adapter. The candidates are in {}",
             100.0 * MIN_NO_PHRASE,
             out.join("candidates").display()
         ),
@@ -477,6 +588,16 @@ mod tests {
         assert_eq!(a.derive.len() + a.held.len(), 100);
         assert_eq!(a.held, b.held);
         assert!(a.held.iter().all(|p| !a.derive.contains(p)));
+    }
+
+    /// What the rows spread along leaves the direction, the rest stays and is unit length again
+    #[test]
+    fn topics_are_taken_out_of_the_direction() {
+        let rows: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32 * 3.0, 0.01 * (i % 2) as f32, 0.0]).collect();
+        let rows: Vec<&[f32]> = rows.iter().map(|r| &r[..]).collect();
+        let r = [std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0];
+        let out = without_spread(&r, &rows, 1);
+        assert!(out[0].abs() < 1e-3 && (out[1] - 1.0).abs() < 1e-3, "{out:?}");
     }
 
     #[test]
