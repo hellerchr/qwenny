@@ -865,7 +865,7 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
                    decide: None, adapter, tx },
         model,
         rx,
-        parser: app.chat.parser(thinking, tools),
+        parser: OutputParser::new(thinking, tools),
         thinking,
         stream: body.get("stream").and_then(Json::as_bool).unwrap_or(false),
         include_usage: body.pointer("/stream_options/include_usage").and_then(Json::as_bool).unwrap_or(false),

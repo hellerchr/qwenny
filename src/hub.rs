@@ -12,13 +12,9 @@ const NEEDED: [&str; 3] = ["config.json", "tokenizer.json", "tokenizer_config.js
 
 /// A local model directory as given, or the directory of a Hugging Face id (`Qwen/Qwen3.5-4B`) in the cache,
 /// downloaded first when missing (the repository's top-level files but GGUF ones, all of one commit: a model repository
-/// may also hold other variants in folders and GGUF builds, tens of GB the engine does not read). Either must be a model the engine runs
-/// (`engine::ensure_qwen`).
+/// may also hold other variants in folders and GGUF builds, tens of GB the engine does not read). Either must be a model
+/// the engine runs (`engine::ensure_qwen`).
 pub fn resolve(model: &str) -> Result<PathBuf> {
-    resolve_files(model, &NEEDED, true)
-}
-
-fn resolve_files(model: &str, needed: &[&str], target_arch: bool) -> Result<PathBuf> {
     let p = Path::new(model);
     let dir = if p.exists() {
         ensure!(p.is_dir(), "{model} is a file; the model is a directory or a Hugging Face id like {DEFAULT_MODEL}");
@@ -26,28 +22,21 @@ fn resolve_files(model: &str, needed: &[&str], target_arch: bool) -> Result<Path
     } else {
         ensure!(model.split('/').count() == 2 && !model.starts_with(['.', '/', '~']),
                 "{model}: no such directory, and not a Hugging Face id like {DEFAULT_MODEL}");
-        download(model, needed)?
+        download(model)?
     };
-    let missing: Vec<_> = needed.iter().filter(|f| !dir.join(f).exists()).collect();
+    let missing: Vec<_> = NEEDED.iter().filter(|f| !dir.join(f).exists()).collect();
     ensure!(missing.is_empty(), "{} is not a model directory: no {:?}", dir.display(), missing);
     ensure!(dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists(),
             "{} has no model.safetensors(.index.json): not a model directory", dir.display());
-    if target_arch {
-        crate::engine::ensure_qwen(&dir)?;
-    }
+    crate::engine::ensure_qwen(&dir)?;
     Ok(dir)
 }
 
 /// The snapshot directory of a Hugging Face id in the cache, if it has the files the engine reads; no network.
-#[cfg(test)]
 pub fn cached(id: &str) -> Option<PathBuf> {
-    cached_files(id, &NEEDED)
-}
-
-fn cached_files(id: &str, needed: &[&str]) -> Option<PathBuf> {
     let repo = Cache::from_env().model(id.to_string());
-    let paths: Option<Vec<PathBuf>> = needed.iter().map(|f| repo.get(f)).collect();
-    paths.and_then(|p| p[0].parent().map(Path::to_path_buf)).filter(|d| needed.iter().all(|f| d.join(f).exists()))
+    let paths: Option<Vec<PathBuf>> = NEEDED.iter().map(|f| repo.get(f)).collect();
+    paths.and_then(|p| p[0].parent().map(Path::to_path_buf)).filter(|d| NEEDED.iter().all(|f| d.join(f).exists()))
 }
 
 /// Whether the engine has a use for a repository's file: the top level, not GGUF
@@ -55,14 +44,14 @@ fn engine_reads(file: &str) -> bool {
     !file.contains('/') && !file.ends_with(".gguf")
 }
 
-fn download(id: &str, needed: &[&str]) -> Result<PathBuf> {
+fn download(id: &str) -> Result<PathBuf> {
     if std::env::var("HF_HUB_OFFLINE").is_ok_and(|v| v == "1") {
-        return cached_files(id, needed).with_context(|| format!("{id} is not in the Hugging Face cache and HF_HUB_OFFLINE=1"));
+        return cached(id).with_context(|| format!("{id} is not in the Hugging Face cache and HF_HUB_OFFLINE=1"));
     }
     let api = ApiBuilder::from_env().with_progress(true).build()?;
     let info = match api.model(id.to_string()).info() {
         Ok(info) => info,
-        Err(e) => match cached_files(id, needed) {
+        Err(e) => match cached(id) {
             Some(dir) => {
                 eprintln!("note: huggingface.co not reached ({e}); using the cached {id}");
                 return Ok(dir);
@@ -74,7 +63,7 @@ fn download(id: &str, needed: &[&str]) -> Result<PathBuf> {
     // every file of one commit, so that they land in one snapshot directory
     let repo = api.repo(Repo::with_revision(id.to_string(), RepoType::Model, info.sha.clone()));
     let files: Vec<&str> = info.siblings.iter().map(|s| s.rfilename.as_str()).filter(|f| engine_reads(f)).collect();
-    for f in needed {
+    for f in NEEDED {
         ensure!(files.contains(&f), "{id} has no {f}: not a model this engine can load");
     }
     let have = Cache::from_env().repo(Repo::with_revision(id.to_string(), RepoType::Model, info.sha.clone()));

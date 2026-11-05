@@ -13,9 +13,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// A decision prompt: its tokens and the first token of each option's label
-pub struct Item {
-    pub ids: Vec<u32>,
-    pub cands: Vec<u32>,
+struct Item {
+    ids: Vec<u32>,
+    cands: Vec<u32>,
 }
 
 /// Questions that ask nothing of their own (the page's placeholder)
@@ -24,32 +24,25 @@ const GENERIC: [&str; 3] = ["", "Welche Option passt?", "Which option fits?"];
 /// The answer words of a yes/no question ("noul"); its two options are what yes and no mean, or these words themselves
 const YES_NO: [&str; 2] = ["Ja", "Nein"];
 
-/// The labels the answer is read from, by question type: yes/no reads the words, score the level numbers (0-9 for
-/// ten levels), choice the letters.
-fn labels(kind: &str, n: usize) -> Result<Vec<String>> {
-    Ok(match kind {
+/// The labels the answer is read from, by question type (decision_options checked it): yes/no reads the words, score the
+/// level numbers (0-9 for ten levels), choice the letters.
+fn labels(kind: &str, n: usize) -> Vec<String> {
+    match kind {
         "noul" => YES_NO.iter().map(|w| w.to_string()).collect(),
         "score" if n <= 9 => (1..=n).map(|k| k.to_string()).collect(),
         "score" => (0..n).map(|k| k.to_string()).collect(),
-        "choice" => LETTERS.chars().take(n).map(String::from).collect(),
-        _ => anyhow::bail!("unknown question type {kind:?} (choice, score or noul)"),
-    })
+        _ => LETTERS.chars().take(n).map(String::from).collect(),
+    }
 }
 
 /// The decision prompt. The last user message gets the question in front of it and, after it, the question again with
 /// the options and the answer instruction; the answer is the first token the assistant would write. The caller's
-/// system prompt stays. `decide` and serving build every prompt here, so both see the same text.
-/// `type` (default choice): choice options are lettered; score levels are numbered; a yes/no question is answered with
-/// the words Ja / Nein, its options say what they mean.
+/// system prompt stays. `kind` and `options` come from decision_options: choice options are lettered; score levels are
+/// numbered; a yes/no question is answered with the words Ja / Nein, its options say what they mean.
 /// "thought" (think, then decide): `true` renders the prompt with thinking on, open for the model to think (the first
 /// step); a string is that thinking, closed, and the answer position follows it (the second step).
-pub fn build(chat: &Chat, row: &Json) -> Result<Item> {
-    let options: Vec<&str> = row["options"].as_array().context("options")?.iter().filter_map(|o| o.as_str()).collect();
-    let kind = row["type"].as_str().unwrap_or("choice");
-    ensure!(options.len() >= 2 && options.len() <= LETTERS.len(), "{} options", options.len());
-    ensure!(kind != "noul" || options.len() == 2, "a yes/no question has two options");
-    ensure!(kind != "score" || options.len() <= 10, "a score question has 2 to 10 levels");
-    let labels = labels(kind, options.len())?;
+fn build(chat: &Chat, row: &Json, kind: &str, options: &[String]) -> Result<Item> {
+    let labels = labels(kind, options.len());
     let mut question = row["question"].as_str().unwrap_or("").trim().to_string();
     let mut msgs = row["messages"].as_array().context("messages")?.clone();
     let last = msgs.iter_mut().rev().find(|m| m["role"] == "user").context("no user message")?;
@@ -141,6 +134,13 @@ pub async fn decisions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json>) 
     }
     if rows.is_empty() {
         return bad_request("no questions".into());
+    }
+    for (_, row) in &mut rows {
+        if row.get("question").is_none_or(Json::is_null)
+            && let Some(i) = row.get("instructions").cloned()
+        {
+            row["question"] = i;
+        }
     }
     let model = match app.model(&req) {
         Ok(m) => m.1,
@@ -243,7 +243,8 @@ fn decision_options(kind: &str, row: &Json) -> Result<(Vec<String>, Vec<String>)
         _ => return Err("no \"options\"".into()),
     };
     match kind {
-        "choice" => {}
+        "choice" if (2..=LETTERS.len()).contains(&pairs.len()) => {}
+        "choice" => return Err(format!("a choice question has 2 to {} options, not {}", LETTERS.len(), pairs.len())),
         "score" if (2..=10).contains(&pairs.len()) => {}
         "score" => return Err(format!("a score question has 2 to 10 levels, not {}", pairs.len())),
         "noul" if pairs.len() == 2 => {}
@@ -254,56 +255,40 @@ fn decision_options(kind: &str, row: &Json) -> Result<(Vec<String>, Vec<String>)
 }
 
 /// Build one question's prompt and send it to the engine.
-fn ask(app: &App, mut row: Json) -> Result<(Asked, UnboundedReceiver<Msg>), String> {
-    if row.get("question").is_none_or(Json::is_null)
-        && let Some(i) = row.get("instructions").cloned()
-    {
-        row["question"] = i;
-    }
+fn ask(app: &App, row: Json) -> Result<(Asked, UnboundedReceiver<Msg>), String> {
     let kind = row.get("type").and_then(Json::as_str).unwrap_or("choice").to_string();
     let (keys, texts) = decision_options(&kind, &row)?;
-    row["options"] = json!(texts);
-    let item = build(&app.chat, &row).map_err(|e| format!("{e:#}"))?;
-    let adapter = app.model(&row).map_err(|e| format!("{e:#}"))?.0;
-    send_decision(app, item, Asked { kind, keys, row }, adapter)
-}
-
-/// Send a built decision to the engine.
-fn send_decision(app: &App, item: Item, asked: Asked, adapter: bool) -> Result<(Asked, UnboundedReceiver<Msg>), String> {
+    let item = build(&app.chat, &row, &kind, &texts).map_err(|e| format!("{e:#}"))?;
     if item.ids.len() + 1 >= app.max_ctx {
         return Err(format!("prompt of {} tokens does not fit the context of {}", item.ids.len(), app.max_ctx));
     }
-    let (tx, rx) = unbounded_channel();
-    let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
-    let job = Job { prompt: item.ids, params, max_tokens: 1, stop: vec![], progress: None, ignore_eos: false, decide: Some(item.cands), adapter,
-                    tx };
-    app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
-    Ok((asked, rx))
+    let adapter = app.model(&row).map_err(|e| format!("{e:#}"))?.0;
+    let rx = send(app, item.ids, 1, vec![], Some(item.cands), adapter)?;
+    Ok((Asked { kind, keys, row }, rx))
 }
 
-/// Think, then decide: the model thinks about the decision prompt for at most
-/// `budget` tokens, then the options are scored at the answer position after that thinking. Returns the thinking.
+/// A greedy request to the engine: decisions and the thinking before them
+fn send(app: &App, prompt: Vec<u32>, max_tokens: usize, stop: Vec<String>, decide: Option<Vec<u32>>, adapter: bool)
+        -> Result<UnboundedReceiver<Msg>, String> {
+    let (tx, rx) = unbounded_channel();
+    let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
+    let job = Job { prompt, params, max_tokens, stop, progress: None, ignore_eos: false, decide, adapter, tx };
+    app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
+    Ok(rx)
+}
+
+/// Think, then decide: the model thinks about the decision prompt for at most `budget` tokens (greedy, up to `</think>`;
+/// cut off, it is told to decide now), then the options are scored at the answer position after that thinking. Returns
+/// the thinking.
 async fn think_first(app: &App, row: &mut Json, budget: usize) -> Result<String, String> {
     let kind = row.get("type").and_then(Json::as_str).unwrap_or("choice").to_string();
     let (_, texts) = decision_options(&kind, row)?;
     let mut open = row.clone();
-    open["options"] = json!(texts);
     open["thought"] = json!(true);
-    let item = build(&app.chat, &open).map_err(|e| format!("{e:#}"))?;
+    let item = build(&app.chat, &open, &kind, &texts).map_err(|e| format!("{e:#}"))?;
     let adapter = app.model(row).map_err(|e| format!("{e:#}"))?.0;
-    let thought = think(app, item.ids, budget, adapter).await?;
-    row["thought"] = json!(thought);
-    Ok(thought)
-}
-
-/// The model's thinking after a prompt that opens a think block, at most `budget` tokens (greedy, up to
-/// `</think>`; cut off, it is told to decide now)
-async fn think(app: &App, prompt: Vec<u32>, budget: usize, adapter: bool) -> Result<String, String> {
-    let (tx, mut rx) = unbounded_channel();
-    let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
-    let max_tokens = budget.min(app.max_ctx.saturating_sub(prompt.len() + 64)).max(1);
-    let job = Job { prompt, params, max_tokens, stop: vec!["</think>".into()], progress: None, ignore_eos: false, decide: None, adapter, tx };
-    app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
+    let max_tokens = budget.min(app.max_ctx.saturating_sub(item.ids.len() + 64)).max(1);
+    let mut rx = send(app, item.ids, max_tokens, vec!["</think>".into()], None, adapter)?;
     let mut thought = String::new();
     while let Some(m) = rx.recv().await {
         match m {
@@ -318,6 +303,7 @@ async fn think(app: &App, prompt: Vec<u32>, budget: usize, adapter: bool) -> Res
             Msg::Decision { .. } => {}
         }
     }
+    row["thought"] = json!(thought);
     Ok(thought)
 }
 
@@ -373,7 +359,8 @@ mod tests {
                          "options": ["neu starten", "Techniker rufen", "ignorieren"]});
         let Some(dir) = test_models::dir(test_models::QWEN) else { return };
         let chat = Chat::load(&dir).unwrap();
-        let item = build(&chat, &row).unwrap_or_else(|e| panic!("{}: {e:#}", dir.display()));
+        let (_, options) = decision_options("choice", &row).unwrap();
+        let item = build(&chat, &row, "choice", &options).unwrap_or_else(|e| panic!("{}: {e:#}", dir.display()));
         assert_eq!(item.cands.len(), 3);
         let tail = chat.decode(&item.ids[item.ids.len().saturating_sub(12)..]);
         assert!(tail.contains("assistant"), "{tail:?}");
