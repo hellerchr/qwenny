@@ -6,13 +6,9 @@
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
-// The matrix products' input type (a model's .cu may define it before including this file): float, or __half (the
-// products round their input to f16 anyway: written as f16 by its producer, it is staged with cp.async)
-#ifndef XIN
-#define XIN float
-#endif
-__device__ __forceinline__ void st_x(float* p, float v) { *p = v; }
-__device__ __forceinline__ void st_x(__half* p, float v) { *p = __float2half_rn(v); }
+// The matrix products' input type: they round it to f16 anyway, so its producer writes f16 and it is staged with cp.async
+#define XIN __half
+__device__ __forceinline__ void st_x(XIN* p, float v) { *p = __float2half_rn(v); }
 
 // Asynchronous copies global -> shared (cp.async; wait with cp.async.wait_group). !ok: zero-fill the 16 bytes.
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok = true) {

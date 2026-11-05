@@ -3,7 +3,6 @@
 // matrix products leave split-K partial products [split][N][rows] that the consumer sums. Norm weights arrive as (1 + w): Qwen3.5's RMSNorm scales by
 // 1 + weight (the host adds the 1). Built once per model size (QWEN_27B: Qwen3.8-27B; QWEN_9B: Qwen3.5-9B; else
 // Qwen3.5-4B).
-#define XIN __half
 #include "common.cuh"
 
 #ifdef QWEN_27B

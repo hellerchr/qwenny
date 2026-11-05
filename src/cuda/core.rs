@@ -513,9 +513,7 @@ impl Gemm {
         l.arg(&cols).arg(&tiles).arg(&ni).arg(&kper).arg(y).arg(&ldy).arg(&st.keys);
         let grid_z = if tile.is_some() { 1 } else { n.div_ceil(8 * PNTT) };
         let warps = if tile.is_some() { WARPS } else { PWARPS };
-        // prompt kernels: 16-row tiles per warp (prompt_tiles in the kernels)
-        let per_warp = 1;
-        let lc = cfg((w.tiles.div_ceil(warps * per_warp), split, grid_z), warps * 32);
+        let lc = cfg((w.tiles.div_ceil(warps), split, grid_z), warps * 32);
         let lc = if tile.is_some() { lc } else { LaunchConfig { shared_mem_bytes: PROMPT_SMEM as u32, ..lc } };
         unsafe { l.launch(lc) }?;
         Ok(split)
