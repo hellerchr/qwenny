@@ -30,7 +30,9 @@ pub fn host_buf(n: usize) -> Vec<u8> {
     let a = (v.as_mut_ptr() as usize).next_multiple_of(HUGE);
     let len = (v.as_ptr() as usize + n).saturating_sub(a) / HUGE * HUGE;
     if len > 0 {
-        unsafe { madvise(a as *mut _, len, 14 /* MADV_HUGEPAGE */) };
+        unsafe {
+            madvise(a as *mut _, len, 14 /* MADV_HUGEPAGE */)
+        };
     }
     v
 }
@@ -145,10 +147,11 @@ struct Entry {
 
 impl Entry {
     fn host_bytes(&self) -> usize {
-        self.held.snaps.iter().map(|p| p.1.len()).sum::<usize>() + match &self.at {
-            Place::Host(img) | Place::Slot(_, Some(img)) => img.bytes(),
-            Place::Slot(_, None) => 0,
-        }
+        self.held.snaps.iter().map(|p| p.1.len()).sum::<usize>()
+            + match &self.at {
+                Place::Host(img) | Place::Slot(_, Some(img)) => img.bytes(),
+                Place::Slot(_, None) => 0,
+            }
     }
 }
 
@@ -217,9 +220,12 @@ pub fn fitting_ctx(m: &dyn Engine, max: usize) -> usize {
 
 /// The system's MemAvailable in bytes
 fn mem_available() -> Option<usize> {
-    std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
-        m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok()
-    }).map(|kb| kb << 10)
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok()
+        })
+        .map(|kb| kb << 10)
 }
 
 /// Host memory left to everything else when the cache takes the rest (1.5 GiB was too little on the 3090's VM of
@@ -235,11 +241,21 @@ impl Store {
     pub fn new(m: &dyn Engine, want: Option<usize>) -> Result<Self> {
         let budget = mem_available().map_or(0, |b| b.saturating_sub(HOST_RESERVE));
         let (gib, ctx, room) = (|b: usize| b as f64 / 1073741824.0, m.max_ctx(), m.cache_room().unwrap_or(0));
-        ensure!(m.slot_bytes(ctx) <= room, "a session of {ctx} tokens does not fit: {:.1} GiB in a slot, the device has {:.1} \
-                 GiB: --ctx={} at most (or leave --ctx out)", gib(m.slot_bytes(ctx)), gib(room), fitting_ctx(m, ctx));
+        ensure!(
+            m.slot_bytes(ctx) <= room,
+            "a session of {ctx} tokens does not fit: {:.1} GiB in a slot, the device has {:.1} \
+                 GiB: --ctx={} at most (or leave --ctx out)",
+            gib(m.slot_bytes(ctx)),
+            gib(room),
+            fitting_ctx(m, ctx)
+        );
         let max = want.unwrap_or(m.slots()).min(m.slots());
-        eprintln!("cache: up to {max} sessions sharing {:.1} GiB of device memory and {:.1} GiB of host memory; one session \
-                   up to {ctx} tokens", gib(room), gib(budget));
+        eprintln!(
+            "cache: up to {max} sessions sharing {:.1} GiB of device memory and {:.1} GiB of host memory; one session \
+                   up to {ctx} tokens",
+            gib(room),
+            gib(budget)
+        );
         Ok(Store { entries: Vec::new(), tick: 0, budget, running: Vec::new(), max })
     }
 
@@ -266,8 +282,7 @@ impl Store {
     /// system has left (the count misses the rest of the process and other processes; past it the system swaps, and
     /// copies to the host crawl)
     fn over_by(&self, extra: usize) -> bool {
-        self.host_used() + extra > self.budget
-            || mem_available().is_some_and(|a| a < HOST_FLOOR + extra)
+        self.host_used() + extra > self.budget || mem_available().is_some_and(|a| a < HOST_FLOOR + extra)
     }
 
     /// Keep the host memory within the budget: drop the shadows of the least recently used, then their oldest saved
@@ -302,8 +317,10 @@ impl Store {
                 continue;
             }
             let Some(i) = self.lru(|e| !spared(e) && !e.parked && matches!(e.at, Place::Host(_))) else { return false };
-            eprintln!("cache: host memory full: a session of {} tokens dropped (read again when continued)",
-                      self.entries[i].held.tokens.len());
+            eprintln!(
+                "cache: host memory full: a session of {} tokens dropped (read again when continued)",
+                self.entries[i].held.tokens.len()
+            );
             self.entries.swap_remove(i);
         }
         true
@@ -312,7 +329,9 @@ impl Store {
     /// Whether `prompt` (for the adapter or the base model) continues a cached sequence (takes it over; a copy needs
     /// room as a new session does)
     pub fn continues(&self, prompt: &[u32], adapter: bool) -> bool {
-        self.entries.iter().any(|e| !e.parked && e.held.adapter == adapter && reuse(&e.held, prompt).is_some_and(|(_, copy)| !copy))
+        self.entries
+            .iter()
+            .any(|e| !e.parked && e.held.adapter == adapter && reuse(&e.held, prompt).is_some_and(|(_, copy)| !copy))
     }
 
     /// Move the least recently used sequence in a slot (other than `keep`) to the host; its slot, if any. `must`: when
@@ -322,7 +341,8 @@ impl Store {
         let t = Instant::now();
         let (id, n) = (self.entries[i].id, self.entries[i].held.tokens.len());
         let Place::Slot(_, shadow) = &self.entries[i].at else { unreachable!() };
-        let reused = shadow.as_ref().map_or(0, |s| s.chunks.iter().filter(|c| c.1 <= n && c.1 - c.0 == CHUNK).count() * CHUNK);
+        let reused =
+            shadow.as_ref().map_or(0, |s| s.chunks.iter().filter(|c| c.1 <= n && c.1 - c.0 == CHUNK).count() * CHUNK);
         // room for the image before it is copied (the host memory would otherwise peak at the budget and the image);
         // what does not fit is read again when continued
         let fits = self.make_room(m.image_bytes(n).saturating_sub(m.image_bytes(reused)), Some(id));
@@ -337,16 +357,22 @@ impl Store {
             eprintln!("cache: no host memory for slot {slot} ({n} tokens): its sequence is read again when continued");
         }
         let img = match m.can_save() && fits {
-            true => settle(m, slot, &e.held.tokens, e.held.adapter, &mut e.held.dirty).and_then(|_| save_image(m, slot, n, shadow))
-                .map_err(|err| eprintln!("cache: slot {slot} not saved ({err:#}): its sequence is read again when continued"))
+            true => settle(m, slot, &e.held.tokens, e.held.adapter, &mut e.held.dirty)
+                .and_then(|_| save_image(m, slot, n, shadow))
+                .map_err(|err| {
+                    eprintln!("cache: slot {slot} not saved ({err:#}): its sequence is read again when continued")
+                })
                 .ok(),
             false => None,
         };
         m.release(slot)?;
         match img {
             Some(img) => {
-                eprintln!("cache: slot {slot} ({n} tokens, {reused} of them on the host already) to the host: {:.0} MB in {:.2} s",
-                          img.bytes() as f64 / 1e6, t.elapsed().as_secs_f64());
+                eprintln!(
+                    "cache: slot {slot} ({n} tokens, {reused} of them on the host already) to the host: {:.0} MB in {:.2} s",
+                    img.bytes() as f64 / 1e6,
+                    t.elapsed().as_secs_f64()
+                );
                 e.at = Place::Host(img);
                 self.trim();
             }
@@ -387,7 +413,9 @@ impl Store {
         let base = bchunks.last().map_or(0, |c| c.1);
         // the incoming image, its entry in slot s from now on
         let ai = self.find(id).unwrap();
-        let Place::Host(mut a) = std::mem::replace(&mut self.entries[ai].at, Place::Slot(s, None)) else { unreachable!() };
+        let Place::Host(mut a) = std::mem::replace(&mut self.entries[ai].at, Place::Slot(s, None)) else {
+            unreachable!()
+        };
         m.release(s)?;
         let local = |a: &Image, bc: &[(usize, usize, Vec<u8>)], out: &[(usize, usize, Vec<u8>)]| {
             a.bytes() + bc.iter().chain(out).map(|c| c.2.len()).sum::<usize>() + bstate.len()
@@ -395,15 +423,22 @@ impl Store {
         let (mut top, mut out, mut i, mut b_out, mut lost) = (nb, Vec::new(), 0, false, false);
         // the outgoing sequence's highest chunk not on the host yet to the host (room made by dropping the incoming
         // chunks already loaded, the highest first); false: no room, the sequence is lost
-        let copy_top = |st: &mut Self, m: &mut Box<dyn Engine>, a: &mut Image, i: usize, top: usize,
-                            out: &mut Vec<(usize, usize, Vec<u8>)>| -> Result<bool> {
+        let copy_top = |st: &mut Self,
+                        m: &mut Box<dyn Engine>,
+                        a: &mut Image,
+                        i: usize,
+                        top: usize,
+                        out: &mut Vec<(usize, usize, Vec<u8>)>|
+         -> Result<bool> {
             let from = ((top - 1) / CHUNK * CHUNK).max(base);
             let need = (m.image_bytes(top - from) - m.image_bytes(0)).max(1);
             let fits = |st: &Self, a: &Image, out: &[(usize, usize, Vec<u8>)]| {
                 st.host_used() + local(a, &bchunks, out) + need <= st.budget
                     && mem_available().is_none_or(|f| f >= HOST_FLOOR + need)
             };
-            while !fits(st, a, out) && let Some(k) = (0..i).rev().find(|&k| !a.chunks[k].2.is_empty()) {
+            while !fits(st, a, out)
+                && let Some(k) = (0..i).rev().find(|&k| !a.chunks[k].2.is_empty())
+            {
                 a.chunks[k].2 = Vec::new();
             }
             // then the other copies that only save work (shadows, saved states; both sequences are in slots now)
@@ -411,8 +446,10 @@ impl Store {
                 st.make_room(local(a, &bchunks, out) + need, None);
             }
             if !fits(st, a, out) {
-                eprintln!("cache: host memory short of what the sessions were promised: slot {bslot}'s sequence ({nb} \
-                           tokens) is read again when continued");
+                eprintln!(
+                    "cache: host memory short of what the sessions were promised: slot {bslot}'s sequence ({nb} \
+                           tokens) is read again when continued"
+                );
                 return Ok(false);
             }
             out.push((from, top, m.save_kv(bslot, from, top)?));
@@ -468,8 +505,12 @@ impl Store {
         a.len = a.chunks.last().map_or(0, |c| c.1);
         let ai = self.find(id).unwrap();
         self.entries[ai].at = Place::Slot(s, Some(a));
-        eprintln!("cache: {alen} tokens from the host into slot {s} as slot {bslot}'s {nb} go to the host ({} of them \
-                   copied now): {:.2} s", nb - base, t.elapsed().as_secs_f64());
+        eprintln!(
+            "cache: {alen} tokens from the host into slot {s} as slot {bslot}'s {nb} go to the host ({} of them \
+                   copied now): {:.2} s",
+            nb - base,
+            t.elapsed().as_secs_f64()
+        );
         self.trim();
         Ok(Some(bslot))
     }
@@ -506,9 +547,15 @@ impl Store {
         let Some(i) = self.find(id) else { return Ok(Bring::Gone(s)) };
         let Place::Host(img) = &self.entries[i].at else { unreachable!() };
         if m.cache_room().is_none_or(|r| r >= m.slot_bytes(img.len)) && load_image(m, s, img)? {
-            eprintln!("cache: {} tokens from the host into slot {s}: {:.0} MB in {:.2} s", img.len,
-                      img.bytes() as f64 / 1e6, t.elapsed().as_secs_f64());
-            let Place::Host(img) = std::mem::replace(&mut self.entries[i].at, Place::Slot(s, None)) else { unreachable!() };
+            eprintln!(
+                "cache: {} tokens from the host into slot {s}: {:.0} MB in {:.2} s",
+                img.len,
+                img.bytes() as f64 / 1e6,
+                t.elapsed().as_secs_f64()
+            );
+            let Place::Host(img) = std::mem::replace(&mut self.entries[i].at, Place::Slot(s, None)) else {
+                unreachable!()
+            };
             self.entries[i].at = Place::Slot(s, Some(img));
             return Ok(Bring::In(s));
         }
@@ -559,7 +606,9 @@ impl Store {
     /// The cached sequence that serves `prompt` best (the most tokens shared, one in a slot first; computed with the same
     /// model): the position it starts at, and whether it copies the prefix (reuse)
     fn best(&self, prompt: &[u32], adapter: bool) -> Option<(&Entry, usize, bool)> {
-        self.entries.iter().filter(|e| !e.parked && e.held.adapter == adapter)
+        self.entries
+            .iter()
+            .filter(|e| !e.parked && e.held.adapter == adapter)
             .filter_map(|e| reuse(&e.held, prompt).map(|(at, copy)| (e, at, copy)))
             .max_by_key(|&(e, at, _)| (at, matches!(e.at, Place::Slot(..))))
     }
@@ -567,8 +616,14 @@ impl Store {
     /// The request for `prompt`: the sequence it continues (in its slot, or loaded from the host; one computed with
     /// the same model: the adapter or the base), else a fresh slot at 0. None: no slot, or no device memory for the
     /// sequence (the request waits). `running`: the sessions of the running requests (and of those that gave way)
-    pub fn take(&mut self, m: &mut Box<dyn Engine>, prompt: &[u32], adapter: bool, free: &mut Vec<u32>, running: usize)
-                -> Result<Option<Resume>> {
+    pub fn take(
+        &mut self,
+        m: &mut Box<dyn Engine>,
+        prompt: &[u32],
+        adapter: bool,
+        free: &mut Vec<u32>,
+        running: usize,
+    ) -> Result<Option<Resume>> {
         let Some((e, at, copy)) = self.best(prompt, adapter) else {
             return self.fresh(m, free, running, None);
         };
@@ -618,8 +673,13 @@ impl Store {
 
     /// A new session in a fresh slot at 0 (beyond `max` it replaces the least recently used other than `spare`; none
     /// cached: None, it waits)
-    fn fresh(&mut self, m: &mut Box<dyn Engine>, free: &mut Vec<u32>, running: usize, spare: Option<u64>)
-             -> Result<Option<Resume>> {
+    fn fresh(
+        &mut self,
+        m: &mut Box<dyn Engine>,
+        free: &mut Vec<u32>,
+        running: usize,
+        spare: Option<u64>,
+    ) -> Result<Option<Resume>> {
         while self.entries.len() + running >= self.max {
             let Some(i) = self.lru(|e| !e.parked && Some(e.id) != spare) else { return Ok(None) };
             if let Place::Slot(s, _) = self.entries.swap_remove(i).at {
@@ -640,8 +700,14 @@ impl Store {
 
     /// A new session that shares the first `at` tokens of entry `id`: a fresh slot with a copy of their KV cache and
     /// the state saved at `at`; the entry stays cached. Without device memory for the copy: a fresh start at 0.
-    fn share(&mut self, m: &mut Box<dyn Engine>, free: &mut Vec<u32>, running: usize, id: u64, at: usize)
-             -> Result<Option<Resume>> {
+    fn share(
+        &mut self,
+        m: &mut Box<dyn Engine>,
+        free: &mut Vec<u32>,
+        running: usize,
+        id: u64,
+        at: usize,
+    ) -> Result<Option<Resume>> {
         let t = Instant::now();
         let Some((s, ..)) = self.fresh(m, free, running, Some(id))? else { return Ok(None) };
         // getting the slot may have moved the entry to the host, or dropped it
@@ -678,7 +744,10 @@ impl Store {
             eprintln!("cache: no device memory to share {at} tokens with a cached session: read again");
             return Ok(Some((s, 0, Vec::new())));
         }
-        eprintln!("cache: slot {s} shares the first {at} tokens of a cached session (copied in {:.2} s)", t.elapsed().as_secs_f64());
+        eprintln!(
+            "cache: slot {s} shares the first {at} tokens of a cached session (copied in {:.2} s)",
+            t.elapsed().as_secs_f64()
+        );
         Ok(Some((s, at, snaps)))
     }
 
@@ -696,22 +765,32 @@ mod tests {
     use super::*;
 
     fn held(tokens: &[u32], pe: Option<usize>) -> Held {
-        Held { tokens: tokens.to_vec(), adapter: false, dirty: false, snaps: pe.map(|p| (p, Vec::new())).into_iter().collect() }
+        Held {
+            tokens: tokens.to_vec(),
+            adapter: false,
+            dirty: false,
+            snaps: pe.map(|p| (p, Vec::new())).into_iter().collect(),
+        }
     }
 
     #[test]
     fn continues_at_the_end_or_a_saved_state() {
         let h = held(&[1, 2, 3, 4, 5, 6], Some(3));
-        assert_eq!(resume_at(&h, &[1, 2, 3, 4, 5, 6, 7, 8]), Some(6));  // the next turn
-        assert_eq!(resume_at(&h, &[1, 2, 3, 9, 9]), Some(3));  // the last reply regenerated or edited
-        assert_eq!(resume_at(&h, &[1, 2, 3]), None);  // nothing left to read: the last token's logits are not kept
-        assert_eq!(resume_at(&h, &[1, 2, 9]), None);  // the prompt itself changed
-        assert_eq!(resume_at(&h, &[1, 2, 3, 4, 5, 6]), Some(3));  // the same as held: back to the saved state
+        assert_eq!(resume_at(&h, &[1, 2, 3, 4, 5, 6, 7, 8]), Some(6)); // the next turn
+        assert_eq!(resume_at(&h, &[1, 2, 3, 9, 9]), Some(3)); // the last reply regenerated or edited
+        assert_eq!(resume_at(&h, &[1, 2, 3]), None); // nothing left to read: the last token's logits are not kept
+        assert_eq!(resume_at(&h, &[1, 2, 9]), None); // the prompt itself changed
+        assert_eq!(resume_at(&h, &[1, 2, 3, 4, 5, 6]), Some(3)); // the same as held: back to the saved state
         assert_eq!(resume_at(&held(&[1, 2], None), &[1, 3]), None);
-        let h = Held { tokens: vec![1, 2, 3, 4, 5, 6], adapter: false, dirty: false, snaps: vec![(2, vec![]), (4, vec![])] };
-        assert_eq!(resume_at(&h, &[1, 2, 3, 4, 9]), Some(4));  // the latest state on the shared prefix
+        let h = Held {
+            tokens: vec![1, 2, 3, 4, 5, 6],
+            adapter: false,
+            dirty: false,
+            snaps: vec![(2, vec![]), (4, vec![])],
+        };
+        assert_eq!(resume_at(&h, &[1, 2, 3, 4, 9]), Some(4)); // the latest state on the shared prefix
         assert_eq!(resume_at(&h, &[1, 2, 3, 9]), Some(2));
-        assert_eq!(resume_at(&h, &[1, 2, 3, 4]), Some(2));  // a state must leave a token to read
+        assert_eq!(resume_at(&h, &[1, 2, 3, 4]), Some(2)); // a state must leave a token to read
     }
 
     #[test]
@@ -719,23 +798,24 @@ mod tests {
         let snaps = |at: &[usize]| at.iter().map(|&p| (p, vec![])).collect::<Vec<_>>();
         let h = |at: &[usize]| Held { tokens: (1..=10).collect(), adapter: false, dirty: false, snaps: snaps(at) };
         let edited = [1, 2, 3, 4, 5, 6, 7, 99];
-        assert_eq!(still_resumable(&h(&[3, 7]), &edited, 7), Some(7));  // still there
-        assert_eq!(still_resumable(&h(&[3]), &edited, 7), Some(3));  // trimmed: the one before it
-        assert_eq!(still_resumable(&h(&[]), &edited, 7), None);  // none left: it starts over
-        assert_eq!(still_resumable(&h(&[]), &(1..=12).collect::<Vec<_>>(), 10), Some(10));  // the end needs no state
+        assert_eq!(still_resumable(&h(&[3, 7]), &edited, 7), Some(7)); // still there
+        assert_eq!(still_resumable(&h(&[3]), &edited, 7), Some(3)); // trimmed: the one before it
+        assert_eq!(still_resumable(&h(&[]), &edited, 7), None); // none left: it starts over
+        assert_eq!(still_resumable(&h(&[]), &(1..=12).collect::<Vec<_>>(), 10), Some(10)); // the end needs no state
     }
 
     #[test]
     fn takes_over_its_own_turns_and_copies_shared_beginnings() {
         // states where the first message ends (3) and where the last turn begins (7)
-        let h = Held { tokens: (1..=10).collect(), adapter: false, dirty: false, snaps: vec![(3, vec![]), (7, vec![])] };
-        assert_eq!(reuse(&h, &(1..=12).collect::<Vec<_>>()), Some((10, false)));  // the next turn
-        assert_eq!(reuse(&h, &[1, 2, 3, 4, 5, 6, 7, 99]), Some((7, false)));  // the last turn edited
-        assert_eq!(reuse(&h, &[1, 2, 3, 50, 51]), Some((3, true)));  // another conversation, same system prompt
+        let h =
+            Held { tokens: (1..=10).collect(), adapter: false, dirty: false, snaps: vec![(3, vec![]), (7, vec![])] };
+        assert_eq!(reuse(&h, &(1..=12).collect::<Vec<_>>()), Some((10, false))); // the next turn
+        assert_eq!(reuse(&h, &[1, 2, 3, 4, 5, 6, 7, 99]), Some((7, false))); // the last turn edited
+        assert_eq!(reuse(&h, &[1, 2, 3, 50, 51]), Some((3, true))); // another conversation, same system prompt
         assert_eq!(reuse(&h, &[1, 2, 50]), None);
         let mut snaps: Vec<(usize, Vec<u8>)> = (1..=5).map(|p| (p, vec![])).collect();
         keep_snaps(&mut snaps);
-        assert_eq!(snaps.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 4, 5]);  // the first one stays
+        assert_eq!(snaps.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 4, 5]); // the first one stays
     }
 
     #[test]

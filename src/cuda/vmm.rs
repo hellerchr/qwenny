@@ -3,8 +3,8 @@
 //! budget. Kernels and CUDA graphs see fixed addresses, so a per-slot cache can grow, shrink and move to the host
 //! without any kernel knowing: a slot's part of the KV cache costs memory only for the positions it holds.
 use anyhow::{Result, bail, ensure};
-use cudarc::driver::sys::{self, CUdeviceptr, CUmemGenericAllocationHandle};
 use cudarc::driver::CudaStream;
+use cudarc::driver::sys::{self, CUdeviceptr, CUmemGenericAllocationHandle};
 use std::sync::{Arc, Mutex};
 
 fn check(r: sys::CUresult, what: &str) -> Result<()> {
@@ -30,8 +30,16 @@ impl Pool {
         s.context().bind_to_thread()?;
         let dev = s.context().ordinal() as i32;
         let mut page = 0usize;
-        check(unsafe { sys::cuMemGetAllocationGranularity(&mut page, &prop(dev),
-              sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM) }, "page size")?;
+        check(
+            unsafe {
+                sys::cuMemGetAllocationGranularity(
+                    &mut page,
+                    &prop(dev),
+                    sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                )
+            },
+            "page size",
+        )?;
         Ok(Arc::new(Pool { page, dev, inner: Mutex::new(Pages { free: Vec::new(), made: 0, budget: usize::MAX }) }))
     }
 
@@ -211,7 +219,9 @@ impl Region {
             if self.pages[i].is_some() {
                 continue;
             }
-            let Some(h) = self.pool.take()? else { bail!("device memory: no page left (pool of {:?})", self.pool.usage()) };
+            let Some(h) = self.pool.take()? else {
+                bail!("device memory: no page left (pool of {:?})", self.pool.usage())
+            };
             let at = self.base + (i * self.pool.page) as u64;
             check(unsafe { sys::cuMemMap(at, self.pool.page, 0, h, 0) }, "cuMemMap")?;
             check(unsafe { sys::cuMemSetAccess(at, self.pool.page, &access, 1) }, "cuMemSetAccess")?;
@@ -230,7 +240,10 @@ impl Region {
         self.s.synchronize()?;
         for i in p0..p1 {
             if let Some(h) = self.pages[i].take() {
-                check(unsafe { sys::cuMemUnmap(self.base + (i * self.pool.page) as u64, self.pool.page) }, "cuMemUnmap")?;
+                check(
+                    unsafe { sys::cuMemUnmap(self.base + (i * self.pool.page) as u64, self.pool.page) },
+                    "cuMemUnmap",
+                )?;
                 self.pool.give(h);
             }
         }
@@ -241,7 +254,10 @@ impl Region {
     pub fn read(&self, from: usize, out: &mut [u8]) -> Result<()> {
         ensure!(from + out.len() <= self.size, "read beyond the region");
         self.s.synchronize()?;
-        check(unsafe { sys::cuMemcpyDtoH_v2(out.as_mut_ptr().cast(), self.base + from as u64, out.len()) }, "cuMemcpyDtoH")
+        check(
+            unsafe { sys::cuMemcpyDtoH_v2(out.as_mut_ptr().cast(), self.base + from as u64, out.len()) },
+            "cuMemcpyDtoH",
+        )
     }
 
     /// Copy `data` to bytes [from, from + data.len()) (mapped)
@@ -249,7 +265,12 @@ impl Region {
         ensure!(from + data.len() <= self.size, "write beyond the region");
         // on the stream, waited for: a copy from pageable memory may return before it lands, and the stream's next
         // kernels would not wait for the legacy stream's copy
-        check(unsafe { sys::cuMemcpyHtoDAsync_v2(self.base + from as u64, data.as_ptr().cast(), data.len(), self.s.cu_stream()) }, "cuMemcpyHtoDAsync")?;
+        check(
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(self.base + from as u64, data.as_ptr().cast(), data.len(), self.s.cu_stream())
+            },
+            "cuMemcpyHtoDAsync",
+        )?;
         Ok(self.s.synchronize()?)
     }
 }

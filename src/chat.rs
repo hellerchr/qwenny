@@ -21,7 +21,13 @@ pub struct Chat {
 /// of at least two digits. Rust and serde_json write 1e-5 and 1e16 where Python writes 1e-05 and 1e+16.
 fn py_float(x: f64) -> String {
     if !x.is_finite() {
-        return if x.is_nan() { "NaN".into() } else if x > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if x.is_nan() {
+            "NaN".into()
+        } else if x > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     let sci = format!("{x:e}");
     let (mantissa, exp) = sci.split_once('e').unwrap();
@@ -81,8 +87,11 @@ fn normalize(messages: &Json) -> Result<Json> {
         for (j, call) in m.get_mut("tool_calls").and_then(Json::as_array_mut).into_iter().flatten().enumerate() {
             let f = if call.get("function").is_some() { &mut call["function"] } else { call };
             let Some(Json::String(s)) = f.get("arguments") else { continue };
-            let args: Json = if s.trim().is_empty() { json!({}) } else {
-                serde_json::from_str(s).with_context(|| format!("messages[{i}].tool_calls[{j}].function.arguments is not JSON: {s}"))?
+            let args: Json = if s.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(s)
+                    .with_context(|| format!("messages[{i}].tool_calls[{j}].function.arguments is not JSON: {s}"))?
             };
             ensure!(args.is_object(), "messages[{i}].tool_calls[{j}].function.arguments must be a JSON object");
             f["arguments"] = args;
@@ -171,7 +180,12 @@ impl Chat {
             ends.push(token_id(pad)?);
         }
         let ids = &config.get("text_config").unwrap_or(&config)["eos_token_id"];
-        ends.extend(ids.as_u64().into_iter().chain(ids.as_array().into_iter().flatten().filter_map(Json::as_u64)).map(|i| i as u32));
+        ends.extend(
+            ids.as_u64()
+                .into_iter()
+                .chain(ids.as_array().into_iter().flatten().filter_map(Json::as_u64))
+                .map(|i| i as u32),
+        );
         ends.sort_unstable();
         ends.dedup();
         Ok(Chat { env, tok, bos, ends })
@@ -194,8 +208,13 @@ impl Chat {
         self.render_template(messages, tools, kwargs, true)
     }
 
-    fn render_template(&self, messages: &Json, tools: Option<&Json>, kwargs: &Map<String, Json>, generation_prompt: bool)
-                       -> Result<String> {
+    fn render_template(
+        &self,
+        messages: &Json,
+        tools: Option<&Json>,
+        kwargs: &Map<String, Json>,
+        generation_prompt: bool,
+    ) -> Result<String> {
         let mut ctx = Map::new();
         // Qwen's template takes arguments as objects and fails on OpenAI's JSON strings
         ctx.insert("messages".into(), normalize(messages)?);
@@ -245,7 +264,8 @@ impl Chat {
     /// `qwenny chatcheck`: render and tokenize the conversations of a reference from `tools/make_tokref.py` and compare
     /// text and token ids with Transformers'. Returns whether every case is identical.
     pub fn check(&self, reference: &Path) -> Result<bool> {
-        let r: Json = serde_json::from_str(&fs::read_to_string(reference).with_context(|| reference.display().to_string())?)?;
+        let r: Json =
+            serde_json::from_str(&fs::read_to_string(reference).with_context(|| reference.display().to_string())?)?;
         let cases = r["cases"].as_array().context("reference has no cases")?;
         let mut same = 0;
         for c in cases {
@@ -253,18 +273,33 @@ impl Chat {
             let kwargs = c["kwargs"].as_object().cloned().unwrap_or_default();
             let text = self.render(&c["messages"], c["tools"].as_array().map(|_| &c["tools"]), &kwargs);
             let want_text = c["text"].as_str().unwrap_or("");
-            let want: Vec<u32> = c["ids"].as_array().context("ids")?.iter().filter_map(|i| i.as_u64().map(|i| i as u32)).collect();
+            let want: Vec<u32> =
+                c["ids"].as_array().context("ids")?.iter().filter_map(|i| i.as_u64().map(|i| i as u32)).collect();
             let (ok, detail) = match text.and_then(|t| Ok((self.encode(&t)?, t))) {
                 Err(e) => (false, format!("error: {e:#}")),
                 Ok((ids, t)) => {
                     let ok = ids == want && t == want_text;
-                    let at = t.chars().zip(want_text.chars()).position(|(a, b)| a != b).unwrap_or(t.chars().count().min(want_text.chars().count()));
+                    let at = t
+                        .chars()
+                        .zip(want_text.chars())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(t.chars().count().min(want_text.chars().count()));
                     let around = |s: &str| s.chars().skip(at.saturating_sub(20)).take(60).collect::<String>();
-                    let detail = if ok { String::new() } else if t != want_text {
-                        format!("text differs at char {at}:\n    ours      {:?}\n    reference {:?}", around(&t), around(want_text))
+                    let detail = if ok {
+                        String::new()
+                    } else if t != want_text {
+                        format!(
+                            "text differs at char {at}:\n    ours      {:?}\n    reference {:?}",
+                            around(&t),
+                            around(want_text)
+                        )
                     } else {
                         let at = ids.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(ids.len().min(want.len()));
-                        format!("ids differ at {at}: ours {:?} reference {:?}", &ids[at..(at + 5).min(ids.len())], &want[at..(at + 5).min(want.len())])
+                        format!(
+                            "ids differ at {at}: ours {:?} reference {:?}",
+                            &ids[at..(at + 5).min(ids.len())],
+                            &want[at..(at + 5).min(want.len())]
+                        )
                     };
                     (ok, if ok { format!("{} tokens", ids.len()) } else { detail })
                 }
@@ -293,7 +328,10 @@ const PARAM_END: &str = "</parameter>";
 
 /// Length of the longest suffix of `s` that is a proper prefix of `tag`.
 pub(crate) fn partial_tag(s: &str, tag: &str) -> usize {
-    (1..tag.len().min(s.len() + 1)).rev().find(|&n| s.is_char_boundary(s.len() - n) && tag.starts_with(&s[s.len() - n..])).unwrap_or(0)
+    (1..tag.len().min(s.len() + 1))
+        .rev()
+        .find(|&n| s.is_char_boundary(s.len() - n) && tag.starts_with(&s[s.len() - n..]))
+        .unwrap_or(0)
 }
 
 /// A tool call as the model wrote it: `arguments` is a JSON object.
@@ -336,7 +374,10 @@ fn param_value(raw: &str, schema: Option<&Json>) -> Json {
         _ => serde_json::from_str::<Json>(t).ok(),
     };
     let fits = |v: &Json| match v {
-        Json::Number(n) => allows("number") || (allows("integer") && (n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0))),
+        Json::Number(n) => {
+            allows("number")
+                || (allows("integer") && (n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)))
+        }
         Json::Array(_) => allows("array"),
         Json::Object(_) => allows("object"),
         Json::Bool(_) => allows("boolean"),
@@ -528,8 +569,18 @@ pub mod test_models {
 mod tests {
     #[test]
     fn floats_as_python_writes_them() {
-        for (x, want) in [(1.0, "1.0"), (0.5, "0.5"), (1e-5, "1e-05"), (1.5e-7, "1.5e-07"), (0.0001, "0.0001"), (1e15, "1000000000000000.0"),
-                          (1e16, "1e+16"), (1.5e300, "1.5e+300"), (-2.5e-10, "-2.5e-10"), (0.0, "0.0")] {
+        for (x, want) in [
+            (1.0, "1.0"),
+            (0.5, "0.5"),
+            (1e-5, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (0.0001, "0.0001"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.5e300, "1.5e+300"),
+            (-2.5e-10, "-2.5e-10"),
+            (0.0, "0.0"),
+        ] {
             assert_eq!(super::py_float(x), want);
         }
     }
@@ -624,7 +675,10 @@ mod tests {
         let text = "<tool_call>\n<function=write_file>\n<parameter=path>\n123\n</parameter>\n<parameter=note>\ntrue\n</parameter>\n\
                     <parameter=mode>\nmany\n</parameter>\n<parameter=tags>\nnot a list\n</parameter>\n<parameter=limit>\n2.5\n</parameter>\n</function>\n</tool_call>";
         let (_, _, calls) = all_cuts(text, false, Some(&t));
-        assert_eq!(calls[0].arguments, json!({"path": "123", "note": "true", "mode": "many", "tags": "not a list", "limit": "2.5"}));
+        assert_eq!(
+            calls[0].arguments,
+            json!({"path": "123", "note": "true", "mode": "many", "tags": "not a list", "limit": "2.5"})
+        );
     }
 
     #[test]
@@ -679,7 +733,10 @@ mod tests {
         assert_eq!(n[1]["reasoning_content"], "r");
         assert_eq!(n[1]["tool_calls"][0]["function"]["arguments"], json!({"a": 1}));
         assert_eq!(n[2]["tool_calls"][0]["function"]["arguments"], json!({}));
-        assert!(normalize(&json!([{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "[1]"}}]}])).is_err());
+        assert!(
+            normalize(&json!([{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "[1]"}}]}]))
+                .is_err()
+        );
     }
 
     /// A call needs its `</function>`; without schemas the values are JSON when they parse, with them typed.

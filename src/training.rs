@@ -1,14 +1,19 @@
 //! LoRA training: data (chat template, loss masks, packing), the training loop (schedule, accumulation, evaluation),
 //! adapters in PEFT's format, and the checks against PEFT and Unsloth's masks. The forward and backward passes run in
 //! the CUDA trainer (`crate::cuda::qwen::train`).
+use crate::chat::Chat;
 use crate::cuda::learn::mem_gib;
 use crate::cuda::qwen::train::Trainer;
-use crate::chat::Chat;
 use crate::lora;
 use anyhow::{Context, Result, bail, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::{Value as Json, json};
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 #[derive(Clone)]
 pub struct Opts {
@@ -85,8 +90,12 @@ pub(crate) fn read_rows(path: &Path) -> Result<Vec<(usize, String)>> {
 
 /// A row's own chat_template_kwargs (e.g. {"enable_thinking": true, "reasoning_effort": "low"}: the system prompt then
 /// carries the effort's instruction, as the server renders such a request) over the defaults
-pub(crate) fn row_kwargs(defaults: &serde_json::Map<String, Json>, row: &Json, name: &str, line: usize)
-    -> Result<serde_json::Map<String, Json>> {
+pub(crate) fn row_kwargs(
+    defaults: &serde_json::Map<String, Json>,
+    row: &Json,
+    name: &str,
+    line: usize,
+) -> Result<serde_json::Map<String, Json>> {
     let mut kw = defaults.clone();
     match &row["chat_template_kwargs"] {
         Json::Null => {}
@@ -105,11 +114,17 @@ fn encode_rows(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str
     for (line, text) in rows {
         let row: Json = serde_json::from_str(text).with_context(|| format!("{name}:{line}: not a JSON object"))?;
         let Some(messages) = row["messages"].as_array() else {
-            bail!("{name}:{line}: no \"messages\" list; a row is {{\"messages\": [{{\"role\": \"user\", \"content\": ...}}, \
-                   {{\"role\": \"assistant\", \"content\": ...}}]}}");
+            bail!(
+                "{name}:{line}: no \"messages\" list; a row is {{\"messages\": [{{\"role\": \"user\", \"content\": ...}}, \
+                   {{\"role\": \"assistant\", \"content\": ...}}]}}"
+            );
         };
-        let replies = |m: &&Json| m["role"] == "assistant" && (m["content"].as_str().is_some_and(|c| !c.trim().is_empty())
-            || m["content"].as_array().is_some_and(|c| !c.is_empty()) || m["tool_calls"].as_array().is_some_and(|c| !c.is_empty()));
+        let replies = |m: &&Json| {
+            m["role"] == "assistant"
+                && (m["content"].as_str().is_some_and(|c| !c.trim().is_empty())
+                    || m["content"].as_array().is_some_and(|c| !c.is_empty())
+                    || m["tool_calls"].as_array().is_some_and(|c| !c.is_empty()))
+        };
         if !messages.iter().any(|m| replies(&m)) {
             no_reply.push(*line);
             continue;
@@ -128,14 +143,33 @@ fn encode_rows(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str
         }
         out.push(e);
     }
-    let lines = |v: &[usize]| format!("line{} {:?}{}", if v.len() > 1 { "s" } else { "" }, &v[..v.len().min(10)],
-                                      if v.len() > 10 { " ..." } else { "" });
-    ensure!(no_reply.is_empty(), "{name}: {} without an assistant reply to learn from ({})",
-            if no_reply.len() == 1 { "a row".to_string() } else { format!("{} rows", no_reply.len()) }, lines(&no_reply));
+    let lines = |v: &[usize]| {
+        format!(
+            "line{} {:?}{}",
+            if v.len() > 1 { "s" } else { "" },
+            &v[..v.len().min(10)],
+            if v.len() > 10 { " ..." } else { "" }
+        )
+    };
+    ensure!(
+        no_reply.is_empty(),
+        "{name}: {} without an assistant reply to learn from ({})",
+        if no_reply.len() == 1 { "a row".to_string() } else { format!("{} rows", no_reply.len()) },
+        lines(&no_reply)
+    );
     // a cut example trains on a reply without its end (and without <|im_end|>)
     if !cut.is_empty() {
-        eprintln!("warning: {name}: {} of {} examples longer than --max-len={max_len} are cut ({}){}", cut.len(), rows.len(),
-                  lines(&cut), if lost.is_empty() { String::new() } else { format!(", {} of them lose the whole reply and are left out", lost.len()) });
+        eprintln!(
+            "warning: {name}: {} of {} examples longer than --max-len={max_len} are cut ({}){}",
+            cut.len(),
+            rows.len(),
+            lines(&cut),
+            if lost.is_empty() {
+                String::new()
+            } else {
+                format!(", {} of them lose the whole reply and are left out", lost.len())
+            }
+        );
     }
     ensure!(!out.is_empty(), "{name}: no examples");
     Ok(out)
@@ -196,8 +230,10 @@ pub fn save_adapter(tr: &Trainer, out: &Path, base: &Path) -> Result<()> {
     fs::create_dir_all(out)?;
     let params = tr.l.read_params(false)?;
     let tensors = tr.l.tensor_shapes();
-    lora::save_tensors(&out.join("adapter_model.safetensors"),
-                       tensors.iter().map(|(n, r, c)| (n.clone(), Dtype::F32, vec![*r, *c], f32_bytes(&params[n]))))?;
+    lora::save_tensors(
+        &out.join("adapter_model.safetensors"),
+        tensors.iter().map(|(n, r, c)| (n.clone(), Dtype::F32, vec![*r, *c], f32_bytes(&params[n]))),
+    )?;
     let o = &tr.l.o;
     lora::write_config(out, &crate::hub::name(base), o.rank, o.alpha, o.dropout, tensors.iter().map(|t| t.0.as_str()))
 }
@@ -294,11 +330,15 @@ fn evaluate(t: &Trainer, examples: &[Example]) -> Result<Dev> {
         hf += bs / bn.max(1) as f64 * batch.len() as f64;
         hf_n += batch.len();
     }
-    let (loss, acc, hf, per_ex) = (sum / n as f64, correct as f64 / n as f64, hf / hf_n as f64, per_ex / examples.len() as f64);
+    let (loss, acc, hf, per_ex) =
+        (sum / n as f64, correct as f64 / n as f64, hf / hf_n as f64, per_ex / examples.len() as f64);
     Ok(Dev {
         loss,
         log: json!({"dev_loss": loss, "eval_loss": hf, "eval_loss_per_example": per_ex, "token_accuracy": acc}),
-        text: format!("loss {loss:.4} (HF eval_loss {hf:.4}, per example {per_ex:.4}), token accuracy {:.2}%", acc * 100.0),
+        text: format!(
+            "loss {loss:.4} (HF eval_loss {hf:.4}, per example {per_ex:.4}), token accuracy {:.2}%",
+            acc * 100.0
+        ),
     })
 }
 
@@ -306,8 +346,11 @@ fn evaluate(t: &Trainer, examples: &[Example]) -> Result<Dev> {
 pub(crate) fn data_paths(data: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     Ok(if data.is_dir() {
         let t = data.join("train.jsonl");
-        ensure!(t.exists(), "{} has no train.jsonl (one row {{\"messages\": [...]}} per line; dev.jsonl is optional)",
-                data.display());
+        ensure!(
+            t.exists(),
+            "{} has no train.jsonl (one row {{\"messages\": [...]}} per line; dev.jsonl is optional)",
+            data.display()
+        );
         (t, Some(data.join("dev.jsonl")).filter(|d| d.exists()))
     } else {
         ensure!(data.exists(), "{}: no such file or directory", data.display());
@@ -318,8 +361,11 @@ pub(crate) fn data_paths(data: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
 /// The run's out dir (runs/<data>-N by default), which must not hold an adapter yet
 fn out_dir(data: &Path, out: Option<&Path>) -> Result<PathBuf> {
     let out = out.map_or_else(|| run_dir(data), Path::to_path_buf);
-    ensure!(!out.join("adapter").exists(), "{} already holds an adapter: give another out dir (or leave it out for runs/<data>-N)",
-            out.display());
+    ensure!(
+        !out.join("adapter").exists(),
+        "{} already holds an adapter: give another out dir (or leave it out for runs/<data>-N)",
+        out.display()
+    );
     Ok(out)
 }
 
@@ -334,12 +380,14 @@ pub struct InitAdapter {
 /// The trainer's name of a PEFT LoRA tensor: without the adapter name (".default"), and the text model's
 /// "model.layers.N" (an adapter of AutoModelForCausalLM) as the checkpoint's "model.language_model.layers.N"
 pub(crate) fn trainer_name(name: &str) -> String {
-    name.replace(".default", "").replace("base_model.model.model.layers.", "base_model.model.model.language_model.layers.")
+    name.replace(".default", "")
+        .replace("base_model.model.model.layers.", "base_model.model.model.language_model.layers.")
 }
 
 fn read_init_adapter(dir: &Path) -> Result<InitAdapter> {
     let c = lora::read_config(dir).context("--init-adapter")?;
-    let bytes = fs::read(dir.join("adapter_model.safetensors")).with_context(|| format!("{}/adapter_model.safetensors", dir.display()))?;
+    let bytes = fs::read(dir.join("adapter_model.safetensors"))
+        .with_context(|| format!("{}/adapter_model.safetensors", dir.display()))?;
     let st = SafeTensors::deserialize(&bytes)?;
     let mut tensors = HashMap::new();
     for name in st.names() {
@@ -356,8 +404,13 @@ fn read_init_adapter(dir: &Path) -> Result<InitAdapter> {
 pub(crate) fn apply_init(tr: &mut Trainer, init: &HashMap<String, Vec<f32>>) -> Result<()> {
     let shapes: HashMap<String, usize> = tr.l.tensor_shapes().into_iter().map(|(n, r, c)| (n, r * c)).collect();
     let foreign: Vec<&String> = init.keys().filter(|n| !shapes.contains_key(*n)).collect();
-    ensure!(foreign.is_empty(), "the adapter has {} tensors this model's LoRA does not (e.g. {}): an adapter of another \
-             model or of other layers", foreign.len(), foreign[0]);
+    ensure!(
+        foreign.is_empty(),
+        "the adapter has {} tensors this model's LoRA does not (e.g. {}): an adapter of another \
+             model or of other layers",
+        foreign.len(),
+        foreign[0]
+    );
     for (n, v) in init {
         ensure!(v.len() == shapes[n], "{n}: {} values, this LoRA has {} (another rank?)", v.len(), shapes[n]);
     }
@@ -379,11 +432,18 @@ fn new_trainer(model: &Path, o: Opts, lmax: usize) -> Result<Trainer> {
             Ok(t) => return Ok(t),
             Err(e) if crate::engine::out_of_memory(&e) => {
                 let (free, all) = mem_gib();
-                ensure!(o.micro_tokens > floor, "GPU out of memory ({free:.1} of {all:.1} GiB free) with micro-batches \
+                ensure!(
+                    o.micro_tokens > floor,
+                    "GPU out of memory ({free:.1} of {all:.1} GiB free) with micro-batches \
                         of {} tokens, the least that holds the longest example ({lmax} tokens): a lower --max-len, or \
-                        free the GPU (nvidia-smi lists what holds it)", o.micro_tokens);
+                        free the GPU (nvidia-smi lists what holds it)",
+                    o.micro_tokens
+                );
                 o.micro_tokens = (o.micro_tokens / 2).max(floor);
-                println!("GPU memory short ({free:.1} GiB free): --micro-tokens={} (same result, a little slower)", o.micro_tokens);
+                println!(
+                    "GPU memory short ({free:.1} GiB free): --micro-tokens={} (same result, a little slower)",
+                    o.micro_tokens
+                );
             }
             Err(e) => return Err(e),
         }
@@ -416,8 +476,15 @@ impl<T> Run<T> {
     /// The training rows of `data` (see `data_paths`) and the dev rows (dev.jsonl, else held out of the training rows)
     /// encoded by `encode` (rows, most tokens, the file's name for messages); `unit` names them in messages. Creates
     /// the out dir.
-    pub fn load(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: &TrainOpts, unit: &str,
-                encode: impl Fn(&Chat, &[(usize, String)], usize, &str) -> Result<Vec<T>>) -> Result<Self> {
+    pub fn load(
+        model: &Path,
+        data: &Path,
+        out: Option<&Path>,
+        o: Opts,
+        to: &TrainOpts,
+        unit: &str,
+        encode: impl Fn(&Chat, &[(usize, String)], usize, &str) -> Result<Vec<T>>,
+    ) -> Result<Self> {
         let t0 = Instant::now();
         let (train_path, dev_path) = data_paths(data)?;
         let out = out_dir(data, out)?;
@@ -433,12 +500,19 @@ impl<T> Run<T> {
         let dev = if dev_rows.is_empty() { Vec::new() } else { encode(&chat, &dev_rows, to.max_len, &dev_name)? };
         fs::create_dir_all(&out).with_context(|| format!("{}", out.display()))?;
         if dev.is_empty() {
-            println!("warning: fewer than 100 {unit} and no dev.jsonl: no dev set, so no early stopping and no best adapter; \
-                      training all {} epochs", to.epochs);
+            println!(
+                "warning: fewer than 100 {unit} and no dev.jsonl: no dev set, so no early stopping and no best adapter; \
+                      training all {} epochs",
+                to.epochs
+            );
         } else if held_out {
             fs::write(out.join("dev.jsonl"), dev_rows.iter().map(|(_, l)| format!("{l}\n")).collect::<String>())?;
-            println!("dev: {} {unit} held out of {name} (the same ones every run), written to {}; a dev.jsonl next to \
-                      train.jsonl chooses them yourself", dev.len(), out.join("dev.jsonl").display());
+            println!(
+                "dev: {} {unit} held out of {name} (the same ones every run), written to {}; a dev.jsonl next to \
+                      train.jsonl chooses them yourself",
+                dev.len(),
+                out.join("dev.jsonl").display()
+            );
         }
         Ok(Run { train, dev, init, model: model.to_path_buf(), opts, out, t0 })
     }
@@ -451,8 +525,12 @@ impl<T> Run<T> {
             println!("starting from {} ({} LoRA tensors)", a.dir.display(), a.tensors.len());
         }
         let (free, all) = mem_gib();
-        println!("loaded in {:.1}s, {} LoRA parameters, micro-batches of {} tokens, {free:.1} GiB free of {all:.1}",
-                 self.t0.elapsed().as_secs_f64(), tr.l.n_params, tr.tmax);
+        println!(
+            "loaded in {:.1}s, {} LoRA parameters, micro-batches of {} tokens, {free:.1} GiB free of {all:.1}",
+            self.t0.elapsed().as_secs_f64(),
+            tr.l.n_params,
+            tr.tmax
+        );
         Ok(tr)
     }
 
@@ -462,17 +540,26 @@ impl<T> Run<T> {
     /// With a dev set the dev loss is measured every half epoch, the adapter is saved whenever it is the lowest so
     /// far, and training stops after PATIENCE measurements without a new low, so `adapter/` holds the best adapter and
     /// `epochs` is an upper bound. Without one the adapter is the one after `epochs`. `summary` starts summary.json.
-    pub fn fit(&self, tr: &mut Trainer, to: &TrainOpts, summary: Json, start: Option<Dev>,
-               mut train_step: impl FnMut(&Trainer, &[usize], usize) -> Result<Step>,
-               mut eval: impl FnMut(&Trainer) -> Result<Dev>) -> Result<()> {
+    pub fn fit(
+        &self,
+        tr: &mut Trainer,
+        to: &TrainOpts,
+        summary: Json,
+        start: Option<Dev>,
+        mut train_step: impl FnMut(&Trainer, &[usize], usize) -> Result<Step>,
+        mut eval: impl FnMut(&Trainer) -> Result<Dev>,
+    ) -> Result<()> {
         let adapter = self.out.join("adapter");
         let steps_per_epoch = self.train.len().div_ceil(to.batch);
         let total = steps_per_epoch * to.epochs;
         let eval_every = if self.dev.is_empty() { 0 } else { steps_per_epoch.div_ceil(2) };
         let mut log = String::new();
         if eval_every > 0 {
-            println!("up to {} epochs ({total} steps); dev loss every {eval_every} steps, the adapter of the lowest kept, \
-                      stopping after {PATIENCE} without a new low", to.epochs);
+            println!(
+                "up to {} epochs ({total} steps); dev loss every {eval_every} steps, the adapter of the lowest kept, \
+                      stopping after {PATIENCE} without a new low",
+                to.epochs
+            );
             if let Some(d) = start {
                 log.push_str(&format!("{}\n", merged(json!({"step": 0}), d.log)));
                 println!("  dev at the start: {}", d.text);
@@ -494,8 +581,12 @@ impl<T> Run<T> {
                 let line = json!({"step": step + 1, "epoch": epoch, "grad_norm": norm, "lr": lr, "tokens": s.tokens, "seconds": dt});
                 log.push_str(&format!("{}\n", merged(line, s.log)));
                 if total <= 100 || step % 10 == 0 || step + 1 == total {
-                    println!("step {:4}/{total}  {}  grad norm {norm:.3}  lr {lr:.2e}  {:.0} tok/s", step + 1, s.text,
-                             s.tokens as f64 / dt);
+                    println!(
+                        "step {:4}/{total}  {}  grad norm {norm:.3}  lr {lr:.2e}  {:.0} tok/s",
+                        step + 1,
+                        s.text,
+                        s.tokens as f64 / dt
+                    );
                 }
                 step += 1;
                 trained += s.tokens;
@@ -511,7 +602,11 @@ impl<T> Run<T> {
                     }
                     eval_s += te.elapsed().as_secs_f64();
                     log.push_str(&format!("{}\n", merged(json!({"step": step}), d.log.clone())));
-                    println!("  dev {}{}", d.text, if new_low { "  (best, saved)".to_string() } else { format!("  ({since} without a new low)") });
+                    println!(
+                        "  dev {}{}",
+                        d.text,
+                        if new_low { "  (best, saved)".to_string() } else { format!("  ({since} without a new low)") }
+                    );
                     if new_low {
                         best = Some((d, step));
                     }
@@ -523,8 +618,13 @@ impl<T> Run<T> {
             }
         }
         let train_s = t1.elapsed().as_secs_f64();
-        println!("TRAINED in {train_s:.1}s ({:.0} tok/s), {:.1} GiB free at the end", trained as f64 / (train_s - eval_s), mem_gib().0);
-        let mut summary = merged(summary, json!({"train_seconds": train_s, "steps": step, "max_steps": total, "tokens": trained}));
+        println!(
+            "TRAINED in {train_s:.1}s ({:.0} tok/s), {:.1} GiB free at the end",
+            trained as f64 / (train_s - eval_s),
+            mem_gib().0
+        );
+        let mut summary =
+            merged(summary, json!({"train_seconds": train_s, "steps": step, "max_steps": total, "tokens": trained}));
         if let Some((d, s)) = best {
             println!("EVAL best adapter (step {s}): dev {}", d.text);
             summary = merged(summary, merged(json!({"best_step": s}), d.log));
@@ -534,9 +634,13 @@ impl<T> Run<T> {
         fs::write(self.out.join("train_log.jsonl"), log)?;
         fs::write(self.out.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
         let name = crate::hub::name(&self.model);
-        println!("adapter in {}, {:.1}s in all\nserve it: qwenny serve {}--adapter={}", adapter.display(),
-                 self.t0.elapsed().as_secs_f64(),
-                 if name == crate::hub::DEFAULT_MODEL { String::new() } else { format!("--model={name} ") }, adapter.display());
+        println!(
+            "adapter in {}, {:.1}s in all\nserve it: qwenny serve {}--adapter={}",
+            adapter.display(),
+            self.t0.elapsed().as_secs_f64(),
+            if name == crate::hub::DEFAULT_MODEL { String::new() } else { format!("--model={name} ") },
+            adapter.display()
+        );
         Ok(())
     }
 }
@@ -547,28 +651,42 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     let (train, dev) = (&run.train, &run.dev);
     let lmax = train.iter().chain(dev).map(|e| e.ids.len()).max().context("no examples")?;
     let tokens: usize = train.iter().map(|e| e.ids.len()).sum();
-    println!("{} training examples, {tokens} tokens ({} in the loss), {} dev examples; longest {lmax}",
-             train.len(), train.iter().map(|e| e.loss_tokens()).sum::<usize>(), dev.len());
+    println!(
+        "{} training examples, {tokens} tokens ({} in the loss), {} dev examples; longest {lmax}",
+        train.len(),
+        train.iter().map(|e| e.loss_tokens()).sum::<usize>(),
+        dev.len()
+    );
     let seen: std::collections::HashSet<&[u32]> = train.iter().map(|e| e.ids.as_slice()).collect();
     let leaked = dev.iter().filter(|e| seen.contains(e.ids.as_slice())).count();
     if leaked > 0 {
-        println!("warning: {leaked} of {} dev examples are also in the training data: the dev loss looks better than it is \
-                  and early stopping stops late", dev.len());
+        println!(
+            "warning: {leaked} of {} dev examples are also in the training data: the dev loss looks better than it is \
+                  and early stopping stops late",
+            dev.len()
+        );
     }
     if train.len() < 500 {
         println!("note: {} training examples; 500 to 5,000 are the usual advice", train.len());
     }
     let mut tr = run.trainer(lmax)?;
-    run.fit(&mut tr, &to, json!({}), None, |tr, chunk, step| {
-        let n_loss: usize = chunk.iter().map(|&i| train[i].loss_tokens()).sum();
-        let (mut loss, mut tokens) = (0.0, 0);
-        for (mi, mb) in pack(chunk.iter().map(|&i| &train[i]), tr.tmax).iter().enumerate() {
-            loss += nll_sum(&tr.pass(mb, true, 1.0 / n_loss as f32, step as u64, mi)?.0);
-            tokens += mb.tokens();
-        }
-        let loss = loss / n_loss as f64;
-        Ok(Step { tokens, log: json!({"loss": loss}), text: format!("loss {loss:.4}") })
-    }, |tr| evaluate(tr, dev))
+    run.fit(
+        &mut tr,
+        &to,
+        json!({}),
+        None,
+        |tr, chunk, step| {
+            let n_loss: usize = chunk.iter().map(|&i| train[i].loss_tokens()).sum();
+            let (mut loss, mut tokens) = (0.0, 0);
+            for (mi, mb) in pack(chunk.iter().map(|&i| &train[i]), tr.tmax).iter().enumerate() {
+                loss += nll_sum(&tr.pass(mb, true, 1.0 / n_loss as f32, step as u64, mi)?.0);
+                tokens += mb.tokens();
+            }
+            let loss = loss / n_loss as f64;
+            Ok(Step { tokens, log: json!({"loss": loss}), text: format!("loss {loss:.4}") })
+        },
+        |tr| evaluate(tr, dev),
+    )
 }
 
 pub(crate) fn ref_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
@@ -613,7 +731,10 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
     while let Ok(ids) = ref_i32(&r, &format!("ids_{}", docs.len())) {
         let d = docs.len();
         let mask: Vec<u8> = ref_i32(&r, &format!("mask_{d}"))?.into_iter().map(|m| m as u8).collect();
-        docs.push((Example { ids: ids.into_iter().map(|x| x as u32).collect(), mask }, ref_f32(&r, &format!("nll_{d}"))?));
+        docs.push((
+            Example { ids: ids.into_iter().map(|x| x as u32).collect(), mask },
+            ref_f32(&r, &format!("nll_{d}"))?,
+        ));
     }
     let lmax = docs.iter().map(|d| d.0.ids.len()).max().context("no documents in the reference")?;
     let total: usize = docs.iter().map(|d| d.0.loss_tokens()).sum();
@@ -621,11 +742,21 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
     let mut o = o;
     o.dropout = 0.0;
     o.layers = ref_i32(&r, "layers").map_or(0, |l| l[0] as usize);
-    let mode = if o.f32 { "f32" } else if o.f16 { "f16" } else { "bf16" };
+    let mode = if o.f32 {
+        "f32"
+    } else if o.f16 {
+        "f16"
+    } else {
+        "bf16"
+    };
     let mut tr = Trainer::new(model, o, tmax, lmax, 0)?;
     tr.l.write_params(&ref_params(&r, "init.")?)?;
     tr.l.zero_grads()?;
-    let micros = if packed { pack(docs.iter().map(|d| &d.0), tmax) } else { docs.iter().map(|d| pack(std::iter::once(&d.0), tmax).pop().unwrap()).collect() };
+    let micros = if packed {
+        pack(docs.iter().map(|d| &d.0), tmax)
+    } else {
+        docs.iter().map(|d| pack(std::iter::once(&d.0), tmax).pop().unwrap()).collect()
+    };
     let (mut loss, mut worst_nll) = (0.0, 0f32);
     let mut nll_err = 0f64;
     let mut di = 0;
@@ -643,10 +774,19 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
         }
     }
     let ref_loss = ref_f32(&r, "loss")?[0] as f64;
-    println!("{} documents ({}), {total} loss tokens, {} build", docs.len(), if packed { "packed in one pass" } else { "one pass each" },
-             mode);
-    println!("loss {:.6} vs reference {ref_loss:.6} (diff {:.2e}); per-token NLL mean |diff| {:.2e}, max {:.2e}",
-             loss / total as f64, (loss / total as f64 - ref_loss).abs(), nll_err / total as f64, worst_nll);
+    println!(
+        "{} documents ({}), {total} loss tokens, {} build",
+        docs.len(),
+        if packed { "packed in one pass" } else { "one pass each" },
+        mode
+    );
+    println!(
+        "loss {:.6} vs reference {ref_loss:.6} (diff {:.2e}); per-token NLL mean |diff| {:.2e}, max {:.2e}",
+        loss / total as f64,
+        (loss / total as f64 - ref_loss).abs(),
+        nll_err / total as f64,
+        worst_nll
+    );
 
     grads_and_step(&mut tr, &r)
 }
@@ -665,12 +805,16 @@ pub(crate) fn grads_and_step(tr: &mut Trainer, r: &SafeTensors) -> Result<()> {
             worst_name = name.clone();
         }
         min_cos = min_cos.min(cos);
-        let kind = name.split('.').rev().nth(2).unwrap_or("?").to_string() + "." + name.split('.').rev().nth(1).unwrap_or("?");
+        let kind =
+            name.split('.').rev().nth(2).unwrap_or("?").to_string() + "." + name.split('.').rev().nth(1).unwrap_or("?");
         let e = by_kind.entry(kind).or_default();
         e.0 = e.0.max(rel);
         e.1 += 1;
     }
-    println!("gradients of {} tensors: worst relative error {worst:.2e} ({worst_name}), lowest cosine {min_cos:.6}", reff.len());
+    println!(
+        "gradients of {} tensors: worst relative error {worst:.2e} ({worst_name}), lowest cosine {min_cos:.6}",
+        reff.len()
+    );
     let mut kinds: Vec<_> = by_kind.into_iter().collect();
     kinds.sort_by(|a, b| a.0.cmp(&b.0));
     for (k, (e, n)) in kinds {
@@ -687,7 +831,9 @@ pub(crate) fn grads_and_step(tr: &mut Trainer, r: &SafeTensors) -> Result<()> {
         let ref_d: Vec<f32> = p.iter().zip(&init[name]).map(|(a, b)| a - b).collect();
         worst_step = worst_step.max(compare(&ours_d, &ref_d).0);
     }
-    println!("grad norm {norm:.5} vs reference {ref_norm:.5}; AdamW step: worst relative error of the update {worst_step:.2e}");
+    println!(
+        "grad norm {norm:.5} vs reference {ref_norm:.5}; AdamW step: worst relative error of the update {worst_step:.2e}"
+    );
     Ok(())
 }
 
@@ -698,8 +844,11 @@ pub fn datacheck(model: &Path, data: &Path, reference: &Path) -> Result<()> {
     let r = SafeTensors::deserialize(&bytes)?;
     for split in ["train", "dev"] {
         let ex = load_examples(&chat, &data.join(format!("{split}.jsonl")), usize::MAX)?;
-        let (ids, mask, starts) = (ref_i32(&r, &format!("{split}_ids"))?, ref_i32(&r, &format!("{split}_mask"))?,
-                                   ref_i32(&r, &format!("{split}_starts"))?);
+        let (ids, mask, starts) = (
+            ref_i32(&r, &format!("{split}_ids"))?,
+            ref_i32(&r, &format!("{split}_mask"))?,
+            ref_i32(&r, &format!("{split}_starts"))?,
+        );
         ensure!(starts.len() == ex.len() + 1, "{split}: {} examples, reference {}", ex.len(), starts.len() - 1);
         let (mut bad_ids, mut bad_mask) = (0, 0);
         for (i, e) in ex.iter().enumerate() {
@@ -715,8 +864,12 @@ pub fn datacheck(model: &Path, data: &Path, reference: &Path) -> Result<()> {
             bad_ids += !same_ids as usize;
             bad_mask += (same_ids && !same_mask) as usize;
         }
-        println!("{split}: {} examples: ids identical for {}, masks identical for {}", ex.len(), ex.len() - bad_ids,
-                 ex.len() - bad_ids - bad_mask);
+        println!(
+            "{split}: {} examples: ids identical for {}, masks identical for {}",
+            ex.len(),
+            ex.len() - bad_ids,
+            ex.len() - bad_ids - bad_mask
+        );
     }
     Ok(())
 }

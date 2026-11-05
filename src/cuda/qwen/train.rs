@@ -12,7 +12,10 @@
 use super::{Dims, EPS, HD, LK_HEADS, LKD, LVD, NKV, ROT, VOCAB, attn, norm};
 use crate::checkpoint::Checkpoint;
 use crate::cuda::core::cfg;
-use crate::cuda::learn::{Arg::{F, I, P}, Buf, Group, Layout, Learn, Scratch};
+use crate::cuda::learn::{
+    Arg::{F, I, P},
+    Buf, Group, Layout, Learn, Scratch,
+};
 use crate::training::{Micro, Opts, f32_bytes};
 use anyhow::{Context, Result, bail, ensure};
 use std::{fs, path::Path};
@@ -25,9 +28,11 @@ mod int8;
 /// The PTX of a model size: bf16, f32 and f16 builds (build.rs)
 macro_rules! ptx {
     ($size:literal) => {
-        [include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_bf16.ptx")),
-         include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_f32.ptx")),
-         include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_f16.ptx"))]
+        [
+            include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_bf16.ptx")),
+            include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_f32.ptx")),
+            include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_f16.ptx")),
+        ]
     };
 }
 
@@ -36,9 +41,28 @@ const PTX_9B: [&str; 3] = ptx!("9b");
 const PTX_27B: [&str; 3] = ptx!("27b");
 
 const KERNELS: [&str; 22] = [
-    "dequant", "rms_fwd", "add_rms", "rms_bwd_pre", "rms_bwd_final", "swiglu_fwd", "swiglu_bwd", "scatter_rows",
-    "cross_entropy", "dn_conv", "dn_rule", "dn_rule_bwd", "dn_norm", "dn_norm_bwd", "dn_conv_bwd", "dn_conv_in_bwd",
-    "at_prep", "at_prep_bwd", "at_softmax", "at_softmax_bwd", "at_gate", "at_gate_bwd",
+    "dequant",
+    "rms_fwd",
+    "add_rms",
+    "rms_bwd_pre",
+    "rms_bwd_final",
+    "swiglu_fwd",
+    "swiglu_bwd",
+    "scatter_rows",
+    "cross_entropy",
+    "dn_conv",
+    "dn_rule",
+    "dn_rule_bwd",
+    "dn_norm",
+    "dn_norm_bwd",
+    "dn_conv_bwd",
+    "dn_conv_in_bwd",
+    "at_prep",
+    "at_prep_bwd",
+    "at_softmax",
+    "at_softmax_bwd",
+    "at_gate",
+    "at_gate_bwd",
 ];
 
 /// Rows of the output layer per matrix product (logits f32 and their gradient)
@@ -188,7 +212,15 @@ impl Trainer {
             5120 => PTX_27B,
             _ => bail!("training kernels are built for Qwen3.5-4B, Qwen3.5-9B and Qwen3.8-27B"),
         };
-        let (s, module) = crate::cuda::core::open(ptx[if o.f32 { 1 } else if o.f16 { 2 } else { 0 }])?;
+        let (s, module) = crate::cuda::core::open(
+            ptx[if o.f32 {
+                1
+            } else if o.f16 {
+                2
+            } else {
+                0
+            }],
+        )?;
         let es = if o.f32 { 4 } else { 2 };
         let alloc = |bytes: usize| crate::cuda::learn::alloc(&s, bytes);
         let upload = |bytes: &[u8]| crate::cuda::learn::upload(&s, bytes);
@@ -198,10 +230,17 @@ impl Trainer {
         let delta_in = d.delta_in() + 2 * d.lv_heads;
         // 16-bit checkpoints too large for the GPU (Qwen3.5-9B) are held as int8 (int8.rs)
         let types = tc["layer_types"].as_array().context("layer_types")?;
-        let layer_params: usize = types.iter().map(|t| d.h * (3 * d.ff + d.mix() + match t.as_str() {
-            Some("linear_attention") => delta_in,
-            _ => d.attn_in(),
-        })).sum();
+        let layer_params: usize = types
+            .iter()
+            .map(|t| {
+                d.h * (3 * d.ff
+                    + d.mix()
+                    + match t.as_str() {
+                        Some("linear_attention") => delta_in,
+                        _ => d.attn_in(),
+                    })
+            })
+            .sum();
         let q8 = !w.prequantized() && (2 * layer_params) as f64 > int8::INT8_ABOVE;
         // weights stacked by rows: stored quantized with integer zero points as they are, else bf16 as stored, widened
         // for the f32 build or rounded for f16 (consecutive dense matrices in one part)
@@ -225,9 +264,15 @@ impl Trainer {
                 if let Some((q, zp)) = quant {
                     flush(&mut parts, &mut dense, &mut dense_rows)?;
                     let words = q.cols * q.bits / 32;
-                    parts.push(Part::Quant { q: upload(&q.q.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?,
-                                             sc: upload(f32_bytes(&q.scales))?, zp: upload(&zp)?, rows: q.rows, words,
-                                             group: q.group, bits: q.bits });
+                    parts.push(Part::Quant {
+                        q: upload(&q.q.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?,
+                        sc: upload(f32_bytes(&q.scales))?,
+                        zp: upload(&zp)?,
+                        rows: q.rows,
+                        words,
+                        group: q.group,
+                        bits: q.bits,
+                    });
                     rows += q.rows;
                     cols = q.cols;
                     continue;
@@ -236,8 +281,15 @@ impl Trainer {
                 if q8 {
                     flush(&mut parts, &mut dense, &mut dense_rows)?;
                     let (q, sc, zp) = int8::quantize(&b, shape[1]);
-                    parts.push(Part::Quant { q: upload(&q)?, sc: upload(f32_bytes(&sc))?, zp: upload(&zp)?, rows: shape[0],
-                                             words: shape[1] / 4, group: int8::GROUP, bits: 8 });
+                    parts.push(Part::Quant {
+                        q: upload(&q)?,
+                        sc: upload(f32_bytes(&sc))?,
+                        zp: upload(&zp)?,
+                        rows: shape[0],
+                        words: shape[1] / 4,
+                        group: int8::GROUP,
+                        bits: 8,
+                    });
                     rows += shape[0];
                     cols = shape[1];
                     continue;
@@ -245,7 +297,9 @@ impl Trainer {
                 if o.f32 {
                     dense.extend(b.iter().flat_map(|&x| f32::from_bits((x as u32) << 16).to_le_bytes()));
                 } else if o.f16 {
-                    dense.extend(b.iter().flat_map(|&x| half::f16::from_f32(f32::from_bits((x as u32) << 16)).to_le_bytes()));
+                    dense.extend(
+                        b.iter().flat_map(|&x| half::f16::from_f32(f32::from_bits((x as u32) << 16)).to_le_bytes()),
+                    );
                 } else {
                     dense.extend(b.iter().flat_map(|x| x.to_le_bytes()));
                 }
@@ -269,20 +323,35 @@ impl Trainer {
                 other => bail!("layer {i}: unknown type {other:?}"),
             };
             let (mixer, ins, out): (&str, Vec<(&str, usize)>, &str) = if delta {
-                ("linear_attn", vec![("in_proj_qkv", d.lqkv()), ("in_proj_z", d.lv_heads * LVD), ("in_proj_b", d.lv_heads),
-                                     ("in_proj_a", d.lv_heads)], "out_proj")
+                (
+                    "linear_attn",
+                    vec![
+                        ("in_proj_qkv", d.lqkv()),
+                        ("in_proj_z", d.lv_heads * LVD),
+                        ("in_proj_b", d.lv_heads),
+                        ("in_proj_a", d.lv_heads),
+                    ],
+                    "out_proj",
+                )
             } else {
                 ("self_attn", vec![("q_proj", 2 * d.nh * HD), ("k_proj", NKV * HD), ("v_proj", NKV * HD)], "o_proj")
             };
-            let g = [lay.group(&format!("{peft}.{mixer}"), d.h, &ins), lay.group(&format!("{peft}.{mixer}"), d.mix(), &[(out, d.h)]),
-                     lay.group(&format!("{peft}.mlp"), d.h, &[("gate_proj", d.ff), ("up_proj", d.ff)]),
-                     lay.group(&format!("{peft}.mlp"), d.ff, &[("down_proj", d.h)])];
+            let g = [
+                lay.group(&format!("{peft}.{mixer}"), d.h, &ins),
+                lay.group(&format!("{peft}.{mixer}"), d.mix(), &[(out, d.h)]),
+                lay.group(&format!("{peft}.mlp"), d.h, &[("gate_proj", d.ff), ("up_proj", d.ff)]),
+                lay.group(&format!("{peft}.mlp"), d.ff, &[("down_proj", d.h)]),
+            ];
             let fl = |n: &str| -> Result<Option<Buf>> { Ok(Some(vec(w.floats(&format!("{p}.{mixer}.{n}"))?.0)?)) };
             let f = if delta {
                 [fl("conv1d.weight")?, fl("A_log")?, fl("dt_bias")?, fl("norm.weight")?]
             } else {
-                [Some(vec(norm(&w, &format!("{p}.self_attn.q_norm.weight"))?)?),
-                 Some(vec(norm(&w, &format!("{p}.self_attn.k_norm.weight"))?)?), None, None]
+                [
+                    Some(vec(norm(&w, &format!("{p}.self_attn.q_norm.weight"))?)?),
+                    Some(vec(norm(&w, &format!("{p}.self_attn.k_norm.weight"))?)?),
+                    None,
+                    None,
+                ]
             };
             let ly = Layer {
                 delta,
@@ -298,10 +367,19 @@ impl Trainer {
             };
             // the matrices as stacked from the checkpoint against the widths the kernels assume (a mismatch, e.g. a
             // changed Dims, would read misplaced columns without any other error)
-            let shapes = [(&ly.w_in, ly.in_width, d.h), (&ly.w_out, d.h, d.mix()), (&ly.w13, 2 * d.ff, d.h), (&ly.w_down, d.h, d.ff)];
+            let shapes = [
+                (&ly.w_in, ly.in_width, d.h),
+                (&ly.w_out, d.h, d.mix()),
+                (&ly.w13, 2 * d.ff, d.h),
+                (&ly.w_down, d.h, d.ff),
+            ];
             for (wt, rows, cols) in shapes {
-                ensure!(wt.rows == rows && wt.cols == cols, "layer {i}: a matrix of {} x {}, the kernels take {rows} x {cols}",
-                        wt.rows, wt.cols);
+                ensure!(
+                    wt.rows == rows && wt.cols == cols,
+                    "layer {i}: a matrix of {} x {}, the kernels take {rows} x {cols}",
+                    wt.rows,
+                    wt.cols
+                );
             }
             layers.push(ly);
         }
@@ -314,8 +392,17 @@ impl Trainer {
         let lm_head = mat(&[if w.has("lm_head.weight") { "lm_head.weight".to_string() } else { e.clone() }])?;
         // the scratch: the widest matrix put together for a product; the output layer in slices of as many elements
         // (a layer's four matrices side by side: put together once for its recompute and backward)
-        let widest = layers.iter().map(|l| [&l.w_in, &l.w_out, &l.w13, &l.w_down].iter().filter(|w| !w.in_place())
-            .map(|w| w.rows * w.cols).sum::<usize>()).max().unwrap_or(0);
+        let widest = layers
+            .iter()
+            .map(|l| {
+                [&l.w_in, &l.w_out, &l.w13, &l.w_down]
+                    .iter()
+                    .filter(|w| !w.in_place())
+                    .map(|w| w.rows * w.cols)
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
         let scr_elems = if lm_head.in_place() { widest } else { widest.max(32768 * d.h) };
         let ck_rows = tmax.div_ceil(C_CK);
         let inv_freq: Vec<f32> = (0..ROT / 2).map(|i| attn::THETA.powf(-2.0 * i as f64 / ROT as f64) as f32).collect();
@@ -374,8 +461,15 @@ impl Trainer {
             loss_row: alloc(tmax * 4)?,
             correct: alloc(tmax * 4)?,
             row_w: alloc(tmax * 4)?,
-            l: Learn::new(s.clone(), &module, &KERNELS, o.clone(), lay, &init,
-                          Scratch { tmax, inp: d.ff.max(mix).max(in_max), ldu: U_RANKS * o.rank })?,
+            l: Learn::new(
+                s.clone(),
+                &module,
+                &KERNELS,
+                o.clone(),
+                lay,
+                &init,
+                Scratch { tmax, inp: d.ff.max(mix).max(in_max), ldu: U_RANKS * o.rank },
+            )?,
             layers,
             d,
             tmax,
@@ -394,7 +488,12 @@ impl Trainer {
         if let [Part::Dense { w, .. }] = &wt.parts[..] {
             return Ok(w.p + (r0 * cols * es) as u64);
         }
-        ensure!(at + (r1 - r0) * cols <= self.scr_elems, "{} rows of {cols} in a scratch of {}", r1 - r0, self.scr_elems);
+        ensure!(
+            at + (r1 - r0) * cols <= self.scr_elems,
+            "{} rows of {cols} in a scratch of {}",
+            r1 - r0,
+            self.scr_elems
+        );
         let scr = self.scr.p + (at * es) as u64;
         let mut row = 0;
         for part in &wt.parts {
@@ -404,9 +503,22 @@ impl Trainer {
                 match part {
                     Part::Dense { w, .. } => l.copy(dst, w.p + ((a - row) * cols * es) as u64, (b - a) * cols * es)?,
                     Part::Quant { q, sc, zp, words, group, bits, .. } => {
-                        l.elementwise("dequant", (b - a) * words, &[P(q.p), P(sc.p), P(zp.p), I(*words as i32), I(cols as i32),
-                                                                   I(*group as i32), I(*bits as i32), I((a - row) as i32),
-                                                                   I((b - a) as i32), P(dst)])?;
+                        l.elementwise(
+                            "dequant",
+                            (b - a) * words,
+                            &[
+                                P(q.p),
+                                P(sc.p),
+                                P(zp.p),
+                                I(*words as i32),
+                                I(cols as i32),
+                                I(*group as i32),
+                                I(*bits as i32),
+                                I((a - row) as i32),
+                                I((b - a) as i32),
+                                P(dst),
+                            ],
+                        )?;
                     }
                 }
             }
@@ -470,12 +582,29 @@ impl Trainer {
         let (l, d) = (&self.l, &self.d);
         let m = |i: usize| self.meta[i].p;
         let f = |i: usize| ly.f[i].as_ref().unwrap().p;
-        l.launch_cfg("dn_conv", cfg((d.lqkv() / 128, t.div_ceil(4), 1), 128),
-                     &[P(self.p.p), P(f(0)), P(f(1)), P(f(2)), P(m(2)), P(self.cv.p), P(self.gb.p), I(t as i32)])?;
-        l.launch_cfg("dn_rule", cfg((NSLICE, d.lv_heads, docs), 128),
-                     &[P(self.cv.p), P(self.gb.p), P(self.o.p), P(if ck { self.ck.p } else { 0 }), P(self.docs[0].p),
-                       P(self.docs[1].p), P(self.docs[2].p)])?;
-        l.launch_cfg("dn_norm", cfg((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32), &[P(self.o.p), P(self.p.p), P(f(3)), P(self.y.p), F(EPS)])
+        l.launch_cfg(
+            "dn_conv",
+            cfg((d.lqkv() / 128, t.div_ceil(4), 1), 128),
+            &[P(self.p.p), P(f(0)), P(f(1)), P(f(2)), P(m(2)), P(self.cv.p), P(self.gb.p), I(t as i32)],
+        )?;
+        l.launch_cfg(
+            "dn_rule",
+            cfg((NSLICE, d.lv_heads, docs), 128),
+            &[
+                P(self.cv.p),
+                P(self.gb.p),
+                P(self.o.p),
+                P(if ck { self.ck.p } else { 0 }),
+                P(self.docs[0].p),
+                P(self.docs[1].p),
+                P(self.docs[2].p),
+            ],
+        )?;
+        l.launch_cfg(
+            "dn_norm",
+            cfg((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32),
+            &[P(self.o.p), P(self.p.p), P(f(3)), P(self.y.p), F(EPS)],
+        )
     }
 
     /// dy (the mixer output's gradient) -> dp
@@ -483,15 +612,47 @@ impl Trainer {
         let (l, d) = (&self.l, &self.d);
         let m = |i: usize| self.meta[i].p;
         let f = |i: usize| ly.f[i].as_ref().unwrap().p;
-        l.launch_cfg("dn_norm_bwd", cfg((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32), &[P(self.dy.p), P(self.o.p), P(self.p.p), P(f(3)), P(self.dp.p), F(EPS)])?;
+        l.launch_cfg(
+            "dn_norm_bwd",
+            cfg((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32),
+            &[P(self.dy.p), P(self.o.p), P(self.p.p), P(f(3)), P(self.dp.p), F(EPS)],
+        )?;
         l.zero(self.dqk.p, t * 2 * LK_HEADS * LKD * 4)?;
         l.zero(self.dgb.p, t * 2 * d.lv_heads * 4)?;
-        l.launch_cfg("dn_rule_bwd", cfg((NSLICE, d.lv_heads, docs), 128),
-                     &[P(self.cv.p), P(self.gb.p), P(self.o.p), P(self.ck.p), P(self.docs[0].p), P(self.docs[1].p),
-                       P(self.docs[2].p), P(self.dqk.p), P(self.dvv.p), P(self.dgb.p)])?;
-        l.launch_cfg("dn_conv_bwd", cfg((d.lqkv() / 128, t.div_ceil(4), 1), 128),
-                     &[P(self.p.p), P(f(0)), P(f(1)), P(f(2)), P(m(2)), P(self.dqk.p), P(self.dvv.p), P(self.dgb.p),
-                       P(self.gb.p), P(self.cv.p), P(self.dp.p), I(t as i32)])?;
+        l.launch_cfg(
+            "dn_rule_bwd",
+            cfg((NSLICE, d.lv_heads, docs), 128),
+            &[
+                P(self.cv.p),
+                P(self.gb.p),
+                P(self.o.p),
+                P(self.ck.p),
+                P(self.docs[0].p),
+                P(self.docs[1].p),
+                P(self.docs[2].p),
+                P(self.dqk.p),
+                P(self.dvv.p),
+                P(self.dgb.p),
+            ],
+        )?;
+        l.launch_cfg(
+            "dn_conv_bwd",
+            cfg((d.lqkv() / 128, t.div_ceil(4), 1), 128),
+            &[
+                P(self.p.p),
+                P(f(0)),
+                P(f(1)),
+                P(f(2)),
+                P(m(2)),
+                P(self.dqk.p),
+                P(self.dvv.p),
+                P(self.dgb.p),
+                P(self.gb.p),
+                P(self.cv.p),
+                P(self.dp.p),
+                I(t as i32),
+            ],
+        )?;
         l.elementwise("dn_conv_in_bwd", t * d.lqkv(), &[P(self.cv.p), P(f(0)), P(m(3)), P(self.dp.p), I(t as i32)])
     }
 
@@ -507,24 +668,80 @@ impl Trainer {
         let rows = self.d.nh / NKV * len;
         let lp = len.next_multiple_of(8);
         let (qo, ko) = self.group_at(s0, len, g);
-        l.mm(false, true, rows, len, HD, 1.0, self.qa.p + qo * es, HD, self.ka.p + ko * es, HD, 0.0, self.att_s.p, lp, true)?;
-        l.launch("at_softmax", rows.div_ceil(8), 256, &[P(self.att_s.p), P(self.att_p.p), I(rows as i32), I(len as i32),
-                                                         I(lp as i32), F(1.0 / (HD as f32).sqrt())])
+        l.mm(
+            false,
+            true,
+            rows,
+            len,
+            HD,
+            1.0,
+            self.qa.p + qo * es,
+            HD,
+            self.ka.p + ko * es,
+            HD,
+            0.0,
+            self.att_s.p,
+            lp,
+            true,
+        )?;
+        l.launch(
+            "at_softmax",
+            rows.div_ceil(8),
+            256,
+            &[
+                P(self.att_s.p),
+                P(self.att_p.p),
+                I(rows as i32),
+                I(len as i32),
+                I(lp as i32),
+                F(1.0 / (HD as f32).sqrt()),
+            ],
+        )
     }
 
     fn attn_fwd(&self, ly: &Layer, t: usize, mb: &Micro) -> Result<()> {
         let (l, es) = (&self.l, self.l.es as u64);
         let m = |i: usize| self.meta[i].p;
         let f = |i: usize| ly.f[i].as_ref().unwrap().p;
-        l.launch("at_prep", t, 32 * (self.d.nh + 2 * NKV), &[P(self.p.p), P(f(0)), P(f(1)), P(self.inv_freq.p), P(m(1)),
-            P(m(2)), P(m(4)), P(self.qa.p), P(self.ka.p), P(self.va.p), F(EPS)])?;
+        l.launch(
+            "at_prep",
+            t,
+            32 * (self.d.nh + 2 * NKV),
+            &[
+                P(self.p.p),
+                P(f(0)),
+                P(f(1)),
+                P(self.inv_freq.p),
+                P(m(1)),
+                P(m(2)),
+                P(m(4)),
+                P(self.qa.p),
+                P(self.ka.p),
+                P(self.va.p),
+                F(EPS),
+            ],
+        )?;
         for &(s0, len) in &mb.docs {
             for g in 0..NKV {
                 self.scores(s0, len, g)?;
                 let (qo, ko) = self.group_at(s0, len, g);
                 let rows = self.d.nh / NKV * len;
-                l.mm(false, false, rows, HD, len, 1.0, self.att_p.p, len.next_multiple_of(8), self.va.p + ko * es, HD, 0.0,
-                     self.oa.p + qo * es, HD, false)?;
+                l.mm(
+                    false,
+                    false,
+                    rows,
+                    HD,
+                    len,
+                    1.0,
+                    self.att_p.p,
+                    len.next_multiple_of(8),
+                    self.va.p + ko * es,
+                    HD,
+                    0.0,
+                    self.oa.p + qo * es,
+                    HD,
+                    false,
+                )?;
             }
         }
         l.launch("at_gate", t, 32 * self.d.nh, &[P(self.oa.p), P(self.p.p), P(m(2)), P(m(4)), P(self.y.p)])
@@ -534,8 +751,12 @@ impl Trainer {
         let (l, es) = (&self.l, self.l.es as u64);
         let m = |i: usize| self.meta[i].p;
         let f = |i: usize| ly.f[i].as_ref().unwrap().p;
-        l.launch("at_gate_bwd", t, 32 * self.d.nh, &[P(self.dy.p), P(self.oa.p), P(self.p.p), P(m(2)), P(m(4)),
-                                                     P(self.doa.p), P(self.dp.p)])?;
+        l.launch(
+            "at_gate_bwd",
+            t,
+            32 * self.d.nh,
+            &[P(self.dy.p), P(self.oa.p), P(self.p.p), P(m(2)), P(m(4)), P(self.doa.p), P(self.dp.p)],
+        )?;
         let scale = 1.0 / (HD as f32).sqrt();
         for &(s0, len) in &mb.docs {
             let (rows, lp) = (self.d.nh / NKV * len, len.next_multiple_of(8));
@@ -543,24 +764,62 @@ impl Trainer {
                 self.scores(s0, len, g)?;
                 let (qo, ko) = self.group_at(s0, len, g);
                 let (q, k, v) = (self.qa.p + qo * es, self.ka.p + ko * es, self.va.p + ko * es);
-                let (dout, dq, dk, dv) = (self.doa.p + qo * es, self.dqa.p + qo * es, self.dka.p + ko * es, self.dva.p + ko * es);
+                let (dout, dq, dk, dv) =
+                    (self.doa.p + qo * es, self.dqa.p + qo * es, self.dka.p + ko * es, self.dva.p + ko * es);
                 l.mm(false, true, rows, len, HD, 1.0, dout, HD, v, HD, 0.0, self.att_dp.p, lp, true)?;
-                l.launch("at_softmax_bwd", rows.div_ceil(8), 256, &[P(self.att_p.p), P(self.att_dp.p), P(self.att_ds.p),
-                                                                     I(rows as i32), I(len as i32), I(lp as i32), F(scale)])?;
+                l.launch(
+                    "at_softmax_bwd",
+                    rows.div_ceil(8),
+                    256,
+                    &[
+                        P(self.att_p.p),
+                        P(self.att_dp.p),
+                        P(self.att_ds.p),
+                        I(rows as i32),
+                        I(len as i32),
+                        I(lp as i32),
+                        F(scale),
+                    ],
+                )?;
                 l.mm(false, false, rows, HD, len, 1.0, self.att_ds.p, lp, k, HD, 0.0, dq, HD, false)?;
                 l.mm(true, false, len, HD, rows, 1.0, self.att_ds.p, lp, q, HD, 0.0, dk, HD, false)?;
                 l.mm(true, false, len, HD, rows, 1.0, self.att_p.p, lp, dout, HD, 0.0, dv, HD, false)?;
             }
         }
-        l.launch("at_prep_bwd", t, 32 * (self.d.nh + 2 * NKV), &[P(self.p.p), P(f(0)), P(f(1)), P(self.inv_freq.p), P(m(1)),
-            P(m(2)), P(m(4)), P(self.dqa.p), P(self.dka.p), P(self.dva.p), P(self.dp.p), F(EPS)])
+        l.launch(
+            "at_prep_bwd",
+            t,
+            32 * (self.d.nh + 2 * NKV),
+            &[
+                P(self.p.p),
+                P(f(0)),
+                P(f(1)),
+                P(self.inv_freq.p),
+                P(m(1)),
+                P(m(2)),
+                P(m(4)),
+                P(self.dqa.p),
+                P(self.dka.p),
+                P(self.dva.p),
+                P(self.dp.p),
+                F(EPS),
+            ],
+        )
     }
 
     /// Layer `i` forward from xn (its input norm of hs[i]). `recompute` (the backward's): DeltaNet checkpoints, and the
     /// MLP stops at its down projection's LoRA U (hs[i + 1] is known). Else hs[i + 1] and xn = the next norm of it.
     #[allow(clippy::too_many_arguments)]
-    fn layer_fwd(&self, i: usize, wts: [u64; 4], mb: &Micro, train: bool, step: u64, micro: usize, recompute: bool)
-    -> Result<()> {
+    fn layer_fwd(
+        &self,
+        i: usize,
+        wts: [u64; 4],
+        mb: &Micro,
+        train: bool,
+        step: u64,
+        micro: usize,
+        recompute: bool,
+    ) -> Result<()> {
         let (l, ly, d, t) = (&self.l, &self.layers[i], &self.d, mb.tokens());
         let sd = |g: usize| Learn::seed(step, micro, i, g);
         let iw = ly.in_width;
@@ -573,8 +832,20 @@ impl Trainer {
         }
         l.mm(false, true, t, d.h, d.mix(), 1.0, self.y.p, d.mix(), wts[1], d.mix(), 0.0, self.s_op.p, d.h, false)?;
         l.lora_fwd(&ly.g[1], self.y.p, t, self.s_op.p, d.h, self.u(1), train, sd(1))?;
-        l.launch("add_rms", t, 256, &[P(self.hs(i)), P(self.s_op.p), P(ly.post_norm.p), P(self.hmid.p), P(self.xn2.p),
-                                      P(self.rs_mid.p), F(EPS)])?;
+        l.launch(
+            "add_rms",
+            t,
+            256,
+            &[
+                P(self.hs(i)),
+                P(self.s_op.p),
+                P(ly.post_norm.p),
+                P(self.hmid.p),
+                P(self.xn2.p),
+                P(self.rs_mid.p),
+                F(EPS),
+            ],
+        )?;
         l.mm(false, true, t, 2 * d.ff, d.h, 1.0, self.xn2.p, d.h, wts[2], d.h, 0.0, self.w13.p, 2 * d.ff, false)?;
         l.lora_fwd(&ly.g[2], self.xn2.p, t, self.w13.p, 2 * d.ff, self.u(2), train, sd(2))?;
         l.elementwise("swiglu_fwd", t * d.ff, &[P(self.w13.p), P(self.mid.p), I(t as i32)])?;
@@ -587,7 +858,12 @@ impl Trainer {
             Some(n) => (n.in_norm.p, self.rs_in.p),
             None => (self.final_norm.p, self.rs_fin.p),
         };
-        l.launch("add_rms", t, 256, &[P(self.hmid.p), P(self.s_op.p), P(next), P(self.hs(i + 1)), P(self.xn.p), P(rs), F(EPS)])
+        l.launch(
+            "add_rms",
+            t,
+            256,
+            &[P(self.hmid.p), P(self.s_op.p), P(next), P(self.hs(i + 1)), P(self.xn.p), P(rs), F(EPS)],
+        )
     }
 
     /// Backward of layer `i`: dh holds d hs[i + 1] and becomes d hs[i]
@@ -605,7 +881,12 @@ impl Trainer {
         l.elementwise("swiglu_bwd", t * ff, &[P(self.w13.p), P(self.dmid.p), I(t as i32)])?;
         l.mm(false, false, t, h, 2 * ff, 1.0, self.w13.p, 2 * ff, wts[2], h, 0.0, self.dx.p, h, l.g32())?;
         l.lora_bwd(&ly.g[2], self.w13.p, 2 * ff, self.xn2.p, t, self.u(2), self.dx.p, true, sd(2))?;
-        l.launch("rms_bwd_pre", t, 256, &[P(self.hmid.p), P(self.rs_mid.p), P(ly.post_norm.p), P(self.dx.p), P(self.dh.p)])?;
+        l.launch(
+            "rms_bwd_pre",
+            t,
+            256,
+            &[P(self.hmid.p), P(self.rs_mid.p), P(ly.post_norm.p), P(self.dx.p), P(self.dh.p)],
+        )?;
         // mixer
         l.elementwise("to_act_copy", t * h, &[P(self.dh.p), P(self.dact.p), P((t * h) as u64)])?;
         l.mm(false, false, t, mix, h, 1.0, self.dact.p, h, wts[1], mix, 0.0, self.dy.p, mix, false)?;
@@ -631,19 +912,36 @@ impl Trainer {
     /// forward pass `weigh` gets the loss (NLL) of every loss row and returns their weights w; the gradients of
     /// sum_i w_i * loss_i are added to the arena. The output layer's backward runs once with weight 1 and its rows are
     /// scaled afterwards (the rest of the backward pass is linear in them).
-    pub fn pass_weighted(&self, mb: &Micro, step: u64, micro: usize, weigh: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>>)
-        -> Result<()> {
+    pub fn pass_weighted(
+        &self,
+        mb: &Micro,
+        step: u64,
+        micro: usize,
+        weigh: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>>,
+    ) -> Result<()> {
         self.run(mb, true, 1.0, Some(weigh), step, micro)?;
         Ok(())
     }
 
-    fn run(&self, mb: &Micro, train: bool, scale: f32, weigh: Option<&mut Weigh<'_>>, step: u64,
-           micro: usize) -> Result<(Vec<f32>, usize)> {
+    fn run(
+        &self,
+        mb: &Micro,
+        train: bool,
+        scale: f32,
+        weigh: Option<&mut Weigh<'_>>,
+        step: u64,
+        micro: usize,
+    ) -> Result<(Vec<f32>, usize)> {
         self.upload(mb)?;
         let (l, t, h, es) = (&self.l, mb.tokens(), self.d.h, self.l.es as u64);
         let ids: Vec<u32> = mb.ids.iter().map(|&i| i as u32).collect();
         l.htod(self.hs(0), &self.w.rows(&self.embed_name, &ids)?)?;
-        l.launch("rms_fwd", t, 256, &[P(self.hs(0)), P(self.layers[0].in_norm.p), P(self.xn.p), P(self.rs_in.p), F(EPS)])?;
+        l.launch(
+            "rms_fwd",
+            t,
+            256,
+            &[P(self.hs(0)), P(self.layers[0].in_norm.p), P(self.xn.p), P(self.rs_in.p), F(EPS)],
+        )?;
         for i in 0..self.layers.len() {
             self.layer_fwd(i, self.layer_weights(i)?, mb, train, step, micro, false)?;
         }
@@ -663,16 +961,56 @@ impl Trainer {
             let g = self.gath.p + (c0 * h) as u64 * es;
             for v0 in (0..vocab).step_by(slice) {
                 let v1 = (v0 + slice).min(vocab);
-                l.mm(false, true, c, v1 - v0, h, 1.0, g, h, out_w(v0, v1)?, h, 0.0, self.logits.p + (v0 * 4) as u64, vocab, true)?;
+                l.mm(
+                    false,
+                    true,
+                    c,
+                    v1 - v0,
+                    h,
+                    1.0,
+                    g,
+                    h,
+                    out_w(v0, v1)?,
+                    h,
+                    0.0,
+                    self.logits.p + (v0 * 4) as u64,
+                    vocab,
+                    true,
+                )?;
             }
-            l.launch("cross_entropy", c, 1024, &[P(self.logits.p), P(self.targets.p + c0 as u64 * 4), I(vocab as i32),
-                F(scale * l.loss_scale), P(if train { self.dlog.p } else { 0 }), P(self.loss_row.p + c0 as u64 * 4),
-                P(self.correct.p + c0 as u64 * 4)])?;
+            l.launch(
+                "cross_entropy",
+                c,
+                1024,
+                &[
+                    P(self.logits.p),
+                    P(self.targets.p + c0 as u64 * 4),
+                    I(vocab as i32),
+                    F(scale * l.loss_scale),
+                    P(if train { self.dlog.p } else { 0 }),
+                    P(self.loss_row.p + c0 as u64 * 4),
+                    P(self.correct.p + c0 as u64 * 4),
+                ],
+            )?;
             if train {
                 for v0 in (0..vocab).step_by(slice) {
                     let v1 = (v0 + slice).min(vocab);
-                    l.mm(false, false, c, h, v1 - v0, 1.0, self.dlog.p + v0 as u64 * es, vocab, out_w(v0, v1)?, h,
-                         if v0 == 0 { 0.0 } else { 1.0 }, l.tmp32.p + (c0 * h * 4) as u64, h, true)?;
+                    l.mm(
+                        false,
+                        false,
+                        c,
+                        h,
+                        v1 - v0,
+                        1.0,
+                        self.dlog.p + v0 as u64 * es,
+                        vocab,
+                        out_w(v0, v1)?,
+                        h,
+                        if v0 == 0 { 0.0 } else { 1.0 },
+                        l.tmp32.p + (c0 * h * 4) as u64,
+                        h,
+                        true,
+                    )?;
                 }
             }
         }

@@ -27,7 +27,8 @@ pub fn quantize(b: &[u16], cols: usize) -> (Vec<u8>, Vec<f32>, Vec<u8>) {
                         let scale = if max > 0.0 { max / 127.0 } else { 1.0 };
                         sc[r * groups + g] = scale;
                         for (c, &x) in vals.iter().enumerate() {
-                            qc[r * cols + g * GROUP + c] = ((f(x) / scale).round().clamp(-127.0, 127.0) as i32 + 128) as u8;
+                            qc[r * cols + g * GROUP + c] =
+                                ((f(x) / scale).round().clamp(-127.0, 127.0) as i32 + 128) as u8;
                         }
                     }
                 }

@@ -42,8 +42,16 @@ impl Params {
     /// presence penalty applies yet (the request generated a token)
     pub fn draft_row(&self, presence: bool) -> [f32; 8] {
         let top_k = if self.top_k == 0 { 1024 } else { self.top_k.min(1024) };
-        [self.temperature, top_k as f32, self.top_p, self.repetition_penalty, 0.0, 0.0, -1.0,
-         if presence { self.presence_penalty } else { 0.0 }]
+        [
+            self.temperature,
+            top_k as f32,
+            self.top_p,
+            self.repetition_penalty,
+            0.0,
+            0.0,
+            -1.0,
+            if presence { self.presence_penalty } else { 0.0 },
+        ]
     }
 }
 
@@ -77,18 +85,28 @@ impl Rng {
 }
 
 /// A row's penalized logits and its top-k tokens by value, ties to the lower index (0: the whole vocabulary)
-fn ranked(logits: &[f32], seen: &impl Fn(u32) -> bool, generated: &impl Fn(u32) -> bool, row: &[f32; 8], k: usize) -> (Vec<f32>, Vec<u32>) {
+fn ranked(
+    logits: &[f32],
+    seen: &impl Fn(u32) -> bool,
+    generated: &impl Fn(u32) -> bool,
+    row: &[f32; 8],
+    k: usize,
+) -> (Vec<f32>, Vec<u32>) {
     let (rep, pres) = (row[3], row[7]);
-    let vals: Vec<f32> = logits.iter().enumerate().map(|(i, &l)| {
-        let mut v = l;
-        if rep != 1.0 && seen(i as u32) {
-            v = if v > 0.0 { v / rep } else { v * rep };
-        }
-        if pres != 0.0 && generated(i as u32) {
-            v -= pres;
-        }
-        v
-    }).collect();
+    let vals: Vec<f32> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| {
+            let mut v = l;
+            if rep != 1.0 && seen(i as u32) {
+                v = if v > 0.0 { v / rep } else { v * rep };
+            }
+            if pres != 0.0 && generated(i as u32) {
+                v -= pres;
+            }
+            v
+        })
+        .collect();
     let k = if k > 0 { k.min(logits.len()) } else { logits.len() };
     let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
     let cmp = |a: &u32, b: &u32| vals[*b as usize].total_cmp(&vals[*a as usize]).then(a.cmp(b));
@@ -103,9 +121,16 @@ fn ranked(logits: &[f32], seen: &impl Fn(u32) -> bool, generated: &impl Fn(u32) 
 fn kept(vals: &[f32], idx: &[u32], temp: f32, top_p: f32) -> (Vec<f32>, Vec<f32>, usize) {
     let vmax = vals[idx[0] as usize];
     let p: Vec<f32> = idx.iter().map(|&i| ((vals[i as usize] - vmax) / temp).exp()).collect();
-    let cum: Vec<f32> = p.iter().scan(0.0, |c, &x| { *c += x; Some(*c) }).collect();
+    let cum: Vec<f32> = p
+        .iter()
+        .scan(0.0, |c, &x| {
+            *c += x;
+            Some(*c)
+        })
+        .collect();
     let total = cum[idx.len() - 1];
-    let keep = if top_p < 1.0 { cum.iter().position(|&c| c / total >= top_p).map_or(idx.len(), |i| i + 1) } else { idx.len() };
+    let keep =
+        if top_p < 1.0 { cum.iter().position(|&c| c / total >= top_p).map_or(idx.len(), |i| i + 1) } else { idx.len() };
     (p, cum, keep)
 }
 
@@ -113,7 +138,12 @@ fn kept(vals: &[f32], idx: &[u32], temp: f32, top_p: f32) -> (Vec<f32>, Vec<f32>
 /// repetition penalty for the tokens `seen` reports, presence penalty for those `generated` reports, temperature,
 /// top-k, top-p, then the draw with the row's uniform numbers. With a draft d: accepted with probability p(d), else a
 /// draw from p without d. Returns (token, draft accepted).
-pub fn sample_row(logits: &[f32], seen: impl Fn(u32) -> bool, generated: impl Fn(u32) -> bool, row: &[f32; 8]) -> (u32, bool) {
+pub fn sample_row(
+    logits: &[f32],
+    seen: impl Fn(u32) -> bool,
+    generated: impl Fn(u32) -> bool,
+    row: &[f32; 8],
+) -> (u32, bool) {
     let (temp, top_k, top_p, u1, u2) = (row[0], row[1] as usize, row[2], row[4], row[5]);
     let draft = (row[6] >= 0.0).then_some(row[6] as u32);
     let greedy = temp <= 0.0 || top_k == 1;
@@ -144,8 +174,13 @@ pub fn sample_row(logits: &[f32], seen: impl Fn(u32) -> bool, generated: impl Fn
 /// sample_row for a draft d drawn from `q` (token, probability; ascending ids), exactly as `sample_rows` does it for
 /// a sampled draft: accepted with probability min(1, p(d) / q(d)) (u1), else a draw from max(0, p - q) normalized
 /// (u2). Returns (token, draft accepted).
-pub fn sample_row_q(logits: &[f32], seen: impl Fn(u32) -> bool, generated: impl Fn(u32) -> bool, row: &[f32; 8],
-                    q: &[(u32, f32)]) -> (u32, bool) {
+pub fn sample_row_q(
+    logits: &[f32],
+    seen: impl Fn(u32) -> bool,
+    generated: impl Fn(u32) -> bool,
+    row: &[f32; 8],
+    q: &[(u32, f32)],
+) -> (u32, bool) {
     let (p, idx) = kept_dist(logits, &seen, &generated, row);
     let d = row[6] as u32;
     let qof = |t: u32| q.binary_search_by_key(&t, |e| e.0).map_or(0.0, |i| q[i].1);
@@ -154,19 +189,30 @@ pub fn sample_row_q(logits: &[f32], seen: impl Fn(u32) -> bool, generated: impl 
         return (d, true);
     }
     let r: Vec<f32> = idx.iter().zip(&p).map(|(&t, &pt)| (pt - qof(t)).max(0.0)).collect();
-    let cum: Vec<f32> = r.iter().scan(0.0, |c, &x| { *c += x; Some(*c) }).collect();
+    let cum: Vec<f32> = r
+        .iter()
+        .scan(0.0, |c, &x| {
+            *c += x;
+            Some(*c)
+        })
+        .collect();
     let total = *cum.last().unwrap_or(&0.0);
     if total <= 0.0 {
         return (idx[0], false);
     }
     let target = row[5] * total;
-    let at = (0..r.len()).find(|&i| r[i] > 0.0 && cum[i] >= target).or_else(|| (0..r.len()).rev().find(|&i| r[i] > 0.0));
+    let at =
+        (0..r.len()).find(|&i| r[i] > 0.0 && cum[i] >= target).or_else(|| (0..r.len()).rev().find(|&i| r[i] > 0.0));
     (idx[at.unwrap_or(0)], false)
 }
 
 /// The kept tokens of a sampling row (penalties, temperature, top-k, top-p as sample_row) and their probabilities
-pub fn kept_dist(logits: &[f32], seen: &impl Fn(u32) -> bool, generated: &impl Fn(u32) -> bool, row: &[f32; 8])
--> (Vec<f32>, Vec<u32>) {
+pub fn kept_dist(
+    logits: &[f32],
+    seen: &impl Fn(u32) -> bool,
+    generated: &impl Fn(u32) -> bool,
+    row: &[f32; 8],
+) -> (Vec<f32>, Vec<u32>) {
     let (vals, idx) = ranked(logits, seen, generated, row, row[1] as usize);
     let (p, cum, keep) = kept(&vals, &idx, row[0], row[2]);
     let mass = cum[keep - 1];
@@ -181,10 +227,15 @@ mod tests {
     #[test]
     fn no_top_k_reaches_the_whole_vocabulary() {
         let logits = vec![0.0f32; 5000];
-        let draw = |u: f32, top_k: f32| sample_row(&logits, |_| false, |_| false, &[1.0, top_k, 1.0, 1.0, u, 0.0, -1.0, 0.0]).0;
+        let draw = |u: f32, top_k: f32| {
+            sample_row(&logits, |_| false, |_| false, &[1.0, top_k, 1.0, 1.0, u, 0.0, -1.0, 0.0]).0
+        };
         assert_eq!(draw(0.9999, 0.0), 4999);
         assert!(draw(0.9999, 1024.0) < 1024);
-        assert_eq!(kept_dist(&logits, &|_| false, &|_| false, &[1.0, 0.0, 1.0, 1.0, 0.0, 0.0, -1.0, 0.0]).1.len(), 5000);
+        assert_eq!(
+            kept_dist(&logits, &|_| false, &|_| false, &[1.0, 0.0, 1.0, 1.0, 0.0, 0.0, -1.0, 0.0]).1.len(),
+            5000
+        );
     }
 
     /// A sampled draft d ~ q, accepted or resampled by sample_row_q, gives tokens distributed as p (the row's own

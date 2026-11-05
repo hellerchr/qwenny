@@ -3,11 +3,11 @@
 //! run after each step, or an n-gram chain), plus prompt chunks of new requests, up to max_tok tokens, and
 //! samples the next tokens on the GPU, accepting drafts so the output follows the model's distribution exactly. A
 //! decision request (crate::decide) is prefilled like a chat request, then reads the logits at its last position.
+use crate::auth::{self, Auth};
 use crate::chat::{Chat, OutputParser, Piece, ToolCall, split_stray_think};
-use crate::sessions::{self, Held, Image, SNAP_FROM, Store};
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{self, Params, Rng};
-use crate::auth::{self, Auth};
+use crate::sessions::{self, Held, Image, SNAP_FROM, Store};
 use anyhow::{Context, Result, bail};
 use axum::{
     Json as AxJson, Router,
@@ -55,9 +55,17 @@ pub struct Progress {
 
 pub enum Msg {
     Text(String),
-    Done { finish: &'static str, prompt_tokens: usize, completion_tokens: usize },
+    Done {
+        finish: &'static str,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
     /// candidate logits and the share of the full next-token distribution on the candidates
-    Decision { logits: Vec<f32>, label_mass: f64, prompt_tokens: usize },
+    Decision {
+        logits: Vec<f32>,
+        label_mass: f64,
+        prompt_tokens: usize,
+    },
     Error(String),
 }
 
@@ -123,10 +131,20 @@ impl SpecStats {
     }
 
     fn line(&self) -> String {
-        let rates: Vec<String> = self.offered.iter().zip(&self.accepted).take_while(|(o, _)| **o > 0)
-            .map(|(o, a)| format!("{:.2}", *a as f64 / *o as f64)).collect();
-        format!("SPECSTAT tokens={} steps={} per_step={:.2} accepted=[{}]", self.tokens, self.steps,
-                self.tokens as f64 / self.steps.max(1) as f64, rates.join(" "))
+        let rates: Vec<String> = self
+            .offered
+            .iter()
+            .zip(&self.accepted)
+            .take_while(|(o, _)| **o > 0)
+            .map(|(o, a)| format!("{:.2}", *a as f64 / *o as f64))
+            .collect();
+        format!(
+            "SPECSTAT tokens={} steps={} per_step={:.2} accepted=[{}]",
+            self.tokens,
+            self.steps,
+            self.tokens as f64 / self.steps.max(1) as f64,
+            rates.join(" ")
+        )
     }
 }
 
@@ -211,9 +229,7 @@ impl Seq {
                 self.pending = held;
             }
         }
-        if self.finish.is_none()
-            && (self.reply().len() >= self.job.max_tokens || self.history.len() + 1 >= max_ctx)
-        {
+        if self.finish.is_none() && (self.reply().len() >= self.job.max_tokens || self.history.len() + 1 >= max_ctx) {
             self.finish = Some("length");
             self.flush();
         }
@@ -233,7 +249,13 @@ fn give_way(m: &mut Box<dyn Engine>, s: &mut Seq, shadow: Option<Image>) -> Resu
 
 /// Slot `slot`'s next steps with the adapter or the base model (an engine without an adapter: the base)
 fn use_adapter(m: &mut Box<dyn Engine>, slot: u32, adapter: bool) -> Result<()> {
-    if m.has_adapter() { m.set_adapter(slot, adapter) } else if adapter { bail!("no adapter loaded") } else { Ok(()) }
+    if m.has_adapter() {
+        m.set_adapter(slot, adapter)
+    } else if adapter {
+        bail!("no adapter loaded")
+    } else {
+        Ok(())
+    }
 }
 
 /// N-gram chains' drafts per step, unless --drafts says otherwise
@@ -278,10 +300,29 @@ struct Step {
     per_chain: usize,
 }
 
-fn engine(m: Box<dyn Engine>, store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize, mtp: usize) {
+fn engine(
+    m: Box<dyn Engine>,
+    store: Option<Store>,
+    chat: Arc<Chat>,
+    mut rx: UnboundedReceiver<Job>,
+    spec: usize,
+    mtp: usize,
+) {
     let free = (0..m.slots() as u32).rev().collect();
-    let mut e = Sched { m, store, chat, spec, mtp, spec_stats: crate::SPEC_STATS.load(std::sync::atomic::Ordering::Relaxed), free,
-                        waiting: VecDeque::new(), active: Vec::new(), parked: VecDeque::new(), held: VecDeque::new(), born: 0 };
+    let mut e = Sched {
+        m,
+        store,
+        chat,
+        spec,
+        mtp,
+        spec_stats: crate::SPEC_STATS.load(std::sync::atomic::Ordering::Relaxed),
+        free,
+        waiting: VecDeque::new(),
+        active: Vec::new(),
+        parked: VecDeque::new(),
+        held: VecDeque::new(),
+        born: 0,
+    };
     loop {
         if e.active.is_empty() && e.waiting.is_empty() && e.parked.is_empty() && e.held.is_empty() {
             match rx.blocking_recv() {
@@ -381,13 +422,17 @@ impl Sched {
             if !(continues || self.active.is_empty() || self.room(self.m.slot_bytes(job.prompt.len()))) {
                 let keep = self.store.as_ref().and_then(|st| st.slot_for(&job.prompt, job.adapter));
                 match self.store.as_mut().map(|st| st.park_one(&mut self.m, keep, false)) {
-                    Some(Ok(Some(slot))) => { self.free.push(slot); continue }
+                    Some(Ok(Some(slot))) => {
+                        self.free.push(slot);
+                        continue;
+                    }
                     _ => break,
                 }
             }
             if job.prompt.is_empty() || job.prompt.len() + 1 >= self.m.max_ctx() {
                 let job = self.waiting.pop_front().unwrap();
-                let msg = format!("prompt of {} tokens does not fit the context of {}", job.prompt.len(), self.m.max_ctx());
+                let msg =
+                    format!("prompt of {} tokens does not fit the context of {}", job.prompt.len(), self.m.max_ctx());
                 let _ = job.tx.send(Msg::Error(msg));
                 continue;
             }
@@ -424,7 +469,11 @@ impl Sched {
         // states saved while the prompt is read: where its first message ends (other conversations with the same
         // system prompt and tools share up to there) and where its last turn begins
         let mut snap_at = Vec::new();
-        if let Some(t) = self.chat.turn_token().filter(|_| self.store.is_some() && job.decide.is_none() && job.prompt.len() >= SNAP_FROM) {
+        if let Some(t) = self
+            .chat
+            .turn_token()
+            .filter(|_| self.store.is_some() && job.decide.is_none() && job.prompt.len() >= SNAP_FROM)
+        {
             let starts: Vec<usize> = job.prompt.iter().enumerate().filter(|(_, x)| **x == t).map(|(i, _)| i).collect();
             snap_at.extend(starts.get(1).filter(|&&p| p >= SNAP_FROM));
             snap_at.extend(starts.last().filter(|&&p| p > 0));
@@ -443,9 +492,29 @@ impl Sched {
                 rng: Rng::new(job.params.seed),
             },
         };
-        self.active.push(Seq { job, slot, fed: at, history, reply_at, outs, pending, from, read, rng, finish: None, marked: at,
-                               drafts: Vec::new(), sampled: false, chain: false, valid: at, dirty: false, snaps, snap_at,
-                               born: self.born, spec: SpecStats::default() });
+        self.active.push(Seq {
+            job,
+            slot,
+            fed: at,
+            history,
+            reply_at,
+            outs,
+            pending,
+            from,
+            read,
+            rng,
+            finish: None,
+            marked: at,
+            drafts: Vec::new(),
+            sampled: false,
+            chain: false,
+            valid: at,
+            dirty: false,
+            snaps,
+            snap_at,
+            born: self.born,
+            spec: SpecStats::default(),
+        });
     }
 
     /// The next step: decode tokens (with drafts) first, then prompt chunks. Drafts for the decoding requests also while
@@ -461,9 +530,16 @@ impl Sched {
         let (mut toks, mut want, mut marks, mut segs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (i, s) in self.active.iter_mut().enumerate() {
             if s.fed == s.job.prompt.len() {
-                let room = s.job.max_tokens.saturating_sub(s.history.len() - s.reply_at + 1).min(m.max_ctx().saturating_sub(s.history.len() + 1));
-                let d: Vec<u32> = if s.chain { chain_draft(&s.history, per_chain.min(room)).to_vec() }
-                                  else { s.drafts.iter().take(per.min(room)).copied().collect() };
+                let room = s
+                    .job
+                    .max_tokens
+                    .saturating_sub(s.history.len() - s.reply_at + 1)
+                    .min(m.max_ctx().saturating_sub(s.history.len() + 1));
+                let d: Vec<u32> = if s.chain {
+                    chain_draft(&s.history, per_chain.min(room)).to_vec()
+                } else {
+                    s.drafts.iter().take(per.min(room)).copied().collect()
+                };
                 let pos = s.history.len() - 1;
                 segs.push((i, toks.len(), pos, d.len() + 1));
                 for (j, &id) in std::iter::once(s.history.last().unwrap()).chain(&d).enumerate() {
@@ -514,17 +590,21 @@ impl Sched {
                 self.m.set_outputs(s.slot, &s.outs)?;
             }
         }
-        let p: Vec<[f32; 8]> = step.want.iter().map(|&(i, _, d)| {
-            let s = &mut self.active[i];
-            let mut row = s.job.params.row(&mut s.rng, d);
-            if s.reply().is_empty() {
-                row[7] = 0.0;
-            }
-            if s.sampled && !s.chain {
-                sample::mark_sampled(&mut row);
-            }
-            row
-        }).collect();
+        let p: Vec<[f32; 8]> = step
+            .want
+            .iter()
+            .map(|&(i, _, d)| {
+                let s = &mut self.active[i];
+                let mut row = s.job.params.row(&mut s.rng, d);
+                if s.reply().is_empty() {
+                    row[7] = 0.0;
+                }
+                if s.sampled && !s.chain {
+                    sample::mark_sampled(&mut row);
+                }
+                row
+            })
+            .collect();
         self.m.sample(&p)
     }
 
@@ -556,7 +636,11 @@ impl Sched {
             }
             self.make_device_room(e);
         } else {
-            eprintln!("engine: a step of {} tokens failed, its {} requests end: {e:#}", step.toks.len(), self.active.len());
+            eprintln!(
+                "engine: a step of {} tokens failed, its {} requests end: {e:#}",
+                step.toks.len(),
+                self.active.len()
+            );
             for s in self.active.drain(..) {
                 let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
                 let _ = self.m.release(s.slot);
@@ -597,14 +681,23 @@ impl Sched {
         let own = st.reclaim(seq.slot);
         let fits = seq.valid > 0 && st.make_room(self.m.image_bytes(seq.valid), None);
         if !fits {
-            eprintln!("cache: a request ({} tokens, {} of them read) waits for device memory", seq.job.prompt.len(), seq.valid);
+            eprintln!(
+                "cache: a request ({} tokens, {} of them read) waits for device memory",
+                seq.job.prompt.len(),
+                seq.valid
+            );
             let _ = self.m.release(seq.slot);
             self.free.push(seq.slot);
             // it reads its history again and goes on from there: what it sent stays sent
             if seq.history.len() > seq.reply_at {
                 seq.job.prompt = std::mem::take(&mut seq.history);
                 seq.job.progress = Some(Box::new(Progress {
-                    reply_at: seq.reply_at, outs: seq.outs, pending: seq.pending, from: seq.from, read: seq.read, rng: seq.rng,
+                    reply_at: seq.reply_at,
+                    outs: seq.outs,
+                    pending: seq.pending,
+                    from: seq.from,
+                    read: seq.read,
+                    rng: seq.rng,
                 }));
             }
             self.held.push_back(seq.job);
@@ -703,7 +796,9 @@ impl Sched {
             if s.fed == s.job.prompt.len() && last && s.history.len() + mtp < self.m.max_ctx() {
                 let p = &s.job.params;
                 // A full chain continues; its first miss ends it, and this normal step refreshes the evidence.
-                s.chain = if was_chain { n > 1 && acc[i] + 1 == n } else {
+                s.chain = if was_chain {
+                    n > 1 && acc[i] + 1 == n
+                } else {
                     per_chain > 0 && (p.temperature <= 0.0 || p.top_k == 1) && suffix_match(&s.history).is_some()
                 };
                 if !s.chain {
@@ -757,7 +852,10 @@ impl Sched {
             match &mut self.store {
                 Some(st) if s.job.decide.is_none() && s.valid > 0 => {
                     let snaps = s.snaps.into_iter().filter(|p| p.0 <= s.valid).collect();
-                    st.put(s.slot, Held { tokens: s.history[..s.valid].to_vec(), adapter: s.job.adapter, dirty: s.dirty, snaps });
+                    st.put(
+                        s.slot,
+                        Held { tokens: s.history[..s.valid].to_vec(), adapter: s.job.adapter, dirty: s.dirty, snaps },
+                    );
                 }
                 _ => {
                     if let Err(e) = self.m.release(s.slot) {
@@ -767,7 +865,11 @@ impl Sched {
                 }
             }
             if let Some(finish) = s.finish.filter(|f| *f != "decision") {
-                let _ = s.job.tx.send(Msg::Done { finish, prompt_tokens: s.reply_at, completion_tokens: s.history.len() - s.reply_at });
+                let _ = s.job.tx.send(Msg::Done {
+                    finish,
+                    prompt_tokens: s.reply_at,
+                    completion_tokens: s.history.len() - s.reply_at,
+                });
             }
         }
     }
@@ -821,13 +923,18 @@ async fn get_artifact(State(app): State<Arc<App>>, Path(id): Path<String>) -> Re
     let a = app.artifacts.lock().unwrap();
     match a.iter().find(|(k, _)| *k == id) {
         Some((_, html)) => (
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CONTENT_SECURITY_POLICY, SANDBOX),
-             (header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CONTENT_SECURITY_POLICY, SANDBOX),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
             html.clone(),
         )
             .into_response(),
-        None => (StatusCode::NOT_FOUND, format!("No such page: the server keeps the latest {ARTIFACTS} until it restarts."))
-            .into_response(),
+        None => {
+            (StatusCode::NOT_FOUND, format!("No such page: the server keeps the latest {ARTIFACTS} until it restarts."))
+                .into_response()
+        }
     }
 }
 
@@ -840,7 +947,9 @@ impl App {
         match (&self.adapter, asked) {
             (AdapterUse::Always, _) => Ok((true, self.name.clone())),
             (AdapterUse::Named(a), Some(m)) if m == a => Ok((true, a.clone())),
-            (AdapterUse::Named(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
+            (AdapterUse::Named(a), Some(m)) if m != self.name => {
+                bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name)
+            }
             _ => Ok((false, self.name.clone())),
         }
     }
@@ -929,9 +1038,10 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
         top_k: f("top_k").map_or(d.top_k, |k| k.max(0.0) as usize),
         repetition_penalty: f("repetition_penalty").or(f("repeat_penalty")).map_or(d.repetition_penalty, |r| r as f32),
         presence_penalty: f("presence_penalty").map_or(d.presence_penalty, |p| p as f32),
-        seed: body.get("seed").and_then(Json::as_u64).unwrap_or_else(|| {
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
-        }),
+        seed: body
+            .get("seed")
+            .and_then(Json::as_u64)
+            .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)),
     };
     let room = app.max_ctx.saturating_sub(prompt.len() + 1);
     let max_tokens = f("max_tokens").or(f("max_completion_tokens")).map_or(room, |m| (m as usize).min(room));
@@ -943,8 +1053,17 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
     };
     let (tx, rx) = unbounded_channel();
     Ok(Prepared {
-        job: Job { prompt, params, max_tokens, stop, progress: None, ignore_eos: body.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
-                   decide: None, adapter, tx },
+        job: Job {
+            prompt,
+            params,
+            max_tokens,
+            stop,
+            progress: None,
+            ignore_eos: body.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
+            decide: None,
+            adapter,
+            tx,
+        },
         model,
         rx,
         parser: OutputParser::new(thinking, tools),
@@ -956,10 +1075,16 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
 
 fn tool_calls_json(calls: &[ToolCall], id: &str) -> Json {
     Json::Array(
-        calls.iter().enumerate().map(|(i, c)| json!({
-            "index": i, "id": format!("call_{id}_{i}"), "type": "function",
-            "function": {"name": c.name, "arguments": c.arguments.to_string()}
-        })).collect(),
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                json!({
+                    "index": i, "id": format!("call_{id}_{i}"), "type": "function",
+                    "function": {"name": c.name, "arguments": c.arguments.to_string()}
+                })
+            })
+            .collect(),
     )
 }
 
@@ -980,10 +1105,12 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
         let (finish, counts) = loop {
             match rx.recv().await {
                 Some(Msg::Text(t)) => parser.push(&t, &mut pieces),
-                Some(Msg::Done { finish, prompt_tokens, completion_tokens }) => break (finish, usage(prompt_tokens, completion_tokens)),
+                Some(Msg::Done { finish, prompt_tokens, completion_tokens }) => {
+                    break (finish, usage(prompt_tokens, completion_tokens));
+                }
                 Some(Msg::Error(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
                 None | Some(Msg::Decision { .. }) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped the request").into_response()
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped the request").into_response();
                 }
             }
         };
@@ -1096,7 +1223,10 @@ pub struct ServeOpts {
 
 /// The value of cookie `name` in a request's headers
 fn cookie<'a>(h: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
-    h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';'))
+    h.get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
         .find_map(|c| c.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
@@ -1255,9 +1385,13 @@ async fn auth_password(State(app): State<Arc<App>>, h: axum::http::HeaderMap, Ax
 /// Start an engine thread for `load`; its job queue and context once the model is loaded.
 /// `sessions`: the slots asked for (None: as many as fit at the whole context)
 /// `fit_ctx`: lower the engine's context to what one session can hold on the device (no --ctx given)
-fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Arc<Chat>,
-                drafts: Option<usize>, sessions: Option<usize>, fit_ctx: bool)
-                -> Result<(UnboundedSender<Job>, usize, std::thread::JoinHandle<()>)> {
+fn start_engine(
+    load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
+    chat: Arc<Chat>,
+    drafts: Option<usize>,
+    sessions: Option<usize>,
+    fit_ctx: bool,
+) -> Result<(UnboundedSender<Job>, usize, std::thread::JoinHandle<()>)> {
     let (jobs, rx) = unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
@@ -1295,20 +1429,37 @@ pub struct Local {
 }
 
 impl Local {
-    pub fn start(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Arc<Chat>, adapter: AdapterUse,
-                 sessions: usize) -> Result<Self> {
+    pub fn start(
+        load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
+        chat: Arc<Chat>,
+        adapter: AdapterUse,
+        sessions: usize,
+    ) -> Result<Self> {
         let (jobs, max_ctx, engine) = start_engine(load, chat.clone(), None, Some(sessions), false)?;
         let db = std::env::temp_dir().join(format!("qwenny-local-{}.db", std::process::id()));
-        let app = Arc::new(App { chat, jobs, name: "qwenny".into(), max_ctx, adapter, presets: json!([]),
-                                 artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db)?) });
+        let app = Arc::new(App {
+            chat,
+            jobs,
+            name: "qwenny".into(),
+            max_ctx,
+            adapter,
+            presets: json!([]),
+            artifacts: Mutex::default(),
+            auth: Arc::new(Auth::open(&db)?),
+        });
         Ok(Self { app, engine, db })
     }
 
     /// Every request at once; the replies in order, an error if any fails
-    fn all<F: Future<Output = Response> + Send + 'static>(&self, bodies: Vec<Json>, f: impl Fn(State<Arc<App>>, AxJson<Json>) -> F) -> Result<Vec<Json>> {
+    fn all<F: Future<Output = Response> + Send + 'static>(
+        &self,
+        bodies: Vec<Json>,
+        f: impl Fn(State<Arc<App>>, AxJson<Json>) -> F,
+    ) -> Result<Vec<Json>> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         rt.block_on(async {
-            let tasks: Vec<_> = bodies.into_iter().map(|b| tokio::spawn(f(State(self.app.clone()), AxJson(b)))).collect();
+            let tasks: Vec<_> =
+                bodies.into_iter().map(|b| tokio::spawn(f(State(self.app.clone()), AxJson(b)))).collect();
             let mut out = Vec::with_capacity(tasks.len());
             for t in tasks {
                 let r = t.await?;
@@ -1338,12 +1489,24 @@ impl Local {
 }
 
 /// Load the model on the engine thread, then serve until the process ends.
-pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Chat, opts: ServeOpts) -> Result<()> {
+pub fn serve(
+    load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
+    chat: Chat,
+    opts: ServeOpts,
+) -> Result<()> {
     let auth = Arc::new(Auth::open(&opts.db)?);
     let chat = Arc::new(chat);
     let (jobs, max_ctx, _) = start_engine(load, chat.clone(), opts.drafts, opts.sessions, opts.fit_ctx)?;
-    let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
-                             presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
+    let app = Arc::new(App {
+        chat,
+        jobs,
+        name: opts.name.clone(),
+        max_ctx,
+        adapter: opts.adapter.clone(),
+        presets: opts.presets.clone(),
+        artifacts: Mutex::default(),
+        auth: auth.clone(),
+    });
     // the base model first (the page shows the first), then the adapter
     let mut names = vec![opts.name.clone()];
     if let AdapterUse::Named(a) = &opts.adapter {
@@ -1353,10 +1516,14 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/decisions", post(crate::decide::decisions))
         .route("/v1/decisions/presets", get(|State(app): State<Arc<App>>| async move { AxJson(app.presets.clone()) }))
-        .route("/v1/models", get(move || {
-            let data: Vec<Json> = names.iter().map(|n| json!({"id": n, "object": "model", "owned_by": "qwenny"})).collect();
-            async move { AxJson(json!({"object": "list", "data": data})) }
-        }))
+        .route(
+            "/v1/models",
+            get(move || {
+                let data: Vec<Json> =
+                    names.iter().map(|n| json!({"id": n, "object": "model", "owned_by": "qwenny"})).collect();
+                async move { AxJson(json!({"object": "list", "data": data})) }
+            }),
+        )
         .route("/health", get(|| async { "ok" }))
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
@@ -1375,18 +1542,22 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await?;
-        println!("serving {}{} on http://{}:{} (context {max_ctx}, web page at /{})", opts.name,
-                 match &opts.adapter {
-                     AdapterUse::None => String::new(),
-                     AdapterUse::Named(a) => format!(" and its adapter {a}"),
-                     AdapterUse::Always => " (adapter applied)".to_string(),
-                 }, opts.host, opts.port,
-                 if auth.require_key()? { ", the API requires a key" } else { "" });
+        println!(
+            "serving {}{} on http://{}:{} (context {max_ctx}, web page at /{})",
+            opts.name,
+            match &opts.adapter {
+                AdapterUse::None => String::new(),
+                AdapterUse::Named(a) => format!(" and its adapter {a}"),
+                AdapterUse::Always => " (adapter applied)".to_string(),
+            },
+            opts.host,
+            opts.port,
+            if auth.require_key()? { ", the API requires a key" } else { "" }
+        );
         axum::serve(listener, router).await?;
         Ok::<_, anyhow::Error>(())
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1406,8 +1577,12 @@ mod tests {
     #[test]
     fn sampling_defaults_follow_thinking() {
         let q = sampling_defaults;
-        assert!((q(true).temperature, q(true).top_p, q(true).top_k, q(true).repetition_penalty) == (1.0, 0.95, 20, 1.0));
-        assert!((q(false).temperature, q(false).top_p, q(false).top_k, q(false).repetition_penalty) == (0.7, 0.8, 20, 1.0));
+        assert!(
+            (q(true).temperature, q(true).top_p, q(true).top_k, q(true).repetition_penalty) == (1.0, 0.95, 20, 1.0)
+        );
+        assert!(
+            (q(false).temperature, q(false).top_p, q(false).top_k, q(false).repetition_penalty) == (0.7, 0.8, 20, 1.0)
+        );
         assert!((q(true).presence_penalty, q(false).presence_penalty) == (1.5, 1.5));
     }
 
@@ -1464,36 +1639,72 @@ mod tests {
     }
 
     impl Engine for Scripted {
-        fn slots(&self) -> usize { self.slots }
+        fn slots(&self) -> usize {
+            self.slots
+        }
         // no host memory for an image; the slots take no device memory
-        fn image_bytes(&self, _: usize) -> usize { 1 << 60 }
-        fn slot_bytes(&self, _: usize) -> usize { 0 }
-        fn max_ctx(&self) -> usize { 4096 }
-        fn max_tok(&self) -> usize { 512 }
-        fn max_out(&self) -> usize { 8 }
-        fn spec_tok(&self) -> usize { 8 }
-        fn vocab(&self) -> usize { 248320 }
+        fn image_bytes(&self, _: usize) -> usize {
+            1 << 60
+        }
+        fn slot_bytes(&self, _: usize) -> usize {
+            0
+        }
+        fn max_ctx(&self) -> usize {
+            4096
+        }
+        fn max_tok(&self) -> usize {
+            512
+        }
+        fn max_out(&self) -> usize {
+            8
+        }
+        fn spec_tok(&self) -> usize {
+            8
+        }
+        fn vocab(&self) -> usize {
+            248320
+        }
         fn step(&mut self, toks: &[Tok], out: &[usize], _: Option<&[Vec<u32>]>) -> Result<()> {
             if self.prompt.get() == 0 {
                 self.prompt.set(toks.last().map_or(0, |t| t.pos as usize + 1));
             }
             let decoding = |slot: u32| toks.iter().any(|t| t.slot == slot && t.pos as usize > self.prompt.get());
-            if let Some(full) = &self.full_once && decoding(0) && decoding(1) && !full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(full) = &self.full_once
+                && decoding(0)
+                && decoding(1)
+                && !full.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 bail!("the cache is full");
             }
             self.rows = out.iter().map(|&r| (toks[r].pos as usize + 1).saturating_sub(self.prompt.get())).collect();
             Ok(())
         }
-        fn logits(&self) -> Result<Vec<f32>> { bail!("no logits") }
-        fn logits_row(&self, _: usize) -> Result<Vec<f32>> { bail!("no logits") }
+        fn logits(&self) -> Result<Vec<f32>> {
+            bail!("no logits")
+        }
+        fn logits_row(&self, _: usize) -> Result<Vec<f32>> {
+            bail!("no logits")
+        }
         fn argmax(&self) -> Result<Vec<u32>> {
             Ok(self.rows.iter().map(|&i| self.script[i.min(self.script.len() - 1)]).collect())
         }
-        fn sample(&mut self, _: &[[f32; 8]]) -> Result<Vec<(u32, bool)>> { bail!("greedy only") }
-        fn sync(&self) -> Result<()> { Ok(()) }
-        fn has_draft(&self) -> bool { self.drafts.is_some() }
-        fn draft(&mut self, _: &[Tok], _: &[usize], out: &[usize], k: usize, _: &[Option<DraftSampling>])
-        -> Result<Vec<Vec<u32>>> {
+        fn sample(&mut self, _: &[[f32; 8]]) -> Result<Vec<(u32, bool)>> {
+            bail!("greedy only")
+        }
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn has_draft(&self) -> bool {
+            self.drafts.is_some()
+        }
+        fn draft(
+            &mut self,
+            _: &[Tok],
+            _: &[usize],
+            out: &[usize],
+            k: usize,
+            _: &[Option<DraftSampling>],
+        ) -> Result<Vec<Vec<u32>>> {
             let stats = self.drafts.as_ref().unwrap();
             let count = if out.is_empty() { &stats.context } else { &stats.normal };
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1506,21 +1717,40 @@ mod tests {
         serve_once_drafter(dir, reply, end, body, 0, None)
     }
 
-    fn serve_once_drafter(dir: &std::path::Path, reply: &str, end: u32, mut body: Json, spec: usize,
-                          drafts: Option<Arc<DraftStats>>) -> String {
+    fn serve_once_drafter(
+        dir: &std::path::Path,
+        reply: &str,
+        end: u32,
+        mut body: Json,
+        spec: usize,
+        drafts: Option<Arc<DraftStats>>,
+    ) -> String {
         let chat = Arc::new(Chat::load(dir).unwrap());
         let mut script = chat.encode(reply).unwrap();
         script.push(end);
         let (jobs, rx) = unbounded_channel();
         let engine_chat = chat.clone();
         std::thread::spawn(move || {
-            let m = Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts, slots: 1, full_once: None };
+            let m =
+                Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts, slots: 1, full_once: None };
             let mtp = mtp_depth(m.has_draft(), m.draft_tokens(), m.draft_capacity(), Some(spec));
             engine(Box::new(m), None, engine_chat, rx, spec, mtp)
         });
-        let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
-        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: AdapterUse::None,
-                                 presets: json!([]), artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db).unwrap()) });
+        let db = std::env::temp_dir().join(format!(
+            "qwenny-test-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let app = Arc::new(App {
+            chat,
+            jobs,
+            name: "t".into(),
+            max_ctx: 4096,
+            adapter: AdapterUse::None,
+            presets: json!([]),
+            artifacts: Mutex::default(),
+            auth: Arc::new(Auth::open(&db).unwrap()),
+        });
         // the scripted engine only takes the argmax: greedy, and no presence penalty (Qwen's default would sample)
         body["temperature"] = json!(0);
         body["presence_penalty"] = json!(0);
@@ -1548,13 +1778,32 @@ mod tests {
         let (engine_chat, full_once) = (chat.clone(), Some(full.clone()));
         std::thread::spawn(move || {
             started.recv().unwrap();
-            let m: Box<dyn Engine> = Box::new(Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts: None, slots: 2, full_once });
+            let m: Box<dyn Engine> = Box::new(Scripted {
+                script,
+                prompt: Default::default(),
+                rows: Vec::new(),
+                drafts: None,
+                slots: 2,
+                full_once,
+            });
             let store = Store::new(&*m, Some(2)).unwrap();
             engine(m, Some(store), engine_chat, rx, 0, 0)
         });
-        let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
-        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: AdapterUse::None,
-                                 presets: json!([]), artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db).unwrap()) });
+        let db = std::env::temp_dir().join(format!(
+            "qwenny-test-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let app = Arc::new(App {
+            chat,
+            jobs,
+            name: "t".into(),
+            max_ctx: 4096,
+            adapter: AdapterUse::None,
+            presets: json!([]),
+            artifacts: Mutex::default(),
+            auth: Arc::new(Auth::open(&db).unwrap()),
+        });
         let body = json!({"messages": [{"role": "user", "content": "Count."}], "temperature": 0, "presence_penalty": 0,
                           "chat_template_kwargs": {"enable_thinking": false}});
         let ask = || async {
@@ -1575,12 +1824,14 @@ mod tests {
     #[test]
     fn ngram_chains_work_beside_the_drafter() {
         let Some(dir) = test_models::dir(test_models::QWEN) else { return };
-        let code = "fn report(&self) -> String {\n    self.items.iter().map(|item| item.name.clone()).collect()\n}\n".repeat(2);
+        let code = "fn report(&self) -> String {\n    self.items.iter().map(|item| item.name.clone()).collect()\n}\n"
+            .repeat(2);
         let body = json!({"messages": [{"role": "user", "content": format!("Copy this code exactly:\n```rust\n{code}```")}],
                           "chat_template_kwargs": {"enable_thinking": false}});
         let plain: Json = serde_json::from_str(&serve_once(&dir, &code, 248046, body.clone())).unwrap();
         let stats = Arc::new(DraftStats::default());
-        let chained: Json = serde_json::from_str(&serve_once_drafter(&dir, &code, 248046, body, 7, Some(stats.clone()))).unwrap();
+        let chained: Json =
+            serde_json::from_str(&serve_once_drafter(&dir, &code, 248046, body, 7, Some(stats.clone()))).unwrap();
         assert_eq!(chained["choices"], plain["choices"]);
         assert_eq!(chained["usage"], plain["usage"]);
         assert!(stats.normal.load(std::sync::atomic::Ordering::Relaxed) > 0);
@@ -1591,8 +1842,10 @@ mod tests {
     #[test]
     fn stop_strings_never_leak() {
         let Some(dir) = test_models::dir(test_models::QWEN) else { return };
-        let ask = |stop: &str| json!({"messages": [{"role": "user", "content": "Hi"}], "stop": [stop],
-                                      "chat_template_kwargs": {"enable_thinking": false}});
+        let ask = |stop: &str| {
+            json!({"messages": [{"role": "user", "content": "Hi"}], "stop": [stop],
+                                      "chat_template_kwargs": {"enable_thinking": false}})
+        };
         let content = |r: String| serde_json::from_str::<Json>(&r).unwrap()["choices"][0]["message"]["content"].clone();
         // a stop string over several tokens: none of it reaches the client
         assert_eq!(content(serve_once(&dir, "Hello there.\n\nUser: more", 248046, ask("\n\nUser:"))), "Hello there.");
@@ -1607,9 +1860,15 @@ mod tests {
             "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}}]);
         let ask = json!({"messages": [{"role": "user", "content": "Wetter in 80331?"}], "tools": tools});
         // thinking by default; <|im_end|> ends the reply
-        let r: Json = serde_json::from_str(&serve_once(&dir, "Zip code.\n</think>\n\nDas Wetter ist gut.", 248046, ask.clone())).unwrap();
+        let r: Json =
+            serde_json::from_str(&serve_once(&dir, "Zip code.\n</think>\n\nDas Wetter ist gut.", 248046, ask.clone()))
+                .unwrap();
         let m = &r["choices"][0]["message"];
-        assert_eq!((m["reasoning_content"].as_str(), m["content"].as_str()), (Some("Zip code."), Some("Das Wetter ist gut.")), "{r}");
+        assert_eq!(
+            (m["reasoning_content"].as_str(), m["content"].as_str()),
+            (Some("Zip code."), Some("Das Wetter ist gut.")),
+            "{r}"
+        );
         assert_eq!(r["choices"][0]["finish_reason"], "stop");
         // a tool call, typed by the schema (a numeric city stays a string); <|endoftext|> ends the reply
         let call = "x\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n80331\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
@@ -1617,18 +1876,28 @@ mod tests {
         assert_eq!(r["choices"][0]["finish_reason"], "tool_calls", "{r}");
         let f = &r["choices"][0]["message"]["tool_calls"][0]["function"];
         assert_eq!(f["name"], "get_weather");
-        assert_eq!(serde_json::from_str::<Json>(f["arguments"].as_str().unwrap()).unwrap(), json!({"city": "80331", "days": 3}));
+        assert_eq!(
+            serde_json::from_str::<Json>(f["arguments"].as_str().unwrap()).unwrap(),
+            json!({"city": "80331", "days": 3})
+        );
         // thinking off, a stray </think> in the reply
         let mut off = ask.clone();
         off["chat_template_kwargs"] = json!({"enable_thinking": false});
-        let r: Json = serde_json::from_str(&serve_once(&dir, "oops\n</think>\n\nAntwort", 248046, off.clone())).unwrap();
+        let r: Json =
+            serde_json::from_str(&serve_once(&dir, "oops\n</think>\n\nAntwort", 248046, off.clone())).unwrap();
         let m = &r["choices"][0]["message"];
         assert_eq!((m["reasoning_content"].as_str(), m["content"].as_str()), (Some("oops"), Some("Antwort")), "{r}");
         // streamed: reasoning, then content, then the end
         off["chat_template_kwargs"] = json!({});
         off["stream"] = json!(true);
         let sse = serve_once(&dir, "Zip.\n</think>\n\nAntwort", 248046, off);
-        assert!(sse.contains("\"reasoning_content\":\"Zip\"") && sse.contains("Antwort") && sse.contains("\"finish_reason\":\"stop\"") && sse.ends_with("[DONE]\n\n"), "{sse}");
+        assert!(
+            sse.contains("\"reasoning_content\":\"Zip\"")
+                && sse.contains("Antwort")
+                && sse.contains("\"finish_reason\":\"stop\"")
+                && sse.ends_with("[DONE]\n\n"),
+            "{sse}"
+        );
     }
 
     #[test]
@@ -1639,7 +1908,10 @@ mod tests {
         assert_eq!(k(json!({"reasoning_effort": "high"})), json!({"reasoning_effort": "xhigh"}));
         assert_eq!(k(json!({"reasoning": {"effort": "medium"}})), json!({"reasoning_effort": "medium"}));
         assert_eq!(k(json!({"reasoning_effort": "none"})), json!({"enable_thinking": false}));
-        assert_eq!(k(json!({"reasoning_effort": "minimal", "enable_thinking": true})), json!({"enable_thinking": true}));
+        assert_eq!(
+            k(json!({"reasoning_effort": "minimal", "enable_thinking": true})),
+            json!({"enable_thinking": true})
+        );
         assert_eq!(k(json!({"enable_thinking": false})), json!({"enable_thinking": false}));
         // the template's own variables win
         let b = json!({"reasoning_effort": "low", "enable_thinking": false,

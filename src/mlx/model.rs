@@ -9,7 +9,7 @@
 //! restart replays the accepted tokens from the checkpoint (delta::token, the same operations as the step's own).
 #[cfg(not(has_metal))]
 use super::delta::{self, CH, pad_rows, repeat};
-use super::weights::{self as w, CONV_K, Fused, HD, Layer, LKD, LK_HEADS, LVD, MResult, NKV, ROT, THETA, Weights};
+use super::weights::{self as w, CONV_K, Fused, HD, LK_HEADS, LKD, LVD, Layer, MResult, NKV, ROT, THETA, Weights};
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{kept_dist, sample_row, sample_row_q};
 use anyhow::{Context, Result, ensure};
@@ -93,7 +93,9 @@ fn kv_arrays(kv: &[Vec<Kv>]) -> impl Iterator<Item = &Array> {
 /// Every DeltaNet state's arrays (to evaluate)
 fn delta_arrays(delta: &[Vec<DeltaState>]) -> impl Iterator<Item = &Array> {
     delta.iter().flatten().flat_map(|st| {
-        [&st.state, &st.ck_state, &st.hist].into_iter().chain(st.bank.iter().flat_map(|b| [&b.kq, &b.v, &b.e, &b.b, &b.dot]))
+        [&st.state, &st.ck_state, &st.hist]
+            .into_iter()
+            .chain(st.bank.iter().flat_map(|b| [&b.kq, &b.v, &b.e, &b.b, &b.dot]))
     })
 }
 
@@ -150,13 +152,31 @@ impl Model {
         let d = w.d;
         let zero_state = ops::zeros::<f32>(&[d.lv_heads, LVD, LKD])?;
         let zero_hist = ops::zeros::<f32>(&[CONV_K - 1, d.conv_width()])?;
-        let delta = (0..slots).map(|_| (0..n_delta).map(|_| DeltaState::new(&zero_state, &zero_hist)).collect()).collect();
+        let delta =
+            (0..slots).map(|_| (0..n_delta).map(|_| DeltaState::new(&zero_state, &zero_hist)).collect()).collect();
         let vocab = d.vocab;
-        Ok(Model { w, slots, max_ctx, kv: (0..slots).map(|_| Vec::new()).collect(), cap: vec![0; slots], delta,
-                   zero_state, zero_hist, end: vec![0; slots], ck: vec![0; slots], hpos: vec![-3; slots],
-                   seen: vec![vec![0; vocab.div_ceil(64)]; slots], outs: vec![vec![0; vocab / 32]; slots],
-                   logits: None, hidden: None, draft_dist: vec![Vec::new(); slots], draft_end: vec![0; slots],
-                   rows: Vec::new(), ids: Vec::new(), fused: DeltaStages::new(d) })
+        Ok(Model {
+            w,
+            slots,
+            max_ctx,
+            kv: (0..slots).map(|_| Vec::new()).collect(),
+            cap: vec![0; slots],
+            delta,
+            zero_state,
+            zero_hist,
+            end: vec![0; slots],
+            ck: vec![0; slots],
+            hpos: vec![-3; slots],
+            seen: vec![vec![0; vocab.div_ceil(64)]; slots],
+            outs: vec![vec![0; vocab / 32]; slots],
+            logits: None,
+            hidden: None,
+            draft_dist: vec![Vec::new(); slots],
+            draft_end: vec![0; slots],
+            rows: Vec::new(),
+            ids: Vec::new(),
+            fused: DeltaStages::new(d),
+        })
     }
 
     /// Whether token `id` is in slot `slot`'s seen set (repetition penalty)
@@ -180,7 +200,8 @@ impl Model {
         let s = || ops::zeros::<f32>(&[NKV, more as i32, 1]);
         if self.cap[slot] == 0 {
             let n_attn = self.w.counts().0 + usize::from(self.w.mtp.is_some());
-            self.kv[slot] = (0..n_attn).map(|_| Ok(Kv { k: q()?, ks: s()?, v: q()?, vs: s()? })).collect::<MResult<_>>()?;
+            self.kv[slot] =
+                (0..n_attn).map(|_| Ok(Kv { k: q()?, ks: s()?, v: q()?, vs: s()? })).collect::<MResult<_>>()?;
         } else {
             let (q, s) = (q()?, s()?);
             for c in self.kv[slot].iter_mut() {
@@ -213,14 +234,24 @@ impl Model {
         let mut used = vec![false; self.slots];
         for (i, t) in toks.iter().enumerate() {
             let s = t.slot as usize;
-            ensure!(s < self.slots && (t.pos as usize) < self.max_ctx && (t.id as usize) < self.w.d.vocab,
-                    "token {t:?} out of range");
+            ensure!(
+                s < self.slots && (t.pos as usize) < self.max_ctx && (t.id as usize) < self.w.d.vocab,
+                "token {t:?} out of range"
+            );
             match segs.last_mut() {
                 Some(g) if g.slot == s && g.pos0 + g.b - g.a == t.pos as usize => g.b = i + 1,
                 _ => {
                     ensure!(!std::mem::replace(&mut used[s], true), "slot {s} twice in one step");
-                    segs.push(Segment { a: i, b: i + 1, slot: s, pos0: t.pos as usize,
-                                        replay: None, hfrom: 0, ck: 0, hpos: 0 });
+                    segs.push(Segment {
+                        a: i,
+                        b: i + 1,
+                        slot: s,
+                        pos0: t.pos as usize,
+                        replay: None,
+                        hfrom: 0,
+                        ck: 0,
+                        hpos: 0,
+                    });
                 }
             }
         }
@@ -240,10 +271,18 @@ impl Model {
             .as_dtype(Dtype::Float16)?;
         let x = m.fc.apply_draft(&fused)?;
         let pos: Vec<i32> = toks.iter().map(|t| t.pos as i32).collect();
-        let mut cache = Cache { kv: &mut self.kv, delta: &mut self.delta, segs: &segs,
-                                rope: rope_tables(&pos)?, d: self.w.d, fused: &mut self.fused };
+        let mut cache = Cache {
+            kv: &mut self.kv,
+            delta: &mut self.delta,
+            segs: &segs,
+            rope: rope_tables(&pos)?,
+            d: self.w.d,
+            fused: &mut self.fused,
+        };
         let h = m.forward(&mut cache, &x, ai)?;
-        let logits = if out.is_empty() { None } else {
+        let logits = if out.is_empty() {
+            None
+        } else {
             let hf = w::rms(&take_rows(&h, out.iter().copied())?, &m.norm)?.as_dtype(Dtype::Float16)?;
             let head = m.head.as_ref().or(self.w.head.as_ref());
             Some(match head {
@@ -252,7 +291,9 @@ impl Model {
             })
         };
         transforms::eval([&h].into_iter().chain(logits.iter()).chain(kv_arrays(&self.kv)))?;
-        for g in &segs { self.draft_end[g.slot] = g.pos0 + g.b - g.a; }
+        for g in &segs {
+            self.draft_end[g.slot] = g.pos0 + g.b - g.a;
+        }
         Ok((h, logits))
     }
 
@@ -260,8 +301,8 @@ impl Model {
         let h = take_rows(&self.w.embed, toks.iter().map(|t| t.id as usize))?.as_dtype(Dtype::Float32)?;
         let pos: Vec<i32> = toks.iter().map(|x| x.pos as i32).collect();
         let rope = rope_tables(&pos)?;
-        let mut cache = Cache { kv: &mut self.kv, delta: &mut self.delta, segs, rope, d: self.w.d,
-                                fused: &mut self.fused };
+        let mut cache =
+            Cache { kv: &mut self.kv, delta: &mut self.delta, segs, rope, d: self.w.d, fused: &mut self.fused };
         let prompt = segs.iter().any(|g| g.pos0 == 0) || toks.len() > SPEC_TOK;
         let h = self.w.layers(&mut cache, h, prompt)?;
         self.hidden = self.w.mtp.as_ref().map(|_| h.clone());
@@ -326,7 +367,8 @@ impl DeltaStages {
 
     #[cfg(not(has_metal))]
     fn token(&mut self, small: bool, s: &Array, t: delta::Tok) -> MResult<(Array, Array)> {
-        let mut r = self.token.call(small, &[s.clone(), t.kq.clone(), t.v.clone(), t.e.clone(), t.b.clone(), t.dot.clone()])?;
+        let mut r =
+            self.token.call(small, &[s.clone(), t.kq.clone(), t.v.clone(), t.e.clone(), t.b.clone(), t.dot.clone()])?;
         let o = r.pop().unwrap();
         Ok((r.pop().unwrap(), o))
     }
@@ -386,23 +428,41 @@ impl w::Mix for Cache<'_> {
             // CUDA's tensor-core attention product. f16 inputs take MLX's fused flash-attention kernel; f32 inputs
             // fall back to a path that materializes the [len][end] scores.
             let read = |x: &Array, s: &Array| -> MResult<Array> {
-                ops::expand_dims(ops::multiply(x.index((.., ..end, ..)).as_dtype(Dtype::Float32)?,
-                                               s.index((.., ..end, ..)))?.as_dtype(Dtype::Float16)?, 0)
+                ops::expand_dims(
+                    ops::multiply(x.index((.., ..end, ..)).as_dtype(Dtype::Float32)?, s.index((.., ..end, ..)))?
+                        .as_dtype(Dtype::Float16)?,
+                    0,
+                )
             };
             // Query positions pos0..end are the last `len` of the `end` cached keys, so the built-in causal mask is
             // exact (it needs no materialized array); a single decode query attends to everything (no mask).
             let mask = (len > 1).then_some(ScaledDotProductAttentionMask::Causal);
             let qh = ops::expand_dims(heads(q)?.as_dtype(Dtype::Float16)?, 0)?;
-            let o = fast::scaled_dot_product_attention(qh, read(&c.k, &c.ks)?, read(&c.v, &c.vs)?,
-                                                       1.0 / (HD as f32).sqrt(), mask, None)?;
+            let o = fast::scaled_dot_product_attention(
+                qh,
+                read(&c.k, &c.ks)?,
+                read(&c.v, &c.vs)?,
+                1.0 / (HD as f32).sqrt(),
+                mask,
+                None,
+            )?;
             parts.push(ops::swap_axes(&o.reshape(&[self.d.nh, len, HD])?.as_dtype(Dtype::Float32)?, 0, 1)?);
         }
         ops::concatenate(&parts, 0)
     }
 
     #[cfg_attr(has_metal, allow(unused_variables))]
-    fn delta(&mut self, di: usize, layer: &Layer, small: bool, qkv: &Array, z: &Array, beta: &Array, log_decay: &Array,
-             decay: &Array) -> MResult<Array> {
+    fn delta(
+        &mut self,
+        di: usize,
+        layer: &Layer,
+        small: bool,
+        qkv: &Array,
+        z: &Array,
+        beta: &Array,
+        log_decay: &Array,
+        decay: &Array,
+    ) -> MResult<Array> {
         let d = self.d;
         let (cw, norm_w) = (layer.conv_w.as_ref().unwrap(), layer.delta_norm.as_ref().unwrap());
         let mut parts = Vec::with_capacity(self.segs.len());
@@ -426,8 +486,16 @@ impl w::Mix for Cache<'_> {
                     if r > 0 && len as usize > SEQ_MAX {
                         let bank = bank.expect("a bank to replay from");
                         let r = r as i32;
-                        s = super::metal::delta(&s, &bank.kq.index(..r), &bank.v.index(..r), &bank.e.index(..r),
-                                                &bank.b.index(..r), &bank.dot.index(..r), 0)?.0;
+                        s = super::metal::delta(
+                            &s,
+                            &bank.kq.index(..r),
+                            &bank.v.index(..r),
+                            &bank.e.index(..r),
+                            &bank.b.index(..r),
+                            &bank.dot.index(..r),
+                            0,
+                        )?
+                        .0;
                     }
                     #[cfg(not(has_metal))]
                     for i in 0..r as i32 {
@@ -451,7 +519,12 @@ impl w::Mix for Cache<'_> {
                     let (s2, ck, y) = match g.replay {
                         Some(r) if r > 0 => {
                             let bank = st.bank.as_ref().expect("a bank to replay from");
-                            super::metal::delta_replay(&s, [&bank.kq, &bank.v, &bank.e, &bank.b], r as i32, [kq, v, &e, &bt, dot])?
+                            super::metal::delta_replay(
+                                &s,
+                                [&bank.kq, &bank.v, &bank.e, &bank.b],
+                                r as i32,
+                                [kq, v, &e, &bt, dot],
+                            )?
                         }
                         _ => {
                             let (s2, _, y) = super::metal::delta(&s, kq, v, &e, &bt, dot, 0)?;
@@ -467,8 +540,11 @@ impl w::Mix for Cache<'_> {
                     let mut ys = Vec::with_capacity(len as usize);
                     for t in 0..len {
                         let r = |x: &Array| delta::row(x, t);
-                        let (s2, y) = fused.token(small, &s, delta::Tok { kq: &r(kq)?, v: &r(v)?, e: &r(&e)?, b: &r(&bt)?,
-                                                                         dot: &r(dot)? })?;
+                        let (s2, y) = fused.token(
+                            small,
+                            &s,
+                            delta::Tok { kq: &r(kq)?, v: &r(v)?, e: &r(&e)?, b: &r(&bt)?, dot: &r(dot)? },
+                        )?;
                         s = s2;
                         ys.push(y);
                     }
@@ -481,7 +557,8 @@ impl w::Mix for Cache<'_> {
                 let dot = ops::sum_axis(ops::multiply(&q1, &k1)?, -1, false)?;
                 #[cfg(has_metal)]
                 let (y, s_end, s_ck) = {
-                    let (s_end, s_ck, y) = super::metal::delta(&s, &ops::stack(&[&k1, &q1], -1)?, &v, &e, &bt, &dot, cko)?;
+                    let (s_end, s_ck, y) =
+                        super::metal::delta(&s, &ops::stack(&[&k1, &q1], -1)?, &v, &e, &bt, &dot, cko)?;
                     (y, s_end, s_ck)
                 };
                 #[cfg(not(has_metal))]
@@ -493,14 +570,20 @@ impl w::Mix for Cache<'_> {
                     let front = (CH - cko % CH) % CH;
                     let back = (CH - (front + len) % CH) % CH;
                     let p = |x: &Array| pad_rows(x, front, back);
-                    let (y, s_end, s_ck) = delta::chunked(&s, &p(&q)?, &p(&k)?, &p(&v)?, &p(&lg)?, &p(&bt)?, front + cko)?;
+                    let (y, s_end, s_ck) =
+                        delta::chunked(&s, &p(&q)?, &p(&k)?, &p(&v)?, &p(&lg)?, &p(&bt)?, front + cko)?;
                     (y.index(front..front + len), s_end, s_ck)
                 };
                 st.ck_state = s_ck;
                 s = s_end;
                 let tail = |x: &Array| own(&x.index(cko..));
-                st.bank = Some(Bank { kq: ops::stack(&[&k1.index(cko..), &q1.index(cko..)], -1)?, v: tail(&v)?, e: tail(&e)?,
-                                      b: tail(&bt)?, dot: tail(&dot)? });
+                st.bank = Some(Bank {
+                    kq: ops::stack(&[&k1.index(cko..), &q1.index(cko..)], -1)?,
+                    v: tail(&v)?,
+                    e: tail(&e)?,
+                    b: tail(&bt)?,
+                    dot: tail(&dot)?,
+                });
                 o = y;
             }
             st.state = s;
@@ -517,15 +600,32 @@ fn l2(x: &Array) -> MResult<Array> {
 }
 
 impl Engine for Model {
-    fn slots(&self) -> usize { self.slots }
-    fn max_ctx(&self) -> usize { self.max_ctx }
-    fn max_tok(&self) -> usize { MAX_TOK }
-    fn max_out(&self) -> usize { MAX_OUT }
-    fn spec_tok(&self) -> usize { SPEC_TOK }
-    fn vocab(&self) -> usize { self.w.d.vocab }
+    fn slots(&self) -> usize {
+        self.slots
+    }
+    fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+    fn max_tok(&self) -> usize {
+        MAX_TOK
+    }
+    fn max_out(&self) -> usize {
+        MAX_OUT
+    }
+    fn spec_tok(&self) -> usize {
+        SPEC_TOK
+    }
+    fn vocab(&self) -> usize {
+        self.w.d.vocab
+    }
 
     fn step(&mut self, toks: &[Tok], out: &[usize], marks: Option<&[Vec<u32>]>) -> Result<()> {
-        ensure!((1..=MAX_TOK).contains(&toks.len()) && out.len() <= MAX_OUT, "step of {} tokens, {} rows", toks.len(), out.len());
+        ensure!(
+            (1..=MAX_TOK).contains(&toks.len()) && out.len() <= MAX_OUT,
+            "step of {} tokens, {} rows",
+            toks.len(),
+            out.len()
+        );
         ensure!(out.iter().all(|&r| r < toks.len()), "an output row beyond the step");
         let mut segs = self.segments(toks)?;
         ensure!(marks.is_none_or(|m| m.len() == segs.len()), "marks per segment");
@@ -536,9 +636,12 @@ impl Engine for Model {
             }
             let (end, len) = (self.end[s], g.b - g.a);
             if g.pos0 != end {
-                ensure!(self.ck[s] <= g.pos0 && g.pos0 < end,
-                        "slot {s} restarts at {}: its last step ended at {end}, rollback reaches back to {}",
-                        g.pos0, self.ck[s]);
+                ensure!(
+                    self.ck[s] <= g.pos0 && g.pos0 < end,
+                    "slot {s} restarts at {}: its last step ended at {end}, rollback reaches back to {}",
+                    g.pos0,
+                    self.ck[s]
+                );
                 g.replay = Some(g.pos0 - self.ck[s]);
             }
             g.hfrom = (g.pos0 as isize - 3 - self.hpos[s]) as usize;
@@ -563,23 +666,30 @@ impl Engine for Model {
         self.w.learn_drafts(&committed)?;
         let logits = self.forward(toks, &segs, out)?;
         // Commit logits and all lazy state writes together; no graph may span engine steps.
-        transforms::eval(logits.iter().chain(self.hidden.iter()).chain(kv_arrays(&self.kv)).chain(delta_arrays(&self.delta)))?;
+        transforms::eval(
+            logits.iter().chain(self.hidden.iter()).chain(kv_arrays(&self.kv)).chain(delta_arrays(&self.delta)),
+        )?;
         for g in &segs {
             self.end[g.slot] = g.pos0 + g.b - g.a;
             self.ck[g.slot] = g.ck;
             self.hpos[g.slot] = g.hpos;
         }
-        self.rows = out.iter().map(|&r| {
-            let g = segs.iter().find(|g| (g.a..g.b).contains(&r)).unwrap();
-            (g.slot, g.a, r)
-        }).collect();
+        self.rows = out
+            .iter()
+            .map(|&r| {
+                let g = segs.iter().find(|g| (g.a..g.b).contains(&r)).unwrap();
+                (g.slot, g.a, r)
+            })
+            .collect();
         self.ids = toks.iter().map(|t| t.id).collect();
         self.logits = logits;
         Ok(())
     }
 
     fn logits(&self) -> Result<Vec<f32>> {
-        if self.rows.is_empty() { return Ok(Vec::new()); }
+        if self.rows.is_empty() {
+            return Ok(Vec::new());
+        }
         w::host(self.logits.as_ref().context("no step yet")?)
     }
 
@@ -588,47 +698,71 @@ impl Engine for Model {
     }
 
     fn argmax(&self) -> Result<Vec<u32>> {
-        if self.rows.is_empty() { return Ok(Vec::new()); }
+        if self.rows.is_empty() {
+            return Ok(Vec::new());
+        }
         let a = argmax_axis(self.logits.as_ref().context("no step yet")?, -1, false)?.as_dtype(Dtype::Uint32)?;
         a.eval()?;
         Ok(a.as_slice::<u32>().to_vec())
     }
 
     fn set_outputs(&mut self, slot: u32, words: &[u32]) -> Result<()> {
-        ensure!((slot as usize) < self.slots && words.len() == self.w.d.vocab / 32,
-                "outputs of slot {slot}: {} words", words.len());
+        ensure!(
+            (slot as usize) < self.slots && words.len() == self.w.d.vocab / 32,
+            "outputs of slot {slot}: {} words",
+            words.len()
+        );
         self.outs[slot as usize].copy_from_slice(words);
         Ok(())
     }
 
     fn sample(&mut self, params: &[[f32; 8]]) -> Result<Vec<(u32, bool)>> {
         ensure!(params.len() == self.rows.len(), "{} sampling rows for {} logit rows", params.len(), self.rows.len());
-        if params.is_empty() { return Ok(Vec::new()); }
+        if params.is_empty() {
+            return Ok(Vec::new());
+        }
         let all = self.logits()?;
         let vocab = self.w.d.vocab;
-        Ok(self.rows.iter().zip(params).enumerate().map(|(j, (&(slot, first, tok), p))| {
-            let step = |id: u32| self.ids[first + 1..=tok].contains(&id);
-            let seen = |id: u32| self.is_seen(slot, id) || step(id);
-            let generated = |id: u32| self.is_output(slot, id) || step(id);
-            if p[6] <= -2.0 {
-                let mut row = *p;
-                row[6] = -p[6] - 2.0;
-                let t = tok - first;
-                sample_row_q(&all[j * vocab..(j + 1) * vocab], seen, generated, &row,
-                             &self.draft_dist[slot][t].0)
-            } else {
-                sample_row(&all[j * vocab..(j + 1) * vocab], seen, generated, p)
-            }
-        }).collect())
+        Ok(self
+            .rows
+            .iter()
+            .zip(params)
+            .enumerate()
+            .map(|(j, (&(slot, first, tok), p))| {
+                let step = |id: u32| self.ids[first + 1..=tok].contains(&id);
+                let seen = |id: u32| self.is_seen(slot, id) || step(id);
+                let generated = |id: u32| self.is_output(slot, id) || step(id);
+                if p[6] <= -2.0 {
+                    let mut row = *p;
+                    row[6] = -p[6] - 2.0;
+                    let t = tok - first;
+                    sample_row_q(&all[j * vocab..(j + 1) * vocab], seen, generated, &row, &self.draft_dist[slot][t].0)
+                } else {
+                    sample_row(&all[j * vocab..(j + 1) * vocab], seen, generated, p)
+                }
+            })
+            .collect())
     }
 
-    fn has_draft(&self) -> bool { self.w.mtp.is_some() }
-    fn draft_capacity(&self) -> usize { KEEP.min(SPEC_TOK.saturating_sub(1)) }
+    fn has_draft(&self) -> bool {
+        self.w.mtp.is_some()
+    }
+    fn draft_capacity(&self) -> usize {
+        KEEP.min(SPEC_TOK.saturating_sub(1))
+    }
 
-    fn draft(&mut self, toks: &[Tok], rows: &[usize], out: &[usize], k: usize, sampling: &[Option<DraftSampling>])
-    -> Result<Vec<Vec<u32>>> {
-        ensure!(toks.len() == rows.len() && !toks.is_empty() && toks.len() <= MAX_TOK,
-                "MTP tokens/hidden rows mismatch");
+    fn draft(
+        &mut self,
+        toks: &[Tok],
+        rows: &[usize],
+        out: &[usize],
+        k: usize,
+        sampling: &[Option<DraftSampling>],
+    ) -> Result<Vec<Vec<u32>>> {
+        ensure!(
+            toks.len() == rows.len() && !toks.is_empty() && toks.len() <= MAX_TOK,
+            "MTP tokens/hidden rows mismatch"
+        );
         ensure!(k <= KEEP && out.len() <= MAX_OUT && out.iter().all(|&r| r < toks.len()), "MTP draft shape");
         ensure!(sampling.is_empty() || sampling.len() == out.len(), "MTP sampling rows mismatch");
         let hidden = self.hidden.as_ref().context("MTP needs a target step")?;
@@ -636,11 +770,15 @@ impl Engine for Model {
         // Match qwenny's MTP reference: the backbone's final hidden state, after its final norm.
         let h = w::rms(&take_rows(hidden, rows.iter().copied())?, &self.w.final_norm)?;
         let mut chains = vec![Vec::new(); out.len()];
-        for &r in out { self.draft_dist[toks[r].slot as usize].clear(); }
+        for &r in out {
+            self.draft_dist[toks[r].slot as usize].clear();
+        }
         let (mut h, mut logits) = self.mtp_forward(toks, &h, if k == 0 { &[] } else { out })?;
         let mut cur: Vec<Tok> = out.iter().map(|&r| toks[r]).collect();
         for t in 0..k {
-            if out.is_empty() { break; }
+            if out.is_empty() {
+                break;
+            }
             let l = logits.take().context("no MTP logits")?;
             let ids = &self.w.mtp.as_ref().unwrap().ids;
             ensure!(l.shape()[1] as usize == ids.len(), "MTP head and draft vocabulary sizes differ");
@@ -653,20 +791,33 @@ impl Engine for Model {
                     let log = w::host(&l.index(j as i32))?;
                     // Expand the fixed head into token-id order: ties and penalty membership use real ids.
                     let mut full = vec![f32::NEG_INFINITY; self.w.d.vocab];
-                    for (&id, &v) in ids.iter().zip(&log) { full[id as usize] = v; }
-                    let seen = |id: u32| self.is_seen(slot, id) || toks.iter().any(|x| x.slot as usize == slot && x.id == id)
-                        || chains[j].contains(&id);
+                    for (&id, &v) in ids.iter().zip(&log) {
+                        full[id as usize] = v;
+                    }
+                    let seen = |id: u32| {
+                        self.is_seen(slot, id)
+                            || toks.iter().any(|x| x.slot as usize == slot && x.id == id)
+                            || chains[j].contains(&id)
+                    };
                     let generated = |id: u32| self.is_output(slot, id) || chains[j].contains(&id);
                     let (p, kept) = kept_dist(&full, &seen, &generated, &s.row);
                     let u = s.u.get(t).copied().unwrap_or(0.5);
                     let mut cum = 0.0;
-                    let at = p.iter().position(|&v| { cum += v; cum >= u }).unwrap_or(p.len() - 1);
+                    let at = p
+                        .iter()
+                        .position(|&v| {
+                            cum += v;
+                            cum >= u
+                        })
+                        .unwrap_or(p.len() - 1);
                     let id = kept[at];
                     let mut q: Vec<_> = kept.into_iter().zip(p).collect();
                     q.sort_by_key(|x| x.0);
                     self.draft_dist[slot].push((q, id));
                     id
-                } else { ids[am[j] as usize] };
+                } else {
+                    ids[am[j] as usize]
+                };
                 chains[j].push(id);
                 cur[j].id = id;
                 cur[j].pos += 1;
@@ -697,18 +848,21 @@ impl Engine for Model {
     }
 
     fn warmup(&mut self, draft_depth: usize) -> Result<()> {
-        if self.max_ctx < 4 { return Ok(()); }
+        if self.max_ctx < 4 {
+            return Ok(());
+        }
         // Empty marks: these synthetic inputs never affect the learned vocabulary or penalties.
         let marks = vec![Vec::new()];
-        self.step(&[Tok {id:0,slot:0,pos:0}],&[0],Some(&marks))?;
-        self.step(&[Tok {id:0,slot:0,pos:1}],&[0],Some(&marks))?;
+        self.step(&[Tok { id: 0, slot: 0, pos: 0 }], &[0], Some(&marks))?;
+        self.step(&[Tok { id: 0, slot: 0, pos: 1 }], &[0], Some(&marks))?;
         let n = (draft_depth + 1).min(self.max_ctx - 2).min(SPEC_TOK);
-        let toks: Vec<Tok> = (0..n).map(|i| Tok {id:0,slot:0,pos:2+i as u32}).collect();
+        let toks: Vec<Tok> = (0..n).map(|i| Tok { id: 0, slot: 0, pos: 2 + i as u32 }).collect();
         let rows: Vec<usize> = (0..n).collect();
-        self.step(&toks,&rows,Some(&marks))?;
+        self.step(&toks, &rows, Some(&marks))?;
         if draft_depth > 0 && self.has_draft() && 2 + n + draft_depth < self.max_ctx {
-            let sampling = DraftSampling {row:[1.0,20.0,0.95,1.0,0.0,0.0,-1.0,0.0],u:vec![0.5;draft_depth]};
-            self.draft(&toks,&rows,&[n-1],draft_depth,&[Some(sampling)])?;
+            let sampling =
+                DraftSampling { row: [1.0, 20.0, 0.95, 1.0, 0.0, 0.0, -1.0, 0.0], u: vec![0.5; draft_depth] };
+            self.draft(&toks, &rows, &[n - 1], draft_depth, &[Some(sampling)])?;
         }
         self.release(0)?;
         self.logits = None;
@@ -718,7 +872,9 @@ impl Engine for Model {
         Ok(())
     }
 
-    fn sync(&self) -> Result<()> { Ok(()) }
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -732,54 +888,64 @@ mod tests {
         let mut m = Model::load(&dir, 8192, 1, true)?;
         let seed = m.w.mtp.as_ref().unwrap().ids.clone();
         ensure!(m.w.mtp.as_ref().unwrap().adaptive.is_some(), "adaptive head disabled");
-        let pt: Vec<Tok> = seed[..8].iter().enumerate().map(|(i,&id)| Tok { id,slot:0,pos:i as u32 }).collect();
-        m.run(&pt,&[7])?;
-        let ds = DraftSampling { row:[1.0,20.0,0.95,1.0,0.0,0.0,-1.0,0.0],u:vec![0.25] };
-        m.draft(&[Tok {id:seed[1],slot:0,pos:7}],&[7],&[0],1,&[Some(ds)])?;
-        let before_q = m.draft_q(0,0)?;
+        let pt: Vec<Tok> = seed[..8].iter().enumerate().map(|(i, &id)| Tok { id, slot: 0, pos: i as u32 }).collect();
+        m.run(&pt, &[7])?;
+        let ds = DraftSampling { row: [1.0, 20.0, 0.95, 1.0, 0.0, 0.0, -1.0, 0.0], u: vec![0.25] };
+        m.draft(&[Tok { id: seed[1], slot: 0, pos: 7 }], &[7], &[0], 1, &[Some(ds)])?;
+        let before_q = m.draft_q(0, 0)?;
         let vocab = m.vocab();
         let missing = |m: &Model, count: usize| -> Vec<u32> {
-            let mut have = vec![false;vocab];
-            for &id in &m.w.mtp.as_ref().unwrap().ids { have[id as usize]=true; }
+            let mut have = vec![false; vocab];
+            for &id in &m.w.mtp.as_ref().unwrap().ids {
+                have[id as usize] = true;
+            }
             (0..vocab as u32).filter(|&id| !have[id as usize]).take(count).collect()
         };
         let verify_rows = |m: &Model, rows: &[usize]| -> Result<()> {
             let head = m.w.mtp.as_ref().unwrap();
             let ids: Vec<u32> = rows.iter().map(|&r| head.ids[r]).collect();
-            let idx = Array::from_slice(&ids,&[ids.len() as i32]).as_dtype(Dtype::Int32)?;
+            let idx = Array::from_slice(&ids, &[ids.len() as i32]).as_dtype(Dtype::Int32)?;
             let r: Vec<i32> = rows.iter().map(|&r| r as i32).collect();
-            let ridx = Array::from_slice(&r,&[r.len() as i32]);
-            for (src,draft) in m.w.head.as_ref().unwrap().arrays().into_iter().zip(head.head.as_ref().unwrap().arrays()) {
-                let equal = ops::all(ops::eq(src.take_axis(&idx,0)?,draft.take_axis(&ridx,0)?)?,None)?;
+            let ridx = Array::from_slice(&r, &[r.len() as i32]);
+            for (src, draft) in
+                m.w.head.as_ref().unwrap().arrays().into_iter().zip(head.head.as_ref().unwrap().arrays())
+            {
+                let equal = ops::all(ops::eq(src.take_axis(&idx, 0)?, draft.take_axis(&ridx, 0)?)?, None)?;
                 equal.eval()?;
                 ensure!(equal.item_exact::<bool>(), "draft row differs from the stored target output matrix");
             }
             Ok(())
         };
-        let new = missing(&m,16);
+        let new = missing(&m, 16);
         m.w.learn_drafts(&new[..15])?;
-        assert_eq!(m.w.mtp.as_ref().unwrap().ids.len(),seed.len());
+        assert_eq!(m.w.mtp.as_ref().unwrap().ids.len(), seed.len());
         m.w.learn_drafts(&new[15..])?;
-        assert_eq!(&m.w.mtp.as_ref().unwrap().ids[seed.len()..],&new);
-        verify_rows(&m,&(seed.len()..seed.len()+16).collect::<Vec<_>>())?;
-        assert_eq!(m.draft_q(0,0)?,before_q,"head growth changed a distribution already drawn");
-        let remaining = crate::draft_vocab::MAX_ROWS-m.w.mtp.as_ref().unwrap().ids.len();
-        let extra = missing(&m,remaining);
+        assert_eq!(&m.w.mtp.as_ref().unwrap().ids[seed.len()..], &new);
+        verify_rows(&m, &(seed.len()..seed.len() + 16).collect::<Vec<_>>())?;
+        assert_eq!(m.draft_q(0, 0)?, before_q, "head growth changed a distribution already drawn");
+        let remaining = crate::draft_vocab::MAX_ROWS - m.w.mtp.as_ref().unwrap().ids.len();
+        let extra = missing(&m, remaining);
         m.w.learn_drafts(&extra)?;
-        assert_eq!(m.w.mtp.as_ref().unwrap().ids.len(),crate::draft_vocab::MAX_ROWS);
-        for _ in 0..3 { m.w.learn_drafts(&seed[..16])?; }
-        let replace = missing(&m,16);
+        assert_eq!(m.w.mtp.as_ref().unwrap().ids.len(), crate::draft_vocab::MAX_ROWS);
+        for _ in 0..3 {
+            m.w.learn_drafts(&seed[..16])?;
+        }
+        let replace = missing(&m, 16);
         m.w.learn_drafts(&replace)?;
         let head = m.w.mtp.as_ref().unwrap();
-        for id in &seed[..16] { assert!(head.ids.contains(id),"a hot row was evicted"); }
-        let changed: Vec<usize> = replace.iter().map(|id| head.ids.iter().position(|v|v==id).unwrap()).collect();
-        verify_rows(&m,&changed)?;
-        assert_eq!(m.draft_q(0,0)?,before_q,"replacement changed an existing sampled distribution");
+        for id in &seed[..16] {
+            assert!(head.ids.contains(id), "a hot row was evicted");
+        }
+        let changed: Vec<usize> = replace.iter().map(|id| head.ids.iter().position(|v| v == id).unwrap()).collect();
+        verify_rows(&m, &changed)?;
+        assert_eq!(m.draft_q(0, 0)?, before_q, "replacement changed an existing sampled distribution");
         let saved_ids = m.w.mtp.as_ref().unwrap().ids.clone();
         drop(m);
-        let restored = crate::draft_vocab::Adaptive::load(&dir,vocab,&seed)?;
-        assert_eq!(restored.ids(),saved_ids,"learned vocabulary did not survive reload");
-        println!("adaptive head: 16-row growth, packed target rows, cold replacement, hot-row retention, old q and reload OK");
+        let restored = crate::draft_vocab::Adaptive::load(&dir, vocab, &seed)?;
+        assert_eq!(restored.ids(), saved_ids, "learned vocabulary did not survive reload");
+        println!(
+            "adaptive head: 16-row growth, packed target rows, cold replacement, hot-row retention, old q and reload OK"
+        );
         Ok(())
     }
 }

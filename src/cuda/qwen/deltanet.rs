@@ -33,7 +33,11 @@ pub struct Kernels {
 
 impl Kernels {
     pub fn load(m: &Arc<CudaModule>) -> Result<Self> {
-        Ok(Kernels { conv: m.load_function("delta_conv")?, rule: m.load_function("delta_rule")?, norm: m.load_function("delta_norm")? })
+        Ok(Kernels {
+            conv: m.load_function("delta_conv")?,
+            rule: m.load_function("delta_rule")?,
+            norm: m.load_function("delta_norm")?,
+        })
     }
 }
 
@@ -66,15 +70,23 @@ pub struct DeltaNet {
 
 impl DeltaNet {
     /// `prefix`: e.g. "model.language_model.layers.0.linear_attn"
-    pub fn new(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, d: &Dims, prefix: &str, slots: usize)
-               -> Result<Self> {
+    pub fn new(
+        s: &Arc<CudaStream>,
+        pool: &Arc<Pool>,
+        w: &Checkpoint,
+        d: &Dims,
+        prefix: &str,
+        slots: usize,
+    ) -> Result<Self> {
         let (lv_heads, lqkv) = (d.lv_heads, d.lqkv());
         // replay entry per position: k (per key head), v, exp(g), beta
         let rep = LK_HEADS * LKD + lv_heads * LVD + 2 * lv_heads;
         let f = |n: &str| Ok::<_, anyhow::Error>(w.floats(&format!("{prefix}.{n}"))?.0);
         let (conv_w, a_log, dt_bias, norm_w) = (f("conv1d.weight")?, f("A_log")?, f("dt_bias")?, f("norm.weight")?);
-        ensure!(conv_w.len() == lqkv * 4 && a_log.len() == lv_heads && dt_bias.len() == lv_heads && norm_w.len() == LVD,
-                "{prefix}: unexpected DeltaNet weight shapes");
+        ensure!(
+            conv_w.len() == lqkv * 4 && a_log.len() == lv_heads && dt_bias.len() == lv_heads && norm_w.len() == LVD,
+            "{prefix}: unexpected DeltaNet weight shapes"
+        );
         let meta: Vec<i32> = (0..slots * META).map(|i| if i % META == 0 { -1 } else { 0 }).collect();
         let parts = (lv_heads * LVD * LKD, KEEP * rep, CR * lqkv);
         let page = pool.page() / 4;
@@ -101,14 +113,47 @@ impl DeltaNet {
         let (sp, n, segs, bsp) = (split as i32, st.n as i32, st.segs as i32, ba_split as i32);
         let (mem, ss) = (self.mem.ptr(), self.ss as i64);
         unsafe {
-            s.launch_builder(&k.conv).arg(&b.part).arg(&sp).arg(&n).arg(&b.ba).arg(&bsp).arg(&self.conv_w).arg(&self.a_log)
-                .arg(&self.dt_bias).arg(&mem).arg(&ss).arg(cv).arg(&st.tok_slot).arg(&st.tok_pos)
+            s.launch_builder(&k.conv)
+                .arg(&b.part)
+                .arg(&sp)
+                .arg(&n)
+                .arg(&b.ba)
+                .arg(&bsp)
+                .arg(&self.conv_w)
+                .arg(&self.a_log)
+                .arg(&self.dt_bias)
+                .arg(&mem)
+                .arg(&ss)
+                .arg(cv)
+                .arg(&st.tok_slot)
+                .arg(&st.tok_pos)
                 .launch(cfg((lqkv / 128, st.n.div_ceil(4), 1), 128))?;
-            s.launch_builder(&k.rule).arg(&b.part).arg(&sp).arg(&n).arg(cv).arg(&mem).arg(&ss).arg(&self.meta)
-                .arg(&b.o).arg(&st.seg_start).arg(&st.seg_len).arg(&st.seg_slot).arg(&st.seg_pos0)
+            s.launch_builder(&k.rule)
+                .arg(&b.part)
+                .arg(&sp)
+                .arg(&n)
+                .arg(cv)
+                .arg(&mem)
+                .arg(&ss)
+                .arg(&self.meta)
+                .arg(&b.o)
+                .arg(&st.seg_start)
+                .arg(&st.seg_len)
+                .arg(&st.seg_slot)
+                .arg(&st.seg_pos0)
                 .launch(cfg((LVD / CPB, lv_heads, st.segs), CPB * LPC))?;
-            s.launch_builder(&k.norm).arg(&b.part).arg(&sp).arg(&n).arg(&self.norm_w).arg(&b.o).arg(&b.mix).arg(&self.meta)
-                .arg(&st.seg_len).arg(&st.seg_slot).arg(&st.seg_pos0).arg(&segs)
+            s.launch_builder(&k.norm)
+                .arg(&b.part)
+                .arg(&sp)
+                .arg(&n)
+                .arg(&self.norm_w)
+                .arg(&b.o)
+                .arg(&b.mix)
+                .arg(&self.meta)
+                .arg(&st.seg_len)
+                .arg(&st.seg_slot)
+                .arg(&st.seg_pos0)
+                .arg(&segs)
                 .launch(cfg((st.n, lv_heads / 16, 1), 16 * 32))?;
         }
         Ok(())
@@ -161,7 +206,12 @@ impl DeltaNet {
 
     /// Set slot `slot` (mapped) to a state from save at position `pos`: the next step continues there
     pub fn load(&mut self, s: &Arc<CudaStream>, slot: usize, data: &[u8], pos: i32) -> Result<()> {
-        ensure!(data.len() == self.saved_bytes(), "a DeltaNet state of {} bytes, not {}", data.len(), self.saved_bytes());
+        ensure!(
+            data.len() == self.saved_bytes(),
+            "a DeltaNet state of {} bytes, not {}",
+            data.len(),
+            self.saved_bytes()
+        );
         let (base, ring, row) = (slot * self.ss * 4, (2 * self.parts.0 + 2 * self.parts.1) * 4, self.parts.2 / CR * 4);
         let (state, rows) = data.split_at(self.parts.0 * 4);
         self.mem.write(base, state)?;

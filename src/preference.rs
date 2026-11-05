@@ -41,7 +41,8 @@ pub fn is_preference(data: &Path) -> Result<bool> {
     let (train, _) = training::data_paths(data)?;
     let rows = training::read_rows(&train)?;
     let Some((line, first)) = rows.first() else { return Ok(false) };
-    let row: Json = serde_json::from_str(first).with_context(|| format!("{}:{line}: not a JSON object", train.display()))?;
+    let row: Json =
+        serde_json::from_str(first).with_context(|| format!("{}:{line}: not a JSON object", train.display()))?;
     Ok(row.get("chosen").is_some() || row.get("rejected").is_some())
 }
 
@@ -53,18 +54,32 @@ fn encode_pairs(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &st
         let at = format!("{name}:{line}");
         let row: Json = serde_json::from_str(text).with_context(|| format!("{at}: not a JSON object"))?;
         let Some(messages) = row["messages"].as_array().filter(|m| !m.is_empty()) else {
-            bail!("{at}: no \"messages\" list (the prompt); a preference row is {{\"messages\": [{{\"role\": \"user\", \
-                   \"content\": ...}}], \"chosen\": {{\"role\": \"assistant\", \"content\": ...}}, \"rejected\": {{...}}}}");
+            bail!(
+                "{at}: no \"messages\" list (the prompt); a preference row is {{\"messages\": [{{\"role\": \"user\", \
+                   \"content\": ...}}], \"chosen\": {{\"role\": \"assistant\", \"content\": ...}}, \"rejected\": {{...}}}}"
+            );
         };
-        ensure!(messages.last().unwrap()["role"] != "assistant",
-                "{at}: the prompt ends with an assistant message; \"chosen\" and \"rejected\" are the replies to it");
+        ensure!(
+            messages.last().unwrap()["role"] != "assistant",
+            "{at}: the prompt ends with an assistant message; \"chosen\" and \"rejected\" are the replies to it"
+        );
         let kw = training::row_kwargs(&defaults, &row, name, *line)?;
         let mut encode = |key: &str| -> Result<Option<Example>> {
             let Some(r) = row[key].as_object() else { bail!("{at}: no \"{key}\" object (an assistant message)") };
-            ensure!(r.get("role").is_none_or(|x| x == "assistant"), "{at}: \"{key}\" has role {}, not assistant", r["role"]);
-            let has = |k: &str| r.get(k).is_some_and(|v| v.as_str().is_some_and(|c| !c.trim().is_empty())
-                || v.as_array().is_some_and(|c| !c.is_empty()));
-            ensure!(has("content") || has("reasoning_content") || has("reasoning") || has("tool_calls"), "{at}: \"{key}\" is empty");
+            ensure!(
+                r.get("role").is_none_or(|x| x == "assistant"),
+                "{at}: \"{key}\" has role {}, not assistant",
+                r["role"]
+            );
+            let has = |k: &str| {
+                r.get(k).is_some_and(|v| {
+                    v.as_str().is_some_and(|c| !c.trim().is_empty()) || v.as_array().is_some_and(|c| !c.is_empty())
+                })
+            };
+            ensure!(
+                has("content") || has("reasoning_content") || has("reasoning") || has("tool_calls"),
+                "{at}: \"{key}\" is empty"
+            );
             let mut reply = r.clone();
             reply.insert("role".into(), json!("assistant"));
             let mut msgs = messages.clone();
@@ -91,15 +106,30 @@ fn encode_pairs(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &st
     }
     let lines = |v: &mut Vec<usize>| {
         v.dedup();
-        format!("line{} {:?}{}", if v.len() > 1 { "s" } else { "" }, &v[..v.len().min(10)], if v.len() > 10 { " ..." } else { "" })
+        format!(
+            "line{} {:?}{}",
+            if v.len() > 1 { "s" } else { "" },
+            &v[..v.len().min(10)],
+            if v.len() > 10 { " ..." } else { "" }
+        )
     };
     if !cut.is_empty() {
-        eprintln!("warning: {name}: responses longer than --max-len={max_len} (with the prompt) are cut ({}){}", lines(&mut cut),
-                  if lost.is_empty() { String::new() } else { format!("; {} pairs lose a whole response and are left out ({})",
-                                                                       lost.len(), lines(&mut lost)) });
+        eprintln!(
+            "warning: {name}: responses longer than --max-len={max_len} (with the prompt) are cut ({}){}",
+            lines(&mut cut),
+            if lost.is_empty() {
+                String::new()
+            } else {
+                format!("; {} pairs lose a whole response and are left out ({})", lost.len(), lines(&mut lost))
+            }
+        );
     }
     if !same.is_empty() {
-        eprintln!("warning: {name}: {} pairs whose chosen and rejected are the same are left out ({})", same.len(), lines(&mut same));
+        eprintln!(
+            "warning: {name}: {} pairs whose chosen and rejected are the same are left out ({})",
+            same.len(),
+            lines(&mut same)
+        );
     }
     ensure!(!out.is_empty(), "{name}: no pairs");
     Ok(out)
@@ -186,8 +216,14 @@ impl Terms {
             loss: self.loss,
             log: json!({"dev_loss": self.loss, "dev_dpo": self.dpo, "dev_nll": self.nll, "dev_margin": self.margin,
                         "dev_accuracy": self.accuracy}),
-            text: format!("loss {:.4} (DPO {:.4}, NLL {:.4}), margin {:+.4}, positive margin {:.1}%", self.loss, self.dpo,
-                          self.nll, self.margin, self.accuracy * 100.0),
+            text: format!(
+                "loss {:.4} (DPO {:.4}, NLL {:.4}), margin {:+.4}, positive margin {:.1}%",
+                self.loss,
+                self.dpo,
+                self.nll,
+                self.margin,
+                self.accuracy * 100.0
+            ),
         }
     }
 }
@@ -213,7 +249,13 @@ pub fn terms(po: &PrefOpts, pairs: &[&Pair], lp: &[(f64, f64)], rf: &[(f64, f64)
 
 /// One optimizer step's passes over `pairs` (reference log-probabilities `rf`): adds the gradients of the mean RPO
 /// loss over the pairs to the arena. Returns the policy's log-probabilities (chosen, rejected) of each pair.
-pub fn step_passes(tr: &Trainer, po: &PrefOpts, pairs: &[&Pair], rf: &[(f64, f64)], step: u64) -> Result<Vec<(f64, f64)>> {
+pub fn step_passes(
+    tr: &Trainer,
+    po: &PrefOpts,
+    pairs: &[&Pair],
+    rf: &[(f64, f64)],
+    step: u64,
+) -> Result<Vec<(f64, f64)>> {
     let seqs = seqs(pairs);
     let (micros, place) = pack_pairs(&seqs, tr.tmax);
     // a pair over two micro-batches: the rejected response's log-probability before the chosen one's backward pass
@@ -258,35 +300,61 @@ pub fn step_passes(tr: &Trainer, po: &PrefOpts, pairs: &[&Pair], rf: &[(f64, f64
 pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOpts, po: PrefOpts) -> Result<()> {
     let run = Run::load(model, data, out, o, &to, "pairs", encode_pairs)?;
     let (train, dev) = (&run.train, &run.dev);
-    let lmax = train.iter().chain(dev).flat_map(|p| [&p.chosen, &p.rejected]).map(|e| e.ids.len()).max().context("no pairs")?;
+    let lmax = train
+        .iter()
+        .chain(dev)
+        .flat_map(|p| [&p.chosen, &p.rejected])
+        .map(|e| e.ids.len())
+        .max()
+        .context("no pairs")?;
     let tokens = |pairs: &[&Pair]| -> usize { pairs.iter().map(|p| p.chosen.ids.len() + p.rejected.ids.len()).sum() };
     let train_refs: Vec<&Pair> = train.iter().collect();
     let dev_refs: Vec<&Pair> = dev.iter().collect();
-    println!("preference training (RPO: DPO beta {} + {} x NLL of the chosen response): {} pairs, {} tokens, {} dev \
-              pairs; longest response with its prompt {lmax} tokens", po.beta, po.nll, train.len(), tokens(&train_refs),
-             dev.len());
+    println!(
+        "preference training (RPO: DPO beta {} + {} x NLL of the chosen response): {} pairs, {} tokens, {} dev \
+              pairs; longest response with its prompt {lmax} tokens",
+        po.beta,
+        po.nll,
+        train.len(),
+        tokens(&train_refs),
+        dev.len()
+    );
     let mut tr = run.trainer(lmax)?;
 
     // the reference policy: the starting point, its log-probabilities once
     let tr0 = Instant::now();
     let rf_train = logps(&tr, &train_refs)?;
     let rf_dev = logps(&tr, &dev_refs)?;
-    println!("reference log-probabilities of {} responses in {:.1}s ({})", 2 * (train.len() + dev.len()),
-             tr0.elapsed().as_secs_f64(), if run.init.is_some() { "the --init-adapter, frozen" } else { "the base model" });
+    println!(
+        "reference log-probabilities of {} responses in {:.1}s ({})",
+        2 * (train.len() + dev.len()),
+        tr0.elapsed().as_secs_f64(),
+        if run.init.is_some() { "the --init-adapter, frozen" } else { "the base model" }
+    );
     // at the start the policy is the reference: margin 0
     let start = (!dev.is_empty()).then(|| terms(&po, &dev_refs, &rf_dev, &rf_dev).dev());
-    run.fit(&mut tr, &to, json!({"beta": po.beta, "nll_weight": po.nll}), start, |tr, chunk, step| {
-        let pairs: Vec<&Pair> = chunk.iter().map(|&i| &train[i]).collect();
-        let rf: Vec<(f64, f64)> = chunk.iter().map(|&i| rf_train[i]).collect();
-        let lp = step_passes(tr, &po, &pairs, &rf, step as u64)?;
-        let t = terms(&po, &pairs, &lp, &rf);
-        Ok(Step {
-            tokens: tokens(&pairs),
-            log: json!({"loss": t.loss, "dpo": t.dpo, "nll": t.nll, "margin": t.margin, "accuracy": t.accuracy,
+    run.fit(
+        &mut tr,
+        &to,
+        json!({"beta": po.beta, "nll_weight": po.nll}),
+        start,
+        |tr, chunk, step| {
+            let pairs: Vec<&Pair> = chunk.iter().map(|&i| &train[i]).collect();
+            let rf: Vec<(f64, f64)> = chunk.iter().map(|&i| rf_train[i]).collect();
+            let lp = step_passes(tr, &po, &pairs, &rf, step as u64)?;
+            let t = terms(&po, &pairs, &lp, &rf);
+            Ok(Step {
+                tokens: tokens(&pairs),
+                log: json!({"loss": t.loss, "dpo": t.dpo, "nll": t.nll, "margin": t.margin, "accuracy": t.accuracy,
                         "reward_chosen": t.chosen, "reward_rejected": t.rejected}),
-            text: format!("loss {:.4}  dpo {:.4}  nll {:.4}  margin {:+.4}  acc {:.2}", t.loss, t.dpo, t.nll, t.margin, t.accuracy),
-        })
-    }, |tr| Ok(terms(&po, &dev_refs, &logps(tr, &dev_refs)?, &rf_dev).dev()))
+                text: format!(
+                    "loss {:.4}  dpo {:.4}  nll {:.4}  margin {:+.4}  acc {:.2}",
+                    t.loss, t.dpo, t.nll, t.margin, t.accuracy
+                ),
+            })
+        },
+        |tr| Ok(terms(&po, &dev_refs, &logps(tr, &dev_refs)?, &rf_dev).dev()),
+    )
 }
 
 /// `qwenny dpocheck`: against tools/make_dpo_reference.py: the pairs' token ids and masks (the rows are in the
@@ -300,7 +368,13 @@ pub fn dpocheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Result
     let r = SafeTensors::deserialize(&bytes)?;
     let po = PrefOpts { beta: training::ref_f32(&r, "beta")?[0], nll: training::ref_f32(&r, "alpha")?[0] };
     let chat = Chat::load(model)?;
-    let rows: Vec<(usize, String)> = meta.get("pairs").context("no pairs in the reference's metadata")?.lines().enumerate().map(|(i, l)| (i + 1, l.to_string())).collect();
+    let rows: Vec<(usize, String)> = meta
+        .get("pairs")
+        .context("no pairs in the reference's metadata")?
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.to_string()))
+        .collect();
     let pairs = encode_pairs(&chat, &rows, usize::MAX, "pairs")?;
     let (mut ids_ok, mut mask_ok) = (0, 0);
     for (i, p) in pairs.iter().enumerate() {
@@ -321,7 +395,13 @@ pub fn dpocheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Result
     let mut o = o;
     o.dropout = 0.0;
     o.layers = training::ref_i32(&r, "layers").map_or(0, |l| l[0] as usize);
-    let mode = if o.f32 { "f32" } else if o.f16 { "f16" } else { "bf16" };
+    let mode = if o.f32 {
+        "f32"
+    } else if o.f16 {
+        "f16"
+    } else {
+        "bf16"
+    };
     let mut tr = Trainer::new(model, o, tmax, lmax, 0)?;
     let named = |prefix: &str| -> Result<std::collections::HashMap<String, Vec<f32>>> {
         Ok(training::ref_params(&r, prefix)?.into_iter().map(|(n, v)| (training::trainer_name(&n), v)).collect())
@@ -330,10 +410,20 @@ pub fn dpocheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Result
     let rf = logps(&tr, &refs)?;
     let want_rf = training::ref_f32(&r, "ref_logp")?;
     let want_lp = training::ref_f32(&r, "logp")?;
-    let worst = |got: &[(f64, f64)], want: &[f32]| got.iter().flat_map(|&(c, r)| [c, r]).zip(want)
-        .map(|(a, &b)| (a - b as f64).abs() / (b as f64).abs().max(1.0)).fold(0f64, f64::max);
-    println!("{} pairs ({}), {mode} build, beta {} alpha {}", pairs.len(),
-             if packed { "packed in one pass" } else { "one sequence per pass: every pair split" }, po.beta, po.nll);
+    let worst = |got: &[(f64, f64)], want: &[f32]| {
+        got.iter()
+            .flat_map(|&(c, r)| [c, r])
+            .zip(want)
+            .map(|(a, &b)| (a - b as f64).abs() / (b as f64).abs().max(1.0))
+            .fold(0f64, f64::max)
+    };
+    println!(
+        "{} pairs ({}), {mode} build, beta {} alpha {}",
+        pairs.len(),
+        if packed { "packed in one pass" } else { "one sequence per pass: every pair split" },
+        po.beta,
+        po.nll
+    );
     println!("reference log-probabilities: worst relative error {:.2e}", worst(&rf, &want_rf));
 
     training::apply_init(&mut tr, &named("init.")?)?;
@@ -343,8 +433,15 @@ pub fn dpocheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Result
     let g = |k: &str| -> Result<f64> { Ok(training::ref_f32(&r, k)?[0] as f64) };
     let (want_loss, want_dpo, want_nll, want_m) = (g("loss")?, g("dpo")?, g("nll")?, g("margin")?);
     println!("policy log-probabilities: worst relative error {:.2e}", worst(&lp, &want_lp));
-    println!("loss {:.6} vs reference {want_loss:.6} (diff {:.2e}); DPO {:.6} vs {want_dpo:.6}, NLL {:.6} vs {want_nll:.6}, \
-              margin {:+.6} vs {want_m:+.6}", t.loss, (t.loss - want_loss).abs(), t.dpo, t.nll, t.margin);
+    println!(
+        "loss {:.6} vs reference {want_loss:.6} (diff {:.2e}); DPO {:.6} vs {want_dpo:.6}, NLL {:.6} vs {want_nll:.6}, \
+              margin {:+.6} vs {want_m:+.6}",
+        t.loss,
+        (t.loss - want_loss).abs(),
+        t.dpo,
+        t.nll,
+        t.margin
+    );
     if let Ok(trl) = g("trl_loss") {
         println!("TRL's DPOTrainer (sigmoid + sft) on the same pairs: loss {trl:.6}");
     }

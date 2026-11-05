@@ -10,15 +10,15 @@ mod lora;
 pub mod train;
 
 use super::core::{self, Epi, Gemm, Graphs, MAX_OUT, MAX_TOK, Mat, SPEC_TOK, Step, cfg};
-use crate::engine::{DraftSampling, Engine, Tok};
 use crate::checkpoint::Checkpoint;
+use crate::cuda::vmm::{HostMapped, Pool};
+use crate::engine::{DraftSampling, Engine, Tok};
 use crate::lora::Adapter;
 use anyhow::{Context, Result, bail, ensure};
 use attn::Attn;
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, PushKernelArg};
 use deltanet::DeltaNet;
 use draft::DraftHead;
-use crate::cuda::vmm::{HostMapped, Pool};
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
 /// Device memory left to other allocations (CUDA graphs, the driver) when the per-slot caches take the rest
@@ -59,9 +59,21 @@ pub struct Dims {
 impl Dims {
     /// The sizes with kernels: name, dims, PTX
     const SIZES: [(&str, Dims, &str); 3] = [
-        ("Qwen3.5-4B", Dims { h: 2560, ff: 9216, nh: 16, lv_heads: 32 }, include_str!(concat!(env!("OUT_DIR"), "/qwen4b.ptx"))),
-        ("Qwen3.5-9B", Dims { h: 4096, ff: 12288, nh: 16, lv_heads: 32 }, include_str!(concat!(env!("OUT_DIR"), "/qwen9b.ptx"))),
-        ("Qwen3.8-27B", Dims { h: 5120, ff: 17408, nh: 24, lv_heads: 48 }, include_str!(concat!(env!("OUT_DIR"), "/qwen27b.ptx"))),
+        (
+            "Qwen3.5-4B",
+            Dims { h: 2560, ff: 9216, nh: 16, lv_heads: 32 },
+            include_str!(concat!(env!("OUT_DIR"), "/qwen4b.ptx")),
+        ),
+        (
+            "Qwen3.5-9B",
+            Dims { h: 4096, ff: 12288, nh: 16, lv_heads: 32 },
+            include_str!(concat!(env!("OUT_DIR"), "/qwen9b.ptx")),
+        ),
+        (
+            "Qwen3.8-27B",
+            Dims { h: 5120, ff: 17408, nh: 24, lv_heads: 48 },
+            include_str!(concat!(env!("OUT_DIR"), "/qwen27b.ptx")),
+        ),
     ];
 
     /// q_proj's rows: per head [q; gate]
@@ -95,29 +107,52 @@ impl Dims {
         let d = Self::parse(config.get("text_config").unwrap_or(config))?;
         match Self::SIZES.iter().find(|(_, s, _)| *s == d) {
             Some(&(_, _, ptx)) => Ok((d, ptx)),
-            None => bail!("a model of hidden size {}, {} query heads: kernels are built for {}", d.h, d.nh,
-                          Self::SIZES.map(|s| s.0).join(", ")),
+            None => bail!(
+                "a model of hidden size {}, {} query heads: kernels are built for {}",
+                d.h,
+                d.nh,
+                Self::SIZES.map(|s| s.0).join(", ")
+            ),
         }
     }
 
     /// A text config (`text_config` of the checkpoint's config.json), checked against what the kernels fix (any size)
     fn parse(tc: &serde_json::Value) -> Result<Dims> {
         let get = |k: &str| tc[k].as_u64().map(|v| v as usize);
-        let fixed = [("num_key_value_heads", NKV), ("head_dim", HD), ("linear_num_key_heads", LK_HEADS),
-                     ("linear_key_head_dim", LKD), ("linear_value_head_dim", LVD), ("linear_conv_kernel_dim", CONV_K)];
+        let fixed = [
+            ("num_key_value_heads", NKV),
+            ("head_dim", HD),
+            ("linear_num_key_heads", LK_HEADS),
+            ("linear_key_head_dim", LKD),
+            ("linear_value_head_dim", LVD),
+            ("linear_conv_kernel_dim", CONV_K),
+        ];
         for (key, want) in fixed {
             ensure!(get(key) == Some(want), "config {key} = {}, expected {want}", tc[key]);
         }
-        ensure!(tc["rms_norm_eps"].as_f64().is_some_and(|e| (e - EPS as f64).abs() < 1e-12), "rms_norm_eps {}", tc["rms_norm_eps"]);
-        ensure!(tc["attn_output_gate"].as_bool() == Some(true) && tc["attention_bias"].as_bool() == Some(false),
-                "attention without the output gate or with biases");
+        ensure!(
+            tc["rms_norm_eps"].as_f64().is_some_and(|e| (e - EPS as f64).abs() < 1e-12),
+            "rms_norm_eps {}",
+            tc["rms_norm_eps"]
+        );
+        ensure!(
+            tc["attn_output_gate"].as_bool() == Some(true) && tc["attention_bias"].as_bool() == Some(false),
+            "attention without the output gate or with biases"
+        );
         let rope = &tc["rope_parameters"];
-        ensure!(rope["rope_type"] == "default" && rope["rope_theta"].as_f64() == Some(attn::THETA)
-                && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64), "rope {rope}");
+        ensure!(
+            rope["rope_type"] == "default"
+                && rope["rope_theta"].as_f64() == Some(attn::THETA)
+                && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64),
+            "rope {rope}"
+        );
         ensure!(get("vocab_size") == Some(VOCAB), "vocab_size {}: the kernels are built for {VOCAB}", tc["vocab_size"]);
-        Ok(Dims { h: get("hidden_size").context("hidden_size")?, ff: get("intermediate_size").context("intermediate_size")?,
-                  nh: get("num_attention_heads").context("num_attention_heads")?,
-                  lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")? })
+        Ok(Dims {
+            h: get("hidden_size").context("hidden_size")?,
+            ff: get("intermediate_size").context("intermediate_size")?,
+            nh: get("num_attention_heads").context("num_attention_heads")?,
+            lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")?,
+        })
     }
 }
 
@@ -167,15 +202,31 @@ impl Layer {
     /// The layer whose tensors start with `p` (model.language_model.layers.{i}, or mtp.layers.0), of kind `kind`
     /// (config.json layer_types)
     #[allow(clippy::too_many_arguments)]
-    fn load(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, d: &Dims, p: &str, kind: &str, slots: usize,
-            max_ctx: usize, int8: bool, adapter: Lora) -> Result<Self> {
+    fn load(
+        s: &Arc<CudaStream>,
+        pool: &Arc<Pool>,
+        w: &Checkpoint,
+        d: &Dims,
+        p: &str,
+        kind: &str,
+        slots: usize,
+        max_ctx: usize,
+        int8: bool,
+        adapter: Lora,
+    ) -> Result<Self> {
         let names = |a: &str, ns: &[&str]| ns.iter().map(|n| format!("{p}.{a}.{n}.weight")).collect::<Vec<_>>();
         let mat = |a: &str, ns: &[&str], silu: bool| Mat::stack(s, w, &names(a, ns), silu, int8);
         // per kind: the mixer's tensors, its in-projection with each module's rows, DeltaNet's [in_proj_b; in_proj_a], its
         // out-projection
         let (lv, kv) = (d.lv_heads * LVD, NKV * HD);
         let (a, inp, inp_rows, ba, out): (&str, &[&str], Vec<usize>, &[&str], &str) = match kind {
-            "linear_attention" => ("linear_attn", &["in_proj_qkv", "in_proj_z"], vec![d.lqkv(), lv], &["in_proj_b", "in_proj_a"], "out_proj"),
+            "linear_attention" => (
+                "linear_attn",
+                &["in_proj_qkv", "in_proj_z"],
+                vec![d.lqkv(), lv],
+                &["in_proj_b", "in_proj_a"],
+                "out_proj",
+            ),
             "full_attention" => ("self_attn", &["q_proj", "k_proj", "v_proj"], vec![d.q_rows(), kv, kv], &[], "o_proj"),
             other => bail!("{p}: unknown type {other:?}"),
         };
@@ -186,13 +237,20 @@ impl Layer {
         };
         let in_proj = mat(a, inp, false)?;
         let out_proj = mat(a, &[out], false)?;
-        ensure!(in_proj.tiles * 16 == inp_rows.iter().sum::<usize>() && out_proj.cols == d.mix(),
-                "{p}: in-projection of {} rows", in_proj.tiles * 16);
+        ensure!(
+            in_proj.tiles * 16 == inp_rows.iter().sum::<usize>() && out_proj.cols == d.mix(),
+            "{p}: in-projection of {} rows",
+            in_proj.tiles * 16
+        );
         let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(w, &format!("{p}.{n}.weight"))?)?) };
         // the adapter's A and B of the layer's products, in their row order
         let lora = match adapter {
             Some((ad, used)) => {
-                let st = |a: &str, ns: &[&str], rows: &[usize], silu: bool| lora::Stacked { names: names(a, ns), rows: rows.to_vec(), silu };
+                let st = |a: &str, ns: &[&str], rows: &[usize], silu: bool| lora::Stacked {
+                    names: names(a, ns),
+                    rows: rows.to_vec(),
+                    silu,
+                };
                 let ba = (!ba.is_empty()).then(|| st(a, ba, &[d.lv_heads, d.lv_heads], false));
                 let (inp, out) = (st(a, inp, &inp_rows, false), st(a, &[out], &[d.h], false));
                 let stacks: Vec<lora::Stacked> = std::iter::once(inp).chain(ba).collect();
@@ -276,24 +334,53 @@ struct Stack {
 impl Stack {
     /// `int8`: int8 weights (else f16); `only`: just this layer; `adapter`: a LoRA served unmerged (lora.rs). Also
     /// returns the checkpoint.
-    fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, only: Option<usize>, mut adapter: Lora)
-    -> Result<(Self, Checkpoint)> {
+    fn load(
+        dir: &Path,
+        max_ctx: usize,
+        slots: usize,
+        int8: bool,
+        only: Option<usize>,
+        mut adapter: Lora,
+    ) -> Result<(Self, Checkpoint)> {
         let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
         let tc = config.get("text_config").unwrap_or(&config);
         let (d, ptx) = Dims::of(&config)?;
         ensure!(max_ctx.is_multiple_of(64) && max_ctx > 0, "context {max_ctx}: a multiple of 64");
         let (s, m) = core::open(ptx)?;
         let f = |n: &str| m.load_function(n);
-        let k = Kernels { embed: f("embed")?, embed_q8: f("embed_q8")?, rmsnorm: f("rmsnorm")?, add_rmsnorm: f("add_rmsnorm")?,
-                          to_xin: f("to_xin")?, mtp_in: f("mtp_in")?, sum_parts: f("sum_parts")?,
-                          attn: attn::Kernels::load(&m)?,
-                          delta: deltanet::Kernels::load(&m)? };
+        let k = Kernels {
+            embed: f("embed")?,
+            embed_q8: f("embed_q8")?,
+            rmsnorm: f("rmsnorm")?,
+            add_rmsnorm: f("add_rmsnorm")?,
+            to_xin: f("to_xin")?,
+            mtp_in: f("mtp_in")?,
+            sum_parts: f("sum_parts")?,
+            attn: attn::Kernels::load(&m)?,
+            delta: deltanet::Kernels::load(&m)?,
+        };
         let w = Checkpoint::open(dir)?;
         let pool = Pool::new(&s)?;
-        let kinds: Vec<&str> = tc["layer_types"].as_array().context("layer_types")?.iter().map(|k| k.as_str().unwrap_or("?")).collect();
-        let layers = kinds.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i))
-            .map(|(i, kind)| Layer::load(&s, &pool, &w, &d, &format!("{ROOT}.layers.{i}"), kind, slots,
-                                max_ctx, int8, adapter.as_mut().map(|(a, u)| (*a, &mut **u))))
+        let kinds: Vec<&str> =
+            tc["layer_types"].as_array().context("layer_types")?.iter().map(|k| k.as_str().unwrap_or("?")).collect();
+        let layers = kinds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| only.is_none_or(|o| o == *i))
+            .map(|(i, kind)| {
+                Layer::load(
+                    &s,
+                    &pool,
+                    &w,
+                    &d,
+                    &format!("{ROOT}.layers.{i}"),
+                    kind,
+                    slots,
+                    max_ctx,
+                    int8,
+                    adapter.as_mut().map(|(a, u)| (*a, &mut **u)),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         ensure!(!layers.is_empty(), "no layer {only:?}");
         let z = |n: usize| s.alloc_zeros::<f32>(n);
@@ -315,8 +402,18 @@ impl Stack {
             cv: z(MAX_TOK * deltanet::cv_width(&d))?,
         };
         let st = Step::new(&s, &m, slots, max_ctx, VOCAB, attn::segments(d.nh / NKV))?;
-        let x = Stack { mm: Gemm::load(&s, &m, d.h)?, lk: lora::Kernels::load(&m)?, scales: z(slots)?, k, st, d,
-                        layers, b, s, pool };
+        let x = Stack {
+            mm: Gemm::load(&s, &m, d.h)?,
+            lk: lora::Kernels::load(&m)?,
+            scales: z(slots)?,
+            k,
+            st,
+            d,
+            layers,
+            b,
+            s,
+            pool,
+        };
         x.set_budget()?;
         Ok((x, w))
     }
@@ -348,8 +445,11 @@ impl Stack {
                     Mixer::Delta(d) => d.map(slot)?,
                 };
                 let (used, budget) = pool.usage();
-                ensure!(ok, "the cache is full: {used} of {budget} pages of {} MiB in use (slot {slot} at {len})",
-                        pool.page() >> 20);
+                ensure!(
+                    ok,
+                    "the cache is full: {used} of {budget} pages of {} MiB in use (slot {slot} at {len})",
+                    pool.page() >> 20
+                );
             }
         }
         Ok(())
@@ -360,7 +460,13 @@ impl Stack {
         self.layers.iter_mut().chain(extra).map(|l| &mut l.mixer)
     }
 
-    fn gemm<Y: cudarc::driver::DeviceRepr>(&self, w: &Mat, x: &CudaSlice<u16>, y: &CudaSlice<Y>, epi: Epi) -> Result<usize> {
+    fn gemm<Y: cudarc::driver::DeviceRepr>(
+        &self,
+        w: &Mat,
+        x: &CudaSlice<u16>,
+        y: &CudaSlice<Y>,
+        epi: Epi,
+    ) -> Result<usize> {
         self.mm.run(&self.s, &self.st, w, x, y, epi)
     }
 
@@ -369,8 +475,16 @@ impl Stack {
         let (b, n) = (&self.b, self.st.n);
         let (split, ni, eps) = (split as i32, n as i32, EPS);
         unsafe {
-            self.s.launch_builder(&self.k.add_rmsnorm).arg(&b.h).arg(&b.part).arg(&split).arg(&ni).arg(w_next)
-                .arg(&b.xn).arg(&eps).launch(cfg((n, 1, 1), 512))?;
+            self.s
+                .launch_builder(&self.k.add_rmsnorm)
+                .arg(&b.h)
+                .arg(&b.part)
+                .arg(&split)
+                .arg(&ni)
+                .arg(w_next)
+                .arg(&b.xn)
+                .arg(&eps)
+                .launch(cfg((n, 1, 1), 512))?;
         }
         Ok(())
     }
@@ -389,7 +503,13 @@ impl Stack {
     }
 
     /// xa = A x into `lpart`, then y += s B xa (lora.rs); returns xa's split
-    fn lora_add(&self, a: &lora::LoraA, b: Option<&lora::LoraB>, x: &CudaSlice<u16>, y: &CudaSlice<f32>) -> Result<usize> {
+    fn lora_add(
+        &self,
+        a: &lora::LoraA,
+        b: Option<&lora::LoraB>,
+        x: &CudaSlice<u16>,
+        y: &CudaSlice<f32>,
+    ) -> Result<usize> {
         let xs = self.gemm(&a.a, x, &self.b.lpart, Epi::Plain)?;
         if let Some(b) = b {
             a.add(self, xs, b, y)?;
@@ -411,7 +531,12 @@ impl Stack {
         let c = Ctx { s: &self.s, st: &self.st, b, k: &self.k, d: &self.d };
         match &l.mixer {
             Mixer::Delta(d) => {
-                let bsp = self.gemm(l.in_ba.as_ref().context("DeltaNet layer without in_proj_b/a")?, &b.xn, &b.ba, Epi::Plain)?;
+                let bsp = self.gemm(
+                    l.in_ba.as_ref().context("DeltaNet layer without in_proj_b/a")?,
+                    &b.xn,
+                    &b.ba,
+                    Epi::Plain,
+                )?;
                 if let Some((a, _, Some(bb))) = inp {
                     a.add(self, xs, bb, &b.ba)?;
                 }
@@ -474,13 +599,35 @@ impl Embed {
 
     /// out[t] = the embedding of ids[t] for n tokens (f32 [n][H]); clears the first nk argmax keys
     #[allow(clippy::too_many_arguments)] // a kernel launch: stream, kernels, in/out buffers, keys, counts
-    fn launch(&self, s: &Arc<CudaStream>, k: &Kernels, ids: &CudaSlice<i32>, out: &CudaSlice<f32>,
-              keys: &CudaSlice<u64>, nk: i32, n: usize) -> Result<()> {
+    fn launch(
+        &self,
+        s: &Arc<CudaStream>,
+        k: &Kernels,
+        ids: &CudaSlice<i32>,
+        out: &CudaSlice<f32>,
+        keys: &CudaSlice<u64>,
+        nk: i32,
+        n: usize,
+    ) -> Result<()> {
         unsafe {
             match self {
-                Embed::Bf16(e) => s.launch_builder(&k.embed).arg(e).arg(ids).arg(out).arg(keys).arg(&nk).launch(cfg((n, 1, 1), 256))?,
-                Embed::Q8(e, sc) => s.launch_builder(&k.embed_q8).arg(&e.ptr()).arg(&sc.ptr()).arg(ids).arg(out).arg(keys)
-                    .arg(&nk).launch(cfg((n, 1, 1), 256))?,
+                Embed::Bf16(e) => s
+                    .launch_builder(&k.embed)
+                    .arg(e)
+                    .arg(ids)
+                    .arg(out)
+                    .arg(keys)
+                    .arg(&nk)
+                    .launch(cfg((n, 1, 1), 256))?,
+                Embed::Q8(e, sc) => s
+                    .launch_builder(&k.embed_q8)
+                    .arg(&e.ptr())
+                    .arg(&sc.ptr())
+                    .arg(ids)
+                    .arg(out)
+                    .arg(keys)
+                    .arg(&nk)
+                    .launch(cfg((n, 1, 1), 256))?,
             };
         }
         Ok(())
@@ -529,8 +676,7 @@ pub struct Model {
 impl Model {
     /// `int8`: int8 weights (else f16); `adapter`: a LoRA served unmerged, for the slots that use it (set_adapter;
     /// none at first).
-    pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>)
-    -> Result<Self> {
+    pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>) -> Result<Self> {
         let mut used = HashSet::new();
         let (x, w) = Stack::load(dir, max_ctx, slots, int8, None, adapter.map(|a| (a, &mut used)))?;
         let e = format!("{ROOT}.embed_tokens.weight");
@@ -538,11 +684,22 @@ impl Model {
         let mtp = match w.has("mtp.fc.weight") {
             true => {
                 let (s, d) = (&x.s, &x.d);
-                let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(&w, &format!("mtp.{n}.weight"))?)?) };
+                let fl =
+                    |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(&w, &format!("mtp.{n}.weight"))?)?) };
                 Some(Mtp {
                     // unadapted: drafts are checked by the adapted model (an adapter of the MTP layer: refused below)
-                    layer: Layer::load(s, &x.pool, &w, d, "mtp.layers.0", "full_attention", x.st.slots, x.st.max_ctx, int8,
-                                       None)?,
+                    layer: Layer::load(
+                        s,
+                        &x.pool,
+                        &w,
+                        d,
+                        "mtp.layers.0",
+                        "full_attention",
+                        x.st.slots,
+                        x.st.max_ctx,
+                        int8,
+                        None,
+                    )?,
                     fc: Mat::stack(s, &w, &["mtp.fc.weight".to_string()], false, int8)?,
                     pre_e: fl("pre_fc_norm_embedding")?,
                     pre_h: fl("pre_fc_norm_hidden")?,
@@ -558,8 +715,13 @@ impl Model {
         if let Some(a) = adapter {
             let mut left: Vec<&String> = a.names().filter(|n| !used.contains(*n)).collect();
             left.sort();
-            ensure!(left.is_empty(), "the adapter changes {} matrices served without it here (e.g. {}): only the \
-                     language model's linear modules are (qwenny merge folds it into a bf16 model)", left.len(), left[0]);
+            ensure!(
+                left.is_empty(),
+                "the adapter changes {} matrices served without it here (e.g. {}): only the \
+                     language model's linear modules are (qwenny merge folds it into a bf16 model)",
+                left.len(),
+                left[0]
+            );
         }
         let lm_head = Mat::stack(&x.s, &w, &[head], false, int8)?;
         let final_norm = x.s.clone_htod(&norm(&w, &format!("{ROOT}.norm.weight"))?)?;
@@ -570,8 +732,11 @@ impl Model {
         model.x.set_budget()?;
         model.x.pool.fill()?;
         let (page, (_, budget)) = (model.x.pool.page(), model.x.pool.usage());
-        eprintln!("cache: {:.1} GiB of device memory for the slots' KV and DeltaNet states ({} tokens of KV)",
-                  (budget * page) as f64 / 1073741824.0, budget * page / model.kv_bytes_per_token());
+        eprintln!(
+            "cache: {:.1} GiB of device memory for the slots' KV and DeltaNet states ({} tokens of KV)",
+            (budget * page) as f64 / 1073741824.0,
+            budget * page / model.kv_bytes_per_token()
+        );
         Ok(model)
     }
 
@@ -583,7 +748,11 @@ impl Model {
         st.mark_seen(s)?;
         unsafe {
             self.embed.launch(s, k, &st.ids, &b.h, &st.keys, nk, st.n)?;
-            s.launch_builder(&k.rmsnorm).arg(&b.h).arg(&x.layers[0].input_norm).arg(&b.xn).arg(&eps)
+            s.launch_builder(&k.rmsnorm)
+                .arg(&b.h)
+                .arg(&x.layers[0].input_norm)
+                .arg(&b.xn)
+                .arg(&eps)
                 .launch(cfg((st.n, 1, 1), 256))?;
         }
         for (i, l) in x.layers.iter().enumerate() {
@@ -635,14 +804,32 @@ impl Model {
         // the tokens' embeddings into b.o (scratch here), then fc's input
         self.embed.launch(s, k, &st.ids, &b.o, &st.keys, nk, st.n)?;
         unsafe {
-            s.launch_builder(&k.mtp_in).arg(&b.o).arg(&b.h).arg(&m.rows).arg(fw).arg(&m.pre_e)
-                .arg(&m.pre_h).arg(&m.xin).arg(&eps).launch(cfg((st.n, 1, 1), 256))?;
+            s.launch_builder(&k.mtp_in)
+                .arg(&b.o)
+                .arg(&b.h)
+                .arg(&m.rows)
+                .arg(fw)
+                .arg(&m.pre_e)
+                .arg(&m.pre_h)
+                .arg(&m.xin)
+                .arg(&eps)
+                .launch(cfg((st.n, 1, 1), 256))?;
         }
         // the MTP's residual stream starts at fc's output: h = the sum of its partial products, xn = norm(h)
         let sp = x.gemm(&m.fc, &m.xin, &b.part, Epi::Plain)? as i32;
         unsafe {
-            s.launch_builder(&k.sum_parts).arg(&b.part).arg(&sp).arg(&n).arg(&h).arg(&b.h).launch(cfg((st.n, 1, 1), 256))?;
-            s.launch_builder(&k.rmsnorm).arg(&b.h).arg(&m.layer.input_norm).arg(&b.xn).arg(&eps)
+            s.launch_builder(&k.sum_parts)
+                .arg(&b.part)
+                .arg(&sp)
+                .arg(&n)
+                .arg(&h)
+                .arg(&b.h)
+                .launch(cfg((st.n, 1, 1), 256))?;
+            s.launch_builder(&k.rmsnorm)
+                .arg(&b.h)
+                .arg(&m.layer.input_norm)
+                .arg(&b.xn)
+                .arg(&eps)
                 .launch(cfg((st.n, 1, 1), 256))?;
         }
         x.layer(&m.layer, &m.norm)?;
@@ -680,8 +867,14 @@ impl Model {
     /// MTP drafts drawn on the device (Engine::draft): each step's drafts from its logits (the draft head's
     /// or the output layer's) under the rows' sampling (argmax rows: top_k 1, the argmax), fed to the next step on the
     /// device; the chains come back once at the end
-    fn draft_chains(&mut self, toks: &[Tok], rows: &[usize], out: &[usize], k: usize, sampling: &[Option<DraftSampling>])
-    -> Result<Vec<Vec<u32>>> {
+    fn draft_chains(
+        &mut self,
+        toks: &[Tok],
+        rows: &[usize],
+        out: &[usize],
+        k: usize,
+        sampling: &[Option<DraftSampling>],
+    ) -> Result<Vec<Vec<u32>>> {
         if k == 0 || out.is_empty() {
             self.mtp_launch(toks, rows, &[], false, false)?;
             return Ok(vec![Vec::new(); out.len()]);
@@ -706,14 +899,17 @@ impl Model {
 
     /// draft_sample over the last MTP step's rows; `t`: the drafts' index in their chains
     fn launch_drafts(&mut self, sampling: &[Option<DraftSampling>], t: usize) -> Result<()> {
-        let params: Vec<[f32; 8]> = sampling.iter().map(|s| match s {
-            Some(s) => {
-                let mut r = s.row;
-                (r[4], r[5]) = (s.u.get(t).copied().unwrap_or(0.5), t as f32);
-                r
-            }
-            None => crate::sample::argmax_draft_row(t),
-        }).collect();
+        let params: Vec<[f32; 8]> = sampling
+            .iter()
+            .map(|s| match s {
+                Some(s) => {
+                    let mut r = s.row;
+                    (r[4], r[5]) = (s.u.get(t).copied().unwrap_or(0.5), t as f32);
+                    r
+                }
+                None => crate::sample::argmax_draft_row(t),
+            })
+            .collect();
         let m = self.mtp.as_ref().context("no MTP layer in this model")?;
         let (width, ld, ids) = match &m.head {
             Some(h) => (h.mat.valid, h.mat.tiles * 16, Some(&h.ids)),
@@ -740,7 +936,6 @@ impl Model {
         let m = self.mtp.as_ref().unwrap();
         self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_mtp(m, own))
     }
-
 }
 
 /// One layer on its own (layercheck): its mixer and projections on given inputs.
@@ -765,7 +960,12 @@ impl LayerCheck {
         let sp = x.mix(&x.layers[0])?;
         let (spi, ni, ld) = (sp as i32, n as i32, h as i32);
         unsafe {
-            x.s.launch_builder(&x.k.sum_parts).arg(&x.b.part).arg(&spi).arg(&ni).arg(&ld).arg(&x.b.h)
+            x.s.launch_builder(&x.k.sum_parts)
+                .arg(&x.b.part)
+                .arg(&spi)
+                .arg(&ni)
+                .arg(&ld)
+                .arg(&x.b.h)
                 .launch(cfg((n, 1, 1), 256))?;
         }
         Ok(x.s.clone_dtoh(&x.b.h.slice(0..n * h))?)
@@ -830,10 +1030,13 @@ impl Engine for Model {
 
     fn save_kv(&mut self, slot: u32, from: usize, to: usize) -> Result<Vec<u8>> {
         self.x.s.synchronize()?;
-        let attn: Vec<&Attn> = self.all_layers().filter_map(|l| match &l.mixer {
-            Mixer::Attn(a) => Some(a),
-            Mixer::Delta(_) => None,
-        }).collect();
+        let attn: Vec<&Attn> = self
+            .all_layers()
+            .filter_map(|l| match &l.mixer {
+                Mixer::Attn(a) => Some(a),
+                Mixer::Delta(_) => None,
+            })
+            .collect();
         // one allocation (no copy as it would grow), each layer's part copied into it
         let n = attn.first().map_or(0, |a| a.saved_bytes(from, to));
         let mut data = crate::sessions::host_buf(attn.len() * n);
@@ -858,10 +1061,13 @@ impl Engine for Model {
     }
 
     fn image_bytes(&self, len: usize) -> usize {
-        self.all_layers().map(|l| match &l.mixer {
-            Mixer::Attn(a) => a.saved_bytes(0, len),
-            Mixer::Delta(d) => d.saved_bytes(),
-        }).sum::<usize>() + self.x.st.vocab / 8
+        self.all_layers()
+            .map(|l| match &l.mixer {
+                Mixer::Attn(a) => a.saved_bytes(0, len),
+                Mixer::Delta(d) => d.saved_bytes(),
+            })
+            .sum::<usize>()
+            + self.x.st.vocab / 8
     }
 
     fn truncate(&mut self, slot: u32, from: usize) -> Result<()> {
@@ -874,10 +1080,12 @@ impl Engine for Model {
     }
 
     fn slot_bytes(&self, len: usize) -> usize {
-        self.all_layers().map(|l| match &l.mixer {
-            Mixer::Attn(a) => a.slot_bytes(len),
-            Mixer::Delta(d) => d.slot_bytes(),
-        }).sum::<usize>()
+        self.all_layers()
+            .map(|l| match &l.mixer {
+                Mixer::Attn(a) => a.slot_bytes(len),
+                Mixer::Delta(d) => d.slot_bytes(),
+            })
+            .sum::<usize>()
     }
 
     fn release(&mut self, slot: u32) -> Result<()> {
@@ -983,10 +1191,20 @@ impl Engine for Model {
     }
 
     /// xn after a step holds the final norm of every token of the step (f16)
-    fn draft(&mut self, toks: &[Tok], rows: &[usize], out: &[usize], k: usize, sampling: &[Option<DraftSampling>])
-    -> Result<Vec<Vec<u32>>> {
-        ensure!(sampling.is_empty() || sampling.len() == out.len(), "{} draft samplings for {} rows",
-                sampling.len(), out.len());
+    fn draft(
+        &mut self,
+        toks: &[Tok],
+        rows: &[usize],
+        out: &[usize],
+        k: usize,
+        sampling: &[Option<DraftSampling>],
+    ) -> Result<Vec<Vec<u32>>> {
+        ensure!(
+            sampling.is_empty() || sampling.len() == out.len(),
+            "{} draft samplings for {} rows",
+            sampling.len(),
+            out.len()
+        );
         let argmax = vec![None; out.len()];
         self.draft_chains(toks, rows, out, k, if sampling.is_empty() { &argmax } else { sampling })
     }

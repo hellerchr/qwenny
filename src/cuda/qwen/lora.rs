@@ -54,19 +54,31 @@ pub struct Stacked {
 
 /// A's of the stacked products `stacks` that read one input of `cols` columns, and each product's B; None when the
 /// adapter changes none of them. `used`: the adapter's matrices taken (all must be: Model::load).
-pub fn load(s: &Arc<CudaStream>, ad: &Adapter, stacks: &[Stacked], cols: usize, used: &mut HashSet<String>)
--> Result<Option<(LoraA, Vec<Option<LoraB>>)>> {
+pub fn load(
+    s: &Arc<CudaStream>,
+    ad: &Adapter,
+    stacks: &[Stacked],
+    cols: usize,
+    used: &mut HashSet<String>,
+) -> Result<Option<(LoraA, Vec<Option<LoraB>>)>> {
     let (mut a, mut r) = (Vec::new(), 0);
     // per stack, per module: its column in xa
     let mut offs: Vec<Vec<i32>> = Vec::new();
     for st in stacks {
-        ensure!(st.names.len() <= 4 && st.names.len() == st.rows.len() && (!st.silu || st.names.len() == 2),
-                "a stack of {} modules", st.names.len());
+        ensure!(
+            st.names.len() <= 4 && st.names.len() == st.rows.len() && (!st.silu || st.names.len() == 2),
+            "a stack of {} modules",
+            st.names.len()
+        );
         let mut o = Vec::new();
         for n in &st.names {
             match ad.get(n) {
                 Some((ma, _, mr)) => {
-                    ensure!(ma.len() == mr * cols, "{n}: lora_A of {} values for rank {mr} and {cols} inputs", ma.len());
+                    ensure!(
+                        ma.len() == mr * cols,
+                        "{n}: lora_A of {} values for rank {mr} and {cols} inputs",
+                        ma.len()
+                    );
                     ensure!(r == 0 || r == mr, "{n}: rank {mr} beside {r}");
                     r = mr;
                     o.push((a.len() / cols) as i32);
@@ -104,7 +116,9 @@ pub fn load(s: &Arc<CudaStream>, ad: &Adapter, stacks: &[Stacked], cols: usize, 
         }
         // in the product's row order
         let order = row_order(rows, st.silu);
-        let packed: Vec<u16> = order.iter().flat_map(|&o| b[o * r..(o + 1) * r].iter().map(|&v| half::f16::from_f32(v).to_bits()))
+        let packed: Vec<u16> = order
+            .iter()
+            .flat_map(|&o| b[o * r..(o + 1) * r].iter().map(|&v| half::f16::from_f32(v).to_bits()))
             .collect();
         let mut tab = [i32::MAX; 8];
         let mut end = 0;
@@ -129,15 +143,31 @@ impl LoraA {
     /// The kernel for this rank of `f`, on the plain product y (split 0 or 1, [n][rows]), xa = A x in `lpart` of `split`
     /// parts (s of the slots that use the adapter); and mid when it is written. A block per 256 rows it writes, of y's or
     /// of mid's half of them.
-    fn launch(&self, f: &[CudaFunction], x: &Stack, split: usize, b: &LoraB, y: &CudaSlice<f32>, mid: Option<&CudaSlice<u16>>)
-    -> Result<()> {
+    fn launch(
+        &self,
+        f: &[CudaFunction],
+        x: &Stack,
+        split: usize,
+        b: &LoraB,
+        y: &CudaSlice<f32>,
+        mid: Option<&CudaSlice<u16>>,
+    ) -> Result<()> {
         let (spi, m, rows, n) = (split as i32, (self.a.tiles * 16) as i32, b.rows as i32, x.st.n as i32);
         let per = if mid.is_some() { 2 * 256 } else { 256 };
         let rank = RANKS.iter().position(|&r| r == self.r).unwrap();
         unsafe {
             let mut l = x.s.launch_builder(&f[rank]);
-            l.arg(&x.b.lpart).arg(&spi).arg(&m).arg(&b.b).arg(&rows).arg(&b.tab).arg(&x.st.tok_slot).arg(&x.scales).arg(&n)
-                .arg(y).arg(&rows);
+            l.arg(&x.b.lpart)
+                .arg(&spi)
+                .arg(&m)
+                .arg(&b.b)
+                .arg(&rows)
+                .arg(&b.tab)
+                .arg(&x.st.tok_slot)
+                .arg(&x.scales)
+                .arg(&n)
+                .arg(y)
+                .arg(&rows);
             if let Some(mid) = mid {
                 l.arg(mid);
             }
@@ -169,14 +199,23 @@ pub struct LayerLora {
 impl LayerLora {
     /// The A matrices (for the size of their partial products)
     pub fn mats(&self) -> impl Iterator<Item = &Mat> {
-        let a = [self.inp.as_ref().map(|x| &x.0), self.out.as_ref().map(|x| &x.0), self.gate_up.as_ref().map(|x| &x.0),
-                 self.down.as_ref().map(|x| &x.0)];
+        let a = [
+            self.inp.as_ref().map(|x| &x.0),
+            self.out.as_ref().map(|x| &x.0),
+            self.gate_up.as_ref().map(|x| &x.0),
+            self.down.as_ref().map(|x| &x.0),
+        ];
         a.into_iter().flatten().map(|a| &a.a)
     }
 }
 
 /// One stacked product's A and B
-pub fn single(s: &Arc<CudaStream>, ad: &Adapter, st: Stacked, cols: usize, used: &mut HashSet<String>)
--> Result<Option<(LoraA, LoraB)>> {
+pub fn single(
+    s: &Arc<CudaStream>,
+    ad: &Adapter,
+    st: Stacked,
+    cols: usize,
+    used: &mut HashSet<String>,
+) -> Result<Option<(LoraA, LoraB)>> {
     Ok(load(s, ad, &[st], cols, used)?.map(|(a, mut b)| (a, b.pop().flatten().unwrap())))
 }

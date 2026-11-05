@@ -13,7 +13,10 @@ pub enum Backend {
 
 impl Backend {
     pub fn name(self) -> &'static str {
-        match self { Backend::Cuda => "cuda", Backend::Mlx => "mlx" }
+        match self {
+            Backend::Cuda => "cuda",
+            Backend::Mlx => "mlx",
+        }
     }
 
     pub fn parse(s: &str) -> Result<Self> {
@@ -22,7 +25,10 @@ impl Backend {
             "mlx" => Backend::Mlx,
             _ => bail!("--backend is cuda or mlx"),
         };
-        let compiled = match b { Backend::Cuda => cfg!(has_cuda), Backend::Mlx => cfg!(has_mlx) };
+        let compiled = match b {
+            Backend::Cuda => cfg!(has_cuda),
+            Backend::Mlx => cfg!(has_mlx),
+        };
         ensure!(compiled, "this build has no {s} backend (cargo feature `{s}`)");
         Ok(b)
     }
@@ -46,15 +52,24 @@ pub fn ensure_qwen(dir: &Path) -> Result<()> {
         .with_context(|| format!("{}/config.json", dir.display()))?;
     match config["model_type"].as_str() {
         Some("qwen3_5") => Ok(()),
-        other => bail!("{}: a {} model; this engine runs Qwen3.5 / Qwen3.8 (model_type qwen3_5, e.g. Qwen/Qwen3.5-4B)",
-                       dir.display(), other.unwrap_or("?")),
+        other => bail!(
+            "{}: a {} model; this engine runs Qwen3.5 / Qwen3.8 (model_type qwen3_5, e.g. Qwen/Qwen3.5-4B)",
+            dir.display(),
+            other.unwrap_or("?")
+        ),
     }
 }
 
 /// The model in `dir` on the selected backend: `int8` weights (else 16-bit), `adapter` served unmerged for the slots
 /// that use it (Engine::set_adapter; CUDA only).
 #[allow(unused_variables)]
-pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>) -> Result<Box<dyn Engine>> {
+pub fn load(
+    dir: &Path,
+    max_ctx: usize,
+    slots: usize,
+    int8: bool,
+    adapter: Option<&Adapter>,
+) -> Result<Box<dyn Engine>> {
     if let Some(a) = adapter {
         a.check(&crate::checkpoint::Checkpoint::open(dir)?)?;
     }
@@ -120,7 +135,9 @@ pub trait Engine {
     }
     /// Compile/prime common decode shapes before the server advertises readiness. No-op for backends that
     /// do not need this; it must not learn tokens or leave a user sequence in a slot.
-    fn warmup(&mut self, _draft_depth: usize) -> Result<()> { Ok(()) }
+    fn warmup(&mut self, _draft_depth: usize) -> Result<()> {
+        Ok(())
+    }
     /// Wait for the device (timing)
     fn sync(&self) -> Result<()>;
     /// Whether a LoRA adapter is loaded (served unmerged beside the base model: set_adapter)
@@ -150,8 +167,14 @@ pub trait Engine {
     /// is filled for them); then `k` drafts per output row `out` (indices into `toks`), each continuing its row. A row
     /// with a `sampling` (none, or an empty slice: none for any) draws its drafts from the draft layer's distribution
     /// under it, kept for the target's sampler (sample::mark_sampled); the others take the argmax.
-    fn draft(&mut self, _toks: &[Tok], _rows: &[usize], _out: &[usize], _k: usize, _sampling: &[Option<DraftSampling>])
-    -> Result<Vec<Vec<u32>>> {
+    fn draft(
+        &mut self,
+        _toks: &[Tok],
+        _rows: &[usize],
+        _out: &[usize],
+        _k: usize,
+        _sampling: &[Option<DraftSampling>],
+    ) -> Result<Vec<Vec<u32>>> {
         bail!("speculative decoding with a draft layer: not supported by this backend and model")
     }
     /// The distribution a sampled draft of slot `slot` at index `t` of its chain was drawn from (token, probability;

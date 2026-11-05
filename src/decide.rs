@@ -5,7 +5,12 @@ use crate::chat::Chat;
 use crate::sample::Params;
 use crate::server::{App, Job, Msg, bad_request};
 use anyhow::{Context, Result, ensure};
-use axum::{Json as AxJson, extract::State, http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    Json as AxJson,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -53,10 +58,16 @@ fn build(chat: &Chat, row: &Json, kind: &str, options: &[String]) -> Result<Item
     }
     let question = question.as_str();
     // the question first, so the model reads the content knowing what is asked (not when the content is the question)
-    let mut text = if content.is_empty() || content == question.trim() { String::new() } else { format!("Frage: {question}\n\n{content}\n\n") };
+    let mut text = if content.is_empty() || content == question.trim() {
+        String::new()
+    } else {
+        format!("Frage: {question}\n\n{content}\n\n")
+    };
     text.push_str(&format!("Frage: {question}\n"));
     match kind {
-        "noul" if options != YES_NO => text.push_str(&format!("Ja bedeutet: {}\nNein bedeutet: {}\n", options[0], options[1])),
+        "noul" if options != YES_NO => {
+            text.push_str(&format!("Ja bedeutet: {}\nNein bedeutet: {}\n", options[0], options[1]))
+        }
         "noul" => {}
         _ => {
             for (o, l) in options.iter().zip(&labels) {
@@ -82,7 +93,10 @@ fn build(chat: &Chat, row: &Json, kind: &str, options: &[String]) -> Result<Item
     for l in &labels {
         // a label's first token after the prompt (Nein may be more than one)
         let with = chat.encode(&format!("{prompt}{l}"))?;
-        ensure!(with.len() > ids.len() && with[..ids.len()] == ids[..], "label {l} does not start a new token after the prompt");
+        ensure!(
+            with.len() > ids.len() && with[..ids.len()] == ids[..],
+            "label {l} does not start a new token after the prompt"
+        );
         ensure!(!cands.contains(&with[ids.len()]), "labels {labels:?} share a first token");
         cands.push(with[ids.len()]);
     }
@@ -112,7 +126,8 @@ pub async fn decisions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json>) 
         }
         // a preset's system prompt goes first unless the request brings one
         if let Some(sys) = p.get("system").and_then(Json::as_str)
-            && let Some(msgs) = req["messages"].as_array_mut().filter(|m| m.first().is_none_or(|m| m["role"] != "system"))
+            && let Some(msgs) =
+                req["messages"].as_array_mut().filter(|m| m.first().is_none_or(|m| m["role"] != "system"))
         {
             msgs.insert(0, json!({"role": "system", "content": sys}));
         }
@@ -169,7 +184,9 @@ pub async fn decisions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json>) 
     for (name, row) in rows {
         match ask(&app, row) {
             Ok((a, rx)) => asked.push((name, a, rx)),
-            Err(e) => return if many.is_some() { bad_request(format!("question {name:?}: {e}")) } else { bad_request(e) },
+            Err(e) => {
+                return if many.is_some() { bad_request(format!("question {name:?}: {e}")) } else { bad_request(e) };
+            }
         }
     }
     let mut answers = serde_json::Map::new();
@@ -227,20 +244,27 @@ async fn decision_reply(mut rx: UnboundedReceiver<Msg>) -> Result<(Vec<f32>, f64
 
 /// The option keys and the texts the model reads, from any of the forms `decisions` accepts.
 fn decision_options(kind: &str, row: &Json) -> Result<(Vec<String>, Vec<String>), String> {
-    let text = |key: &str, d: Option<&Json>| d.and_then(Json::as_str).filter(|d| !d.trim().is_empty()).unwrap_or(key).to_string();
+    let text = |key: &str, d: Option<&Json>| {
+        d.and_then(Json::as_str).filter(|d| !d.trim().is_empty()).unwrap_or(key).to_string()
+    };
     let opts = row.get("options").filter(|o| !o.is_null()).or(row.get("criteria")).cloned().unwrap_or(Json::Null);
     let pairs: Vec<(String, String)> = match (&opts, kind) {
         (Json::Null, "noul") => vec![("yes".into(), "Ja".into()), ("no".into(), "Nein".into())],
-        (Json::Object(m), "noul") => vec![("yes".into(), text("Ja", m.get("true"))), ("no".into(), text("Nein", m.get("false")))],
+        (Json::Object(m), "noul") => {
+            vec![("yes".into(), text("Ja", m.get("true"))), ("no".into(), text("Nein", m.get("false")))]
+        }
         (Json::Object(m), _) => m.iter().map(|(k, v)| (k.clone(), text(k, Some(v)))).collect(),
-        (Json::Array(a), _) => a.iter().map(|o| match o {
-            Json::String(s) => Ok((s.clone(), s.clone())),
-            Json::Object(m) => {
-                let key = m.get("key").and_then(Json::as_str).ok_or("an option object without \"key\"")?;
-                Ok((key.to_string(), text(key, m.get("description"))))
-            }
-            _ => Err("an option is neither a string nor {\"key\", \"description\"}"),
-        }).collect::<Result<_, _>>()?,
+        (Json::Array(a), _) => a
+            .iter()
+            .map(|o| match o {
+                Json::String(s) => Ok((s.clone(), s.clone())),
+                Json::Object(m) => {
+                    let key = m.get("key").and_then(Json::as_str).ok_or("an option object without \"key\"")?;
+                    Ok((key.to_string(), text(key, m.get("description"))))
+                }
+                _ => Err("an option is neither a string nor {\"key\", \"description\"}"),
+            })
+            .collect::<Result<_, _>>()?,
         _ => return Err("no \"options\"".into()),
     };
     match kind {
@@ -269,10 +293,17 @@ fn ask(app: &App, row: Json) -> Result<(Asked, UnboundedReceiver<Msg>), String> 
 }
 
 /// A greedy request to the engine: decisions and the thinking before them
-fn send(app: &App, prompt: Vec<u32>, max_tokens: usize, stop: Vec<String>, decide: Option<Vec<u32>>, adapter: bool)
-        -> Result<UnboundedReceiver<Msg>, String> {
+fn send(
+    app: &App,
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    stop: Vec<String>,
+    decide: Option<Vec<u32>>,
+    adapter: bool,
+) -> Result<UnboundedReceiver<Msg>, String> {
     let (tx, rx) = unbounded_channel();
-    let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
+    let params =
+        Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
     let job = Job { prompt, params, max_tokens, stop, progress: None, ignore_eos: false, decide, adapter, tx };
     app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
     Ok(rx)
@@ -326,13 +357,16 @@ fn answer(a: &Asked, logits: &[f32], label_mass: f64, prompt_tokens: usize) -> J
         "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 0},
     });
     match a.kind.as_str() {
-        "score" => out["score"] = json!(p.iter().enumerate().map(|(k, q)| q * k as f64).sum::<f64>() / (p.len() - 1) as f64),
+        "score" => {
+            out["score"] = json!(p.iter().enumerate().map(|(k, q)| q * k as f64).sum::<f64>() / (p.len() - 1) as f64)
+        }
         "noul" => out["noul"] = json!(p[0]),
         _ => {}
     }
     // on a scale of 4 or more levels a neighbouring level is a small error: the threshold is compared with the most
     // likely level and its neighbours ("p_near", sure up to one level), and the margin to the runner-up is not asked
-    let near = (a.kind == "score" && p.len() >= 4).then(|| p[top.saturating_sub(1)..(top + 2).min(p.len())].iter().sum::<f64>());
+    let near = (a.kind == "score" && p.len() >= 4)
+        .then(|| p[top.saturating_sub(1)..(top + 2).min(p.len())].iter().sum::<f64>());
     if let Some(n) = near {
         out["p_near"] = json!(n);
     }

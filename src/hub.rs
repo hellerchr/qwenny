@@ -20,14 +20,19 @@ pub fn resolve(model: &str) -> Result<PathBuf> {
         ensure!(p.is_dir(), "{model} is a file; the model is a directory or a Hugging Face id like {DEFAULT_MODEL}");
         p.to_path_buf()
     } else {
-        ensure!(model.split('/').count() == 2 && !model.starts_with(['.', '/', '~']),
-                "{model}: no such directory, and not a Hugging Face id like {DEFAULT_MODEL}");
+        ensure!(
+            model.split('/').count() == 2 && !model.starts_with(['.', '/', '~']),
+            "{model}: no such directory, and not a Hugging Face id like {DEFAULT_MODEL}"
+        );
         download(model)?
     };
     let missing: Vec<_> = NEEDED.iter().filter(|f| !dir.join(f).exists()).collect();
     ensure!(missing.is_empty(), "{} is not a model directory: no {:?}", dir.display(), missing);
-    ensure!(dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists(),
-            "{} has no model.safetensors(.index.json): not a model directory", dir.display());
+    ensure!(
+        dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists(),
+        "{} has no model.safetensors(.index.json): not a model directory",
+        dir.display()
+    );
     crate::engine::ensure_qwen(&dir)?;
     Ok(dir)
 }
@@ -56,8 +61,10 @@ fn download(id: &str) -> Result<PathBuf> {
                 eprintln!("note: huggingface.co not reached ({e}); using the cached {id}");
                 return Ok(dir);
             }
-            None => bail!("{id}: not in the Hugging Face cache and huggingface.co not reached: {e} \
-                           (a private or gated model needs HF_TOKEN)"),
+            None => bail!(
+                "{id}: not in the Hugging Face cache and huggingface.co not reached: {e} \
+                           (a private or gated model needs HF_TOKEN)"
+            ),
         },
     };
     // every file of one commit, so that they land in one snapshot directory
@@ -68,8 +75,11 @@ fn download(id: &str) -> Result<PathBuf> {
     }
     let have = Cache::from_env().repo(Repo::with_revision(id.to_string(), RepoType::Model, info.sha.clone()));
     if files.iter().any(|f| have.get(f).is_none()) {
-        eprintln!("downloading {id} (commit {}) into {} (once)", &info.sha[..info.sha.len().min(8)],
-                  Cache::from_env().path().display());
+        eprintln!(
+            "downloading {id} (commit {}) into {} (once)",
+            &info.sha[..info.sha.len().min(8)],
+            Cache::from_env().path().display()
+        );
     }
     let mut dir = None;
     for f in &files {
@@ -85,7 +95,9 @@ fn download(id: &str) -> Result<PathBuf> {
 pub fn name(dir: &Path) -> String {
     let repo = dir.parent().and_then(Path::parent).and_then(Path::file_name).and_then(|n| n.to_str());
     match repo.and_then(|n| n.strip_prefix("models--")) {
-        Some(id) if dir.parent().and_then(Path::file_name).is_some_and(|n| n == "snapshots") => id.replacen("--", "/", 1),
+        Some(id) if dir.parent().and_then(Path::file_name).is_some_and(|n| n == "snapshots") => {
+            id.replacen("--", "/", 1)
+        }
         _ => dir.display().to_string(),
     }
 }
@@ -96,7 +108,8 @@ mod tests {
 
     #[test]
     fn downloads_the_top_level_without_gguf() {
-        for f in ["config.json", "model-balanced.safetensors", "model.safetensors.index.json", "mtp_draft_vocab_ids.pt"] {
+        for f in ["config.json", "model-balanced.safetensors", "model.safetensors.index.json", "mtp_draft_vocab_ids.pt"]
+        {
             assert!(engine_reads(f), "{f}");
         }
         for f in ["model-F16.gguf", "verbose/model-verbose.safetensors", "assets/logo.png"] {

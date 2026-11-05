@@ -78,7 +78,8 @@ fn below(what: &str, values: impl IntoIterator<Item = f32>, limit: f32) -> Resul
 
 /// A safetensors file from (name, type, shape, little-endian bytes)
 fn write_tensors(path: &Path, tensors: &[(String, Dtype, Vec<usize>, Vec<u8>)]) -> Result<()> {
-    let views: Vec<_> = tensors.iter()
+    let views: Vec<_> = tensors
+        .iter()
         .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
         .collect::<Result<_>>()?;
     Ok(safetensors::serialize_to_file(views, None, path)?)
@@ -171,8 +172,12 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
             ensure!(!topk, "--write: a reference with full logits");
             out.push((format!("ids_{p}"), Dtype::I32, vec![ids.len()], le_i32(&ids)));
             out.push((format!("pos_{p}"), Dtype::I32, vec![pos.len()], le_i32(&pos)));
-            out.push((format!("logits_{p}"), Dtype::F32, vec![pos.len(), vocab],
-                      our_logits.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            out.push((
+                format!("logits_{p}"),
+                Dtype::F32,
+                vec![pos.len(), vocab],
+                our_logits.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ));
             out.push((format!("argmax_{p}"), Dtype::I32, vec![our_argmax.len()], le_i32(&our_argmax)));
             out.push((format!("gen_{p}"), Dtype::I32, vec![generated.len()], le_i32(&generated)));
         }
@@ -218,7 +223,10 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
         for c0 in (0..end).step_by(64) {
             let c1 = (c0 + 64).min(end);
             m.run(&toks(ids, c0, c1, 0), &[])?;
-            let next: Vec<Tok> = (c0..c1).filter(|&q| q + 1 < ids.len()).map(|q| Tok { id: ids[q + 1], slot: 0, pos: q as u32 }).collect();
+            let next: Vec<Tok> = (c0..c1)
+                .filter(|&q| q + 1 < ids.len())
+                .map(|q| Tok { id: ids[q + 1], slot: 0, pos: q as u32 })
+                .collect();
             let rows: Vec<usize> = (0..next.len()).collect();
             let d = m.draft(&next, &rows, &rows, 1, &[])?;
             am.extend(d.iter().map(|d| d[0]));
@@ -231,8 +239,13 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
     };
     for p in prompts(&r) {
         let ids = ints(&r, &format!("ids_{p}"))?;
-        let (target, want, pos, ref_lg, chain) = (ints(&r, &format!("target_{p}"))?, ints(&r, &format!("mtp_{p}"))?,
-            ints(&r, &format!("pos_{p}"))?, floats(&r, &format!("logits_{p}"))?, ints(&r, &format!("chain_{p}"))?);
+        let (target, want, pos, ref_lg, chain) = (
+            ints(&r, &format!("target_{p}"))?,
+            ints(&r, &format!("mtp_{p}"))?,
+            ints(&r, &format!("pos_{p}"))?,
+            floats(&r, &format!("logits_{p}"))?,
+            ints(&r, &format!("chain_{p}"))?,
+        );
         let (am, lg) = pass(&mut m, &ids, ids.len(), true)?;
         let agree = am.iter().zip(&want).filter(|(a, b)| a == b).count();
         let accept = am.iter().zip(&target[1..]).filter(|(a, b)| a == b).count();
@@ -252,10 +265,17 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
             let d = m.draft(&[Tok { id: ids[q + 1], slot: 0, pos: q as u32 }], &[0], &[0], 2, &[])?;
             chain_agree += (d[0][1] == chain[j]) as usize;
         }
-        println!("prompt {p}: {} positions, MTP argmax agrees with the reference at {agree}/{} (draft 1 = the target's \
+        println!(
+            "prompt {p}: {} positions, MTP argmax agrees with the reference at {agree}/{} (draft 1 = the target's \
                   next argmax at {:.1} %), logits at {} positions: max |diff| {max_diff:.4}, mean {:.5}; second draft \
-                  agrees at {chain_agree}/{}", am.len(), am.len(), 100.0 * accept as f64 / am.len() as f64, pos.len(),
-                 sum / (pos.len() * vocab) as f64, chain.len());
+                  agrees at {chain_agree}/{}",
+            am.len(),
+            am.len(),
+            100.0 * accept as f64 / am.len() as f64,
+            pos.len(),
+            sum / (pos.len() * vocab) as f64,
+            chain.len()
+        );
     }
     Ok(())
 }
@@ -289,7 +309,10 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
         a.extend((n - tail..n).map(|s| vec![(0, s, 1)]));
         passes.push(("chunks + decode", a));
         passes.push(("5-token chunks", (0..n).step_by(5).map(|s| vec![(1, s, 5.min(n - s))]).collect()));
-        passes.push(("two per step", (0..n).step_by(64).map(|s| vec![(2, s, 64.min(n - s)), (3, s, 64.min(n - s))]).collect()));
+        passes.push((
+            "two per step",
+            (0..n).step_by(64).map(|s| vec![(2, s, 64.min(n - s)), (3, s, 64.min(n - s))]).collect(),
+        ));
         if n > 8 {
             let k = n - 4;
             // the prompts in steps of at most max_tok tokens
@@ -306,10 +329,18 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
             let mut rb = vec![vec![(1, 0, l - 4), (1 | DRAFT, l - 4, 4)]];
             let mut s = l - 4;
             while s < n {
-                let (good, drafts) = match rb.len() { i if i % 50 == 0 => (64, 16), i if i % 7 == 0 => (1, 15), _ => (2, 4) };
+                let (good, drafts) = match rb.len() {
+                    i if i % 50 == 0 => (64, 16),
+                    i if i % 7 == 0 => (1, 15),
+                    _ => (2, 4),
+                };
                 let good = good.min(n - s);
                 let drafts = drafts.min(n - s - good);
-                rb.push(if drafts > 0 { vec![(1, s, good), (1 | DRAFT, s + good, drafts)] } else { vec![(1, s, good)] });
+                rb.push(if drafts > 0 {
+                    vec![(1, s, good), (1 | DRAFT, s + good, drafts)]
+                } else {
+                    vec![(1, s, good)]
+                });
                 s += good;
             }
             passes.push(("rollback", rb));
@@ -317,9 +348,19 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
         for (name, steps) in passes {
             let (mut worst, mut sum, mut cnt) = (0f32, 0f64, 0usize);
             for step in steps {
-                let toks: Vec<Tok> = step.iter().flat_map(|&(slot, s, c)| (s..s + c).map(move |q| Tok { id: 0, slot: slot & !DRAFT, pos: q as u32 })).collect();
+                let toks: Vec<Tok> = step
+                    .iter()
+                    .flat_map(|&(slot, s, c)| {
+                        (s..s + c).map(move |q| Tok { id: 0, slot: slot & !DRAFT, pos: q as u32 })
+                    })
+                    .collect();
                 // the input row of each token: its own position, or another one for drafts
-                let src: Vec<usize> = step.iter().flat_map(|&(slot, s, c)| (s..s + c).map(move |q| if slot & DRAFT != 0 { (q * 7 + 3) % n } else { q })).collect();
+                let src: Vec<usize> = step
+                    .iter()
+                    .flat_map(|&(slot, s, c)| {
+                        (s..s + c).map(move |q| if slot & DRAFT != 0 { (q * 7 + 3) % n } else { q })
+                    })
+                    .collect();
                 let x: Vec<f32> = src.iter().flat_map(|&q| xn[q * h..][..h].iter().copied()).collect();
                 let got = m.run(&toks, &x)?;
                 // not the drafts: one whose input happens to be its own position's still follows other drafts
@@ -333,8 +374,11 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
                     }
                 }
             }
-            println!("prompt {p} ({n} tokens), layer {layer}, {name}: max |diff| {worst:.4} (output max {scale:.2}), \
-                      mean {:.5}", sum / cnt.max(1) as f64);
+            println!(
+                "prompt {p} ({n} tokens), layer {layer}, {name}: max |diff| {worst:.4} (output max {scale:.2}), \
+                      mean {:.5}",
+                sum / cnt.max(1) as f64
+            );
             worsts.push(worst);
         }
     }
@@ -401,8 +445,12 @@ fn bench_steps(opts: &Opts, m: &mut dyn Engine, n: usize) -> Result<()> {
         next = m.argmax()?[0];
     }
     let dt = t.elapsed().as_secs_f64();
-    println!("round trip: {:.1} tok/s ({:.3} ms/token, {:.3} ms of it in step())", n as f64 / dt, dt * 1e3 / n as f64,
-             launch * 1e3 / n as f64);
+    println!(
+        "round trip: {:.1} tok/s ({:.3} ms/token, {:.3} ms of it in step())",
+        n as f64 / dt,
+        dt * 1e3 / n as f64,
+        launch * 1e3 / n as f64
+    );
     let dt = timed(m, |m| {
         for i in 0..n {
             m.run(&[Tok { id: next, slot: 0, pos: p0 + (16 + 2 * n + i) as u32 }], &[0])?;
@@ -450,7 +498,9 @@ fn bench_steps(opts: &Opts, m: &mut dyn Engine, n: usize) -> Result<()> {
         for s in 0..b as u32 {
             fill(m, s, p0 as usize + 16, |_| 42, false)?;
         }
-        let at = |i: usize| -> Vec<Tok> { (0..b as u32).map(|s| Tok { id: 42, slot: s, pos: p0 + 16 + i as u32 }).collect() };
+        let at = |i: usize| -> Vec<Tok> {
+            (0..b as u32).map(|s| Tok { id: 42, slot: s, pos: p0 + 16 + i as u32 }).collect()
+        };
         m.run(&at(0), &rows)?;
         let dt = timed(m, |m| {
             for i in 1..=n / 4 {
@@ -485,7 +535,10 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     let kwargs = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
     // prompts.jsonl is project input (not raw/ untrusted), parsed as plain JSON per line
     let text = std::fs::read_to_string(prompts).with_context(|| format!("reading {prompts}"))?;
-    let rows: Vec<(String, String)> = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty())
+    let rows: Vec<(String, String)> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
         .map(|(i, l)| {
             let v: serde_json::Value = serde_json::from_str(l).with_context(|| format!("{prompts} line {}", i + 1))?;
             let g = v["group"].as_str().with_context(|| format!("{prompts} line {}: no \"group\" string", i + 1))?;
@@ -517,12 +570,16 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
         let tail: Vec<i32> = ids[ids.len() - k..].iter().map(|&x| x as i32).collect();
         match &tail0 {
             None => tail0 = Some(tail.clone()),
-            Some(t0) => ensure!(&tail == t0, "prompt {idx} (group {group}) suffix ids {tail:?} differ from prompt 0's                                  {t0:?}: the tapped positions are not aligned across prompts"),
+            Some(t0) => ensure!(
+                &tail == t0,
+                "prompt {idx} (group {group}) suffix ids {tail:?} differ from prompt 0's                                  {t0:?}: the tapped positions are not aligned across prompts"
+            ),
         }
         tail_ids.extend_from_slice(&tail);
         n_tokens.push(ids.len() as i32);
         let toks: Vec<Tok> = ids.iter().enumerate().map(|(p, &id)| Tok { id, slot: 0, pos: p as u32 }).collect();
-        let caps = m.capture_forward(&toks, k)
+        let caps = m
+            .capture_forward(&toks, k)
             .with_context(|| format!("prompt {idx} (group {group}, {} tokens)", ids.len()))?;
         ensure!(caps.len() == nl * k * h, "capture returned {} values, expected {}", caps.len(), nl * k * h);
         let gid = group_names.iter().position(|g| g == group).unwrap_or_else(|| {
@@ -538,16 +595,29 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     for (name, data) in &tensors {
         out_vec.push((name.clone(), Dtype::F32, vec![nl, k, h], data.iter().flat_map(|x| x.to_le_bytes()).collect()));
     }
-    out_vec.push(("group_ids".to_string(), Dtype::I32, vec![group_ids.len()],
-                  group_ids.iter().flat_map(|&g| (g as i32).to_le_bytes()).collect()));
-    out_vec.push(("tail_ids".to_string(), Dtype::I32, vec![rows.len(), k],
-                  tail_ids.iter().flat_map(|&x| x.to_le_bytes()).collect()));
-    out_vec.push(("n_tokens".to_string(), Dtype::I32, vec![rows.len()],
-                  n_tokens.iter().flat_map(|&x| x.to_le_bytes()).collect()));
+    out_vec.push((
+        "group_ids".to_string(),
+        Dtype::I32,
+        vec![group_ids.len()],
+        group_ids.iter().flat_map(|&g| (g as i32).to_le_bytes()).collect(),
+    ));
+    out_vec.push((
+        "tail_ids".to_string(),
+        Dtype::I32,
+        vec![rows.len(), k],
+        tail_ids.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+    ));
+    out_vec.push((
+        "n_tokens".to_string(),
+        Dtype::I32,
+        vec![rows.len()],
+        n_tokens.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+    ));
     // FNV-1a 64-bit of a canonical rendered prompt: a stable fingerprint of the chat template + kwargs + specials,
     // so the offline direction is only ever applied to the exact config it was measured on.
     let probe = chat.render(&serde_json::json!([{"role": "user", "content": "QWENNY_CALIB_PROBE"}]), None, &kwargs)?;
-    let template_hash = probe.bytes().fold(0xcbf29ce484222325u64, |hsh, b| (hsh ^ b as u64).wrapping_mul(0x100000001b3));
+    let template_hash =
+        probe.bytes().fold(0xcbf29ce484222325u64, |hsh, b| (hsh ^ b as u64).wrapping_mul(0x100000001b3));
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("groups".into(), group_names.join(","));
     meta.insert("n_prompts".into(), rows.len().to_string());
@@ -561,7 +631,8 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     meta.insert("model_dir".into(), dir.to_string());
     meta.insert("int8".into(), opts.int8.to_string());
     meta.insert("template_hash".into(), format!("{template_hash:016x}"));
-    let views: Vec<_> = out_vec.iter()
+    let views: Vec<_> = out_vec
+        .iter()
         .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
         .collect::<Result<_>>()?;
     safetensors::serialize_to_file(views, Some(meta), Path::new(out))?;
@@ -577,7 +648,8 @@ pub fn tokcheck(dir: &str, reference: &str, tests: &str) -> Result<()> {
     let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     let ticket: serde_json::Value = serde_json::from_str(std::fs::read_to_string(tests)?.lines().next().unwrap_or(""))?;
-    let ticket_msgs: Vec<_> = ticket["messages"].as_array().unwrap().iter().filter(|m| m["role"] != "assistant").cloned().collect();
+    let ticket_msgs: Vec<_> =
+        ticket["messages"].as_array().unwrap().iter().filter(|m| m["role"] != "assistant").cloned().collect();
     let prompts = [
         serde_json::json!([{"role": "user", "content": "What is the capital of France? Answer in one sentence."}]),
         serde_json::Value::Array(ticket_msgs),
@@ -588,11 +660,20 @@ pub fn tokcheck(dir: &str, reference: &str, tests: &str) -> Result<()> {
         let ours = chat.encode(&chat.render(msgs, None, &kwargs)?)?;
         let theirs = ints(&r, &format!("ids_{i}"))?;
         let same = ours == theirs;
-        println!("prompt {i}: {} tokens (reference {}): {}", ours.len(), theirs.len(), if same { "identical" } else { "DIFFERENT" });
+        println!(
+            "prompt {i}: {} tokens (reference {}): {}",
+            ours.len(),
+            theirs.len(),
+            if same { "identical" } else { "DIFFERENT" }
+        );
         if !same {
             differ += 1;
             let at = ours.iter().zip(&theirs).position(|(a, b)| a != b).unwrap_or(ours.len().min(theirs.len()));
-            println!("  first difference at {at}: ours {:?} reference {:?}", &ours[at..(at + 5).min(ours.len())], &theirs[at..(at + 5).min(theirs.len())]);
+            println!(
+                "  first difference at {at}: ours {:?} reference {:?}",
+                &ours[at..(at + 5).min(ours.len())],
+                &theirs[at..(at + 5).min(theirs.len())]
+            );
         }
     }
     ensure!(differ == 0, "tokcheck: the prompt tokens of {differ} of {} prompts differ", prompts.len());
@@ -604,11 +685,13 @@ pub fn tokcheck(dir: &str, reference: &str, tests: &str) -> Result<()> {
 pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     let mut m = opts.load_at(dir, 4096, 2)?;
     // two sequences with different histories; repeated tokens so the penalty matters
-    let hist: [Vec<u32>; 2] = [(0..60).map(|i| 1000 + (i * 7) % 23).collect(), (0..40).map(|i| 5000 + (i * 13) % 37).collect()];
+    let hist: [Vec<u32>; 2] =
+        [(0..60).map(|i| 1000 + (i * 7) % 23).collect(), (0..40).map(|i| 5000 + (i * 13) % 37).collect()];
     let both: Vec<Tok> = hist.iter().enumerate().flat_map(|(s, h)| toks(h, 0, h.len(), s as u32)).collect();
     let rows = [hist[0].len() - 1, both.len() - 1];
     // the presence penalty's set: the last 20 tokens of each history count as generated
-    let gened: Vec<std::collections::HashSet<u32>> = hist.iter().map(|h| h[h.len() - 20..].iter().copied().collect()).collect();
+    let gened: Vec<std::collections::HashSet<u32>> =
+        hist.iter().map(|h| h[h.len() - 20..].iter().copied().collect()).collect();
     for (s, g) in gened.iter().enumerate() {
         let words = bitset(m.vocab(), g.iter().copied());
         m.set_outputs(s as u32, &words)?;
@@ -618,25 +701,47 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     let last: Vec<Tok> = hist.iter().enumerate().flat_map(|(s, h)| toks(h, h.len() - 1, h.len(), s as u32)).collect();
     let (mut same, mut total) = (0, 0);
     let mut rng = sample::Rng::new(7);
-    for &(temp, k, p, rep, pres) in &[(0.0, 50, 1.0, 1.1, 0.0), (0.1, 50, 1.0, 1.1, 0.0), (0.7, 20, 0.8, 1.0, 0.0), (1.0, 0, 0.95, 1.1, 0.0),
-                                      (1.5, 0, 1.0, 1.0, 0.0), (0.9, 5, 0.5, 1.3, 0.0), (0.0, 20, 1.0, 1.0, 1.5), (1.0, 20, 0.95, 1.0, 1.5),
-                                      (0.7, 20, 0.8, 1.1, 2.0)] {
-        let params = sample::Params { temperature: temp, top_k: k, top_p: p, repetition_penalty: rep, presence_penalty: pres, seed: 0 };
+    for &(temp, k, p, rep, pres) in &[
+        (0.0, 50, 1.0, 1.1, 0.0),
+        (0.1, 50, 1.0, 1.1, 0.0),
+        (0.7, 20, 0.8, 1.0, 0.0),
+        (1.0, 0, 0.95, 1.1, 0.0),
+        (1.5, 0, 1.0, 1.0, 0.0),
+        (0.9, 5, 0.5, 1.3, 0.0),
+        (0.0, 20, 1.0, 1.0, 1.5),
+        (1.0, 20, 0.95, 1.0, 1.5),
+        (0.7, 20, 0.8, 1.1, 2.0),
+    ] {
+        let params = sample::Params {
+            temperature: temp,
+            top_k: k,
+            top_p: p,
+            repetition_penalty: rep,
+            presence_penalty: pres,
+            seed: 0,
+        };
         for it in 0..50 {
             let whole = it % 2 == 0;
             let rowp: Vec<[f32; 8]> = (0..2).map(|_| params.row(&mut rng, None)).collect();
-            if whole { m.run(&both, &rows)? } else { m.run(&last, &[0, 1])? }
+            if whole {
+                m.run(&both, &rows)?
+            } else {
+                m.run(&last, &[0, 1])?
+            }
             let gpu = m.sample(&rowp)?;
             for j in 0..2 {
                 let lg = m.logits_row(j)?;
                 let seen: std::collections::HashSet<u32> = hist[j].iter().copied().collect();
                 let in_step = |t: u32| whole && hist[j][1..].contains(&t);
-                let want = sample::sample_row(&lg, |t| seen.contains(&t), |t| gened[j].contains(&t) || in_step(t), &rowp[j]).0;
+                let want =
+                    sample::sample_row(&lg, |t| seen.contains(&t), |t| gened[j].contains(&t) || in_step(t), &rowp[j]).0;
                 same += (want == gpu[j].0) as usize;
                 total += 1;
             }
         }
-        println!("temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: {same}/{total} draws agree so far");
+        println!(
+            "temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: {same}/{total} draws agree so far"
+        );
     }
     let mut disagree = total - same;
     // sampled drafts (the draft layer's): drawn on the GPU from its distribution q under the row's sampling, then
@@ -646,9 +751,16 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
         let h = &hist[0];
         let n = h.len();
         let (mut same, mut total, mut acc) = (0, 0, 0);
-        for &(temp, k, p, rep, pres) in &[(1.0, 20, 0.95, 1.0, 1.5), (0.7, 0, 0.8, 1.1, 0.0), (1.3, 50, 1.0, 1.0, 0.0)] {
-            let params = sample::Params { temperature: temp, top_k: k, top_p: p, repetition_penalty: rep,
-                                          presence_penalty: pres, seed: 0 };
+        for &(temp, k, p, rep, pres) in &[(1.0, 20, 0.95, 1.0, 1.5), (0.7, 0, 0.8, 1.1, 0.0), (1.3, 50, 1.0, 1.0, 0.0)]
+        {
+            let params = sample::Params {
+                temperature: temp,
+                top_k: k,
+                top_p: p,
+                repetition_penalty: rep,
+                presence_penalty: pres,
+                seed: 0,
+            };
             for it in 0..20 {
                 let next = 3000 + it as u32;
                 m.run(&toks(h, 0, n, 0), &[n - 1])?;
@@ -659,11 +771,15 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
                 let mut step = vec![Tok { id: next, slot: 0, pos: n as u32 }];
                 step.extend(d.iter().enumerate().map(|(j, &id)| Tok { id, slot: 0, pos: (n + 1 + j) as u32 }));
                 m.run(&step, &[0, 1, 2, 3])?;
-                let rowp: Vec<[f32; 8]> = (0..4).map(|j| {
-                    let mut r = params.row(&mut rng, d.get(j).copied());
-                    if j < 3 { sample::mark_sampled(&mut r); }
-                    r
-                }).collect();
+                let rowp: Vec<[f32; 8]> = (0..4)
+                    .map(|j| {
+                        let mut r = params.row(&mut rng, d.get(j).copied());
+                        if j < 3 {
+                            sample::mark_sampled(&mut r);
+                        }
+                        r
+                    })
+                    .collect();
                 let words = bitset(m.vocab(), gened[0].iter().copied());
                 m.set_outputs(0, &words)?;
                 let gpu = m.sample(&rowp)?;
@@ -687,11 +803,15 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
                     same += (want == gpu[j]) as usize;
                     total += 1;
                     acc += (j < 3 && gpu[j].1) as usize;
-                    if !gpu[j].1 { break; }
+                    if !gpu[j].1 {
+                        break;
+                    }
                 }
             }
-            println!("sampled drafts at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: \
-                      {same}/{total} draws agree so far ({acc} drafts accepted)");
+            println!(
+                "sampled drafts at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: \
+                      {same}/{total} draws agree so far ({acc} drafts accepted)"
+            );
         }
         disagree += total - same;
     } else {
@@ -701,20 +821,35 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     m.run(&both, &rows)?;
     let lg = m.logits_row(0)?;
     let mut max_tv = 0f64;
-    for &(temp, k, p, rep, pres) in &[(1.0, 1024, 1.0, 1.0, 0.0), (0.8, 20, 0.9, 1.1, 0.0), (1.5, 50, 1.0, 1.3, 0.0), (1.0, 20, 0.95, 1.0, 1.5)] {
-        let params = sample::Params { temperature: temp, top_k: k, top_p: p, repetition_penalty: rep, presence_penalty: pres, seed: 0 };
+    for &(temp, k, p, rep, pres) in
+        &[(1.0, 1024, 1.0, 1.0, 0.0), (0.8, 20, 0.9, 1.1, 0.0), (1.5, 50, 1.0, 1.3, 0.0), (1.0, 20, 0.95, 1.0, 1.5)]
+    {
+        let params = sample::Params {
+            temperature: temp,
+            top_k: k,
+            top_p: p,
+            repetition_penalty: rep,
+            presence_penalty: pres,
+            seed: 0,
+        };
         // target: the host reference's distribution, estimated with many draws
         let mut want: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
         let seen: std::collections::HashSet<u32> = hist[0].iter().copied().collect();
         // the uniform grid's draws, on all cores
         let draws: Vec<u32> = std::thread::scope(|sc| {
-            let parts: Vec<_> = (0..16).map(|c| {
-                let (lg, seen, g) = (&lg, &seen, &gened[0]);
-                sc.spawn(move || (c * 1250..(c + 1) * 1250).map(|i| {
-                    let row = [temp, k as f32, p, rep, (i as f32 + 0.5) / 20000.0, 0.0, -1.0, pres];
-                    sample::sample_row(lg, |t| seen.contains(&t), |t| g.contains(&t), &row).0
-                }).collect::<Vec<u32>>())
-            }).collect();
+            let parts: Vec<_> = (0..16)
+                .map(|c| {
+                    let (lg, seen, g) = (&lg, &seen, &gened[0]);
+                    sc.spawn(move || {
+                        (c * 1250..(c + 1) * 1250)
+                            .map(|i| {
+                                let row = [temp, k as f32, p, rep, (i as f32 + 0.5) / 20000.0, 0.0, -1.0, pres];
+                                sample::sample_row(lg, |t| seen.contains(&t), |t| g.contains(&t), &row).0
+                            })
+                            .collect::<Vec<u32>>()
+                    })
+                })
+                .collect();
             parts.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         for t in draws {
@@ -732,14 +867,23 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
                 }
             }
             let keys: std::collections::HashSet<u32> = want.keys().chain(got.keys()).copied().collect();
-            let tv: f64 = keys.iter().map(|t| (want.get(t).copied().unwrap_or(0.0) - got.get(t).copied().unwrap_or(0.0)).abs()).sum::<f64>() / 2.0;
+            let tv: f64 = keys
+                .iter()
+                .map(|t| (want.get(t).copied().unwrap_or(0.0) - got.get(t).copied().unwrap_or(0.0)).abs())
+                .sum::<f64>()
+                / 2.0;
             max_tv = max_tv.max(tv);
             let pd = d.map_or(0.0, |d| want.get(&d).copied().unwrap_or(0.0));
-            println!("draft {d:?} at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: total variation {tv:.3} over {} draws (p(draft) {pd:.3})", draws / 2);
+            println!(
+                "draft {d:?} at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: total variation {tv:.3} over {} draws (p(draft) {pd:.3})",
+                draws / 2
+            );
         }
     }
     ensure!(disagree == 0, "samplecheck: {disagree} draws differ from the host reference");
-    println!("every draw agrees with the host reference; max total variation of the accept-or-resample result {max_tv:.3}");
+    println!(
+        "every draw agrees with the host reference; max total variation of the accept-or-resample result {max_tv:.3}"
+    );
     Ok(())
 }
 
@@ -757,9 +901,14 @@ pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
             let pos = prompt.len() + out.len() - 1;
             let good = step % (k + 1);
             step += 1;
-            let d: Vec<u32> = (0..k).map(|j| if j < good { reference.get(out.len() + j).copied().unwrap_or(7) } else { 7 + j as u32 }).collect();
-            let toks: Vec<Tok> = std::iter::once(*out.last().unwrap()).chain(d.iter().copied()).enumerate()
-                .map(|(j, id)| Tok { id, slot, pos: (pos + j) as u32 }).collect();
+            let d: Vec<u32> = (0..k)
+                .map(|j| if j < good { reference.get(out.len() + j).copied().unwrap_or(7) } else { 7 + j as u32 })
+                .collect();
+            let toks: Vec<Tok> = std::iter::once(*out.last().unwrap())
+                .chain(d.iter().copied())
+                .enumerate()
+                .map(|(j, id)| Tok { id, slot, pos: (pos + j) as u32 })
+                .collect();
             m.run(&toks, &(0..toks.len()).collect::<Vec<_>>())?;
             let am = m.argmax()?;
             for (j, &t) in am.iter().enumerate() {
@@ -795,9 +944,11 @@ pub fn swapcheck(opts: &Opts, dir: &str) -> Result<()> {
     ensure!(len.is_multiple_of(64), "--len: a multiple of 64");
     let tail = 256;
     let mut m = opts.load_at(dir, len + 1024, 3)?;
-    let seq = |k: usize| -> Vec<u32> { (0..len + tail).map(|i| 1000 + ((i * 7919 + k * 104729) % 20000) as u32).collect() };
+    let seq =
+        |k: usize| -> Vec<u32> { (0..len + tail).map(|i| 1000 + ((i * 7919 + k * 104729) % 20000) as u32).collect() };
     let (a, b, c) = (seq(1), seq(2), seq(3));
-    let held = |ids: &[u32]| sessions::Held { tokens: ids[..len].to_vec(), adapter: false, dirty: false, snaps: Vec::new() };
+    let held =
+        |ids: &[u32]| sessions::Held { tokens: ids[..len].to_vec(), adapter: false, dirty: false, snaps: Vec::new() };
     // each alone in a slot: its prompt, then its tail
     let mut refs = Vec::new();
     for ids in [&a, &b] {
@@ -826,7 +977,10 @@ pub fn swapcheck(opts: &Opts, dir: &str) -> Result<()> {
         m.release(slot)?;
         free.push(slot);
     }
-    ensure!(all, "swapcheck: MISMATCH, the sequences do not continue identically after moving between slots and host memory");
+    ensure!(
+        all,
+        "swapcheck: MISMATCH, the sequences do not continue identically after moving between slots and host memory"
+    );
     println!("sequences continue identically after moving between slots and host memory");
     Ok(())
 }
@@ -879,8 +1033,12 @@ pub fn cachecheck(opts: &Opts, dir: &str) -> Result<()> {
         let maxd = max_diff(&la, &lb);
         let same = ta.iter().zip(&tb).filter(|(a, b)| a == b).count();
         all &= maxd == 0.0 && same == ta.len();
-        println!("context {len}, saved at {cut}: max |logit diff| {maxd} over {v} logits; decoded tokens identical at \
-                  {same}/{}; image {:.1} MB, save {save_ms:.0} ms, load {load_ms:.0} ms", ta.len(), img2.bytes() as f64 / 1e6);
+        println!(
+            "context {len}, saved at {cut}: max |logit diff| {maxd} over {v} logits; decoded tokens identical at \
+                  {same}/{}; image {:.1} MB, save {save_ms:.0} ms, load {load_ms:.0} ms",
+            ta.len(),
+            img2.bytes() as f64 / 1e6
+        );
     }
     ensure!(all, "cachecheck: MISMATCH, the slots do not continue identically after save and load");
     println!("slots continue identically after save and load");
@@ -903,13 +1061,17 @@ pub fn longcheck(opts: &Opts, dir: &str) -> Result<()> {
             let step = toks(&ids, c, (c + 64).min(len), 0);
             let rows: Vec<usize> = (0..step.len()).filter(|j| c + j >= tail).collect();
             m.run(&step, &rows)?;
-            if !rows.is_empty() { a.extend(m.logits()?); }
+            if !rows.is_empty() {
+                a.extend(m.logits()?);
+            }
         }
         // slot 1: one token per step
         let mut b = Vec::new();
         for (i, &id) in ids.iter().enumerate() {
             m.run(&[Tok { id, slot: 1, pos: i as u32 }], &[0])?;
-            if i >= tail { b.extend(m.logits()?); }
+            if i >= tail {
+                b.extend(m.logits()?);
+            }
         }
         let (mut maxd, mut agree) = (0f32, 0);
         for r in 0..64 {
@@ -979,9 +1141,12 @@ pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
         for step in &steps {
             let (mut toks, mut rows, mut which) = (Vec::new(), Vec::new(), Vec::new());
             for &(s, p0, c) in step {
-                let hist: Vec<u32> = ids[s].iter().copied().chain(refs[s][models[s] as usize].1.iter().copied()).collect();
+                let hist: Vec<u32> =
+                    ids[s].iter().copied().chain(refs[s][models[s] as usize].1.iter().copied()).collect();
                 // prompt chunks: the reference's positions in the chunk (half the rows each); decode: every token
-                let mut want: Vec<usize> = if p0 >= ids[s].len() { (p0..p0 + c).collect() } else {
+                let mut want: Vec<usize> = if p0 >= ids[s].len() {
+                    (p0..p0 + c).collect()
+                } else {
                     pos[s].iter().map(|&q| q as usize).filter(|&q| q >= p0 && q < p0 + c).take(max_out / 2).collect()
                 };
                 want.truncate(max_out / 2);
@@ -1031,14 +1196,25 @@ pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
         for s in 0..2 {
             let mean = sum[s] / cnt[s].max(1) as f64;
             means.push(mean as f32);
-            println!("mixed run, slot {s} ({}, prompt {}): mean |logit diff| {mean:.5} vs. the reference at {} positions; \
-                      greedy agrees with the reference's at {}/{} decode positions", names[models[s] as usize],
-                     prompts[s], cnt[s] / vocab, agree[s], dec[s]);
+            println!(
+                "mixed run, slot {s} ({}, prompt {}): mean |logit diff| {mean:.5} vs. the reference at {} positions; \
+                      greedy agrees with the reference's at {}/{} decode positions",
+                names[models[s] as usize],
+                prompts[s],
+                cnt[s] / vocab,
+                agree[s],
+                dec[s]
+            );
         }
     }
     println!("mixed steps: {same}/{rows} logit rows identical to the steps with one model (max |diff| {worst})");
-    ensure!(same == rows, "adaptercheck: only {same}/{rows} rows of the mixed steps are identical to the steps with one model");
+    ensure!(
+        same == rows,
+        "adaptercheck: only {same}/{rows} rows of the mixed steps are identical to the steps with one model"
+    );
     let worst = below("adaptercheck: mean |logit diff|", means, limit)?;
-    println!("mixed base + adapter steps: {rows} rows identical to one-model steps, mean |logit diff| at most {worst:.5} (< {limit})");
+    println!(
+        "mixed base + adapter steps: {rows} rows identical to one-model steps, mean |logit diff| at most {worst:.5} (< {limit})"
+    );
     Ok(())
 }

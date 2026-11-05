@@ -81,8 +81,11 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(s: &Arc<CudaStream>, d: &Dims) -> Result<Self> {
         let rows = PAIRS.max(TPAIRS * 16) * d.nh;
-        Ok(Scratch { q: s.alloc_zeros(MAX_TOK * d.nh * HD)?, ml: s.alloc_zeros(rows * 2)?,
-                     acc: s.alloc_zeros(rows * HD)? })
+        Ok(Scratch {
+            q: s.alloc_zeros(MAX_TOK * d.nh * HD)?,
+            ml: s.alloc_zeros(rows * 2)?,
+            acc: s.alloc_zeros(rows * HD)?,
+        })
     }
 }
 
@@ -108,15 +111,24 @@ pub struct Attn {
 
 impl Attn {
     /// `prefix`: e.g. "model.language_model.layers.3.self_attn"
-    pub fn new(s: &Arc<CudaStream>, pool: &Arc<Pool>, w: &Checkpoint, prefix: &str, slots: usize,
-               max_ctx: usize) -> Result<Self> {
+    pub fn new(
+        s: &Arc<CudaStream>,
+        pool: &Arc<Pool>,
+        w: &Checkpoint,
+        prefix: &str,
+        slots: usize,
+        max_ctx: usize,
+    ) -> Result<Self> {
         let q_norm = super::norm(w, &format!("{prefix}.q_norm.weight"))?;
         let k_norm = super::norm(w, &format!("{prefix}.k_norm.weight"))?;
         ensure!(q_norm.len() == HD && k_norm.len() == HD, "{prefix}: norms of {} and {}", q_norm.len(), k_norm.len());
         let inv_freq: Vec<f32> = (0..ROT / 2).map(|i| THETA.powf(-2.0 * i as f64 / ROT as f64) as f32).collect();
         let cap = max_ctx.div_ceil(CAP_ALIGN) * CAP_ALIGN;
-        ensure!((NKV * cap * 4).is_multiple_of(pool.page()) && (cap * HD).is_multiple_of(pool.page()), "pages of {} bytes",
-                pool.page());
+        ensure!(
+            (NKV * cap * 4).is_multiple_of(pool.page()) && (cap * HD).is_multiple_of(pool.page()),
+            "pages of {} bytes",
+            pool.page()
+        );
         let cache = slots * NKV * cap * HD;
         Ok(Attn {
             q_norm: s.clone_htod(&q_norm)?,
@@ -173,7 +185,12 @@ impl Attn {
         let (n, vl) = (to - from, to.div_ceil(16) * 16 - from);
         (0..NKV).flat_map(move |g| {
             let p = (slot * NKV + g) * self.cap + from;
-            [(&self.kc, p * HD, n * HD), (&self.vc, p * HD, vl * HD), (&self.ks, p * 4, n * 4), (&self.vs, p * 4, n * 4)]
+            [
+                (&self.kc, p * HD, n * HD),
+                (&self.vc, p * HD, vl * HD),
+                (&self.ks, p * 4, n * 4),
+                (&self.vs, p * 4, n * 4),
+            ]
         })
     }
 
@@ -184,7 +201,11 @@ impl Attn {
 
     /// Slot `slot`'s cache for positions [from, to) (mapped) into `out` (saved_bytes long)
     pub fn save(&self, slot: usize, from: usize, to: usize, out: &mut [u8]) -> Result<()> {
-        ensure!(from.is_multiple_of(16) && from <= to && to <= self.mapped[slot], "slot {slot}: positions {from}..{to} of {}", self.mapped[slot]);
+        ensure!(
+            from.is_multiple_of(16) && from <= to && to <= self.mapped[slot],
+            "slot {slot}: positions {from}..{to} of {}",
+            self.mapped[slot]
+        );
         ensure!(out.len() == self.saved_bytes(from, to), "{} bytes for positions {from}..{to}", out.len());
         let mut o = out;
         for (region, at, n) in self.layout(slot, from, to) {
@@ -198,7 +219,11 @@ impl Attn {
     /// Put a cache from save for positions [from, to) into slot `slot`; the bytes it took; None when the pages ran out
     pub fn load(&mut self, slot: usize, from: usize, to: usize, data: &[u8]) -> Result<Option<usize>> {
         let nb = self.saved_bytes(from, to);
-        ensure!(from.is_multiple_of(16) && data.len() >= nb, "a cache of {} bytes for positions {from}..{to}, not {nb}", data.len());
+        ensure!(
+            from.is_multiple_of(16) && data.len() >= nb,
+            "a cache of {} bytes for positions {from}..{to}, not {nb}",
+            data.len()
+        );
         if !self.map(slot, to)? {
             return Ok(None);
         }
@@ -254,38 +279,100 @@ impl Attn {
         let (s, st, b, k, sc) = (c.s, c.st, c.b, &c.k.attn, &c.b.attn);
         let (nh, group) = (c.d.nh, c.d.nh / NKV);
         let (sp, n, cap) = (split as i32, st.n as i32, self.cap as i32);
-        let qscale = std::f32::consts::LOG2_E / 16.0;  // scores in base 2, over sqrt(HD)
+        let qscale = std::f32::consts::LOG2_E / 16.0; // scores in base 2, over sqrt(HD)
         let (kc, vc, ks, vs) = (self.kc.ptr(), self.vc.ptr(), self.ks.ptr(), self.vs.ptr());
         unsafe {
-            s.launch_builder(&k.prep).arg(&b.part).arg(&sp).arg(&n).arg(&self.q_norm).arg(&self.k_norm).arg(&self.inv_freq)
-                .arg(&qscale).arg(&sc.q).arg(&b.o).arg(&kc).arg(&vc).arg(&ks).arg(&vs).arg(&st.tok_slot).arg(&st.tok_pos)
-                .arg(&cap).launch(cfg((st.n, 1, 1), 32 * (nh + 2 * NKV)))?;
+            s.launch_builder(&k.prep)
+                .arg(&b.part)
+                .arg(&sp)
+                .arg(&n)
+                .arg(&self.q_norm)
+                .arg(&self.k_norm)
+                .arg(&self.inv_freq)
+                .arg(&qscale)
+                .arg(&sc.q)
+                .arg(&b.o)
+                .arg(&kc)
+                .arg(&vc)
+                .arg(&ks)
+                .arg(&vs)
+                .arg(&st.tok_slot)
+                .arg(&st.tok_pos)
+                .arg(&cap)
+                .launch(cfg((st.n, 1, 1), 32 * (nh + 2 * NKV)))?;
             if st.ndec > 0 {
                 let z = Self::splits(st);
                 let zi = z as i32;
                 // row tiles (attn_mq1..3) for the step's longest short segment
                 let rt = (st.dmax * group).div_ceil(16);
-                s.launch_builder(&k.decode[rt - 1]).arg(&sc.q).arg(&kc).arg(&vc).arg(&ks).arg(&vs).arg(&st.dseg)
-                    .arg(&st.dtok).arg(&st.tok_slot).arg(&st.tok_pos).arg(&cap).arg(&zi).arg(&sc.ml).arg(&sc.acc).arg(&b.o)
-                    .launch(LaunchConfig { shared_mem_bytes: mq_smem(rt) as u32, ..cfg((st.ndseg, NKV, z), 32 * rt) })?;
+                s.launch_builder(&k.decode[rt - 1])
+                    .arg(&sc.q)
+                    .arg(&kc)
+                    .arg(&vc)
+                    .arg(&ks)
+                    .arg(&vs)
+                    .arg(&st.dseg)
+                    .arg(&st.dtok)
+                    .arg(&st.tok_slot)
+                    .arg(&st.tok_pos)
+                    .arg(&cap)
+                    .arg(&zi)
+                    .arg(&sc.ml)
+                    .arg(&sc.acc)
+                    .arg(&b.o)
+                    .launch(LaunchConfig {
+                        shared_mem_bytes: mq_smem(rt) as u32,
+                        ..cfg((st.ndseg, NKV, z), 32 * rt)
+                    })?;
                 if z > 1 {
-                    s.launch_builder(&k.combine).arg(&sc.ml).arg(&sc.acc).arg(&st.dtok).arg(&st.dkeys).arg(&zi)
-                        .arg(&b.o).launch(cfg((st.ndec, nh, 1), HD))?;
+                    s.launch_builder(&k.combine)
+                        .arg(&sc.ml)
+                        .arg(&sc.acc)
+                        .arg(&st.dtok)
+                        .arg(&st.dkeys)
+                        .arg(&zi)
+                        .arg(&b.o)
+                        .launch(cfg((st.ndec, nh, 1), HD))?;
                 }
             }
             if st.ntile > 0 {
                 let z = Self::tile_splits(st);
                 let (zi, kps) = (z as i32, (TKPS * st.ntile) as i32);
                 let lc = LaunchConfig { shared_mem_bytes: PREFILL_SMEM as u32, ..cfg((st.ntile, NKV, z), 32 * 4) };
-                s.launch_builder(&k.prefill).arg(&sc.q).arg(&kc).arg(&vc).arg(&ks).arg(&vs).arg(&st.ptile).arg(&st.tok_slot)
-                    .arg(&st.tok_pos).arg(&cap).arg(&zi).arg(&kps).arg(&sc.ml).arg(&sc.acc).arg(&b.o).launch(lc)?;
+                s.launch_builder(&k.prefill)
+                    .arg(&sc.q)
+                    .arg(&kc)
+                    .arg(&vc)
+                    .arg(&ks)
+                    .arg(&vs)
+                    .arg(&st.ptile)
+                    .arg(&st.tok_slot)
+                    .arg(&st.tok_pos)
+                    .arg(&cap)
+                    .arg(&zi)
+                    .arg(&kps)
+                    .arg(&sc.ml)
+                    .arg(&sc.acc)
+                    .arg(&b.o)
+                    .launch(lc)?;
                 if z > 1 {
-                    s.launch_builder(&k.combine_tiles).arg(&sc.ml).arg(&sc.acc).arg(&st.ptile).arg(&st.tok_pos)
-                        .arg(&zi).arg(&kps).arg(&b.o).launch(cfg((st.ntile * (64 / group), nh, 1), HD))?;
+                    s.launch_builder(&k.combine_tiles)
+                        .arg(&sc.ml)
+                        .arg(&sc.acc)
+                        .arg(&st.ptile)
+                        .arg(&st.tok_pos)
+                        .arg(&zi)
+                        .arg(&kps)
+                        .arg(&b.o)
+                        .launch(cfg((st.ntile * (64 / group), nh, 1), HD))?;
                 }
             }
             let len = (st.n * c.d.mix()) as i32;
-            s.launch_builder(&c.k.to_xin).arg(&b.o).arg(&b.mix).arg(&len).launch(cfg(((st.n * c.d.mix()).div_ceil(1024).min(1024), 1, 1), 256))?;
+            s.launch_builder(&c.k.to_xin)
+                .arg(&b.o)
+                .arg(&b.mix)
+                .arg(&len)
+                .launch(cfg(((st.n * c.d.mix()).div_ceil(1024).min(1024), 1, 1), 256))?;
         }
         Ok(())
     }

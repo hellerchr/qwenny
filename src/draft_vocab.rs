@@ -5,7 +5,11 @@
 //! row, scores halve every DECAY tokens; a token without a row waits until 16 do, then gets a new tile while there is
 //! room (MAX_ROWS) and else the rows of the coldest tokens (those of score below 1, rewritten in place).
 use anyhow::{Context, Result, bail, ensure};
-use std::{fs, path::{Path, PathBuf}, time::{Duration, Instant}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 /// Rows of the draft head at most (HyperQwen's draft vocabulary: 40,960)
 pub const MAX_ROWS: usize = 65536;
@@ -35,7 +39,11 @@ struct Rows {
 impl Rows {
     /// Rows for `ids` (with their scores; none: 0), a multiple of 16 of them at most `cap`
     fn new(vocab: usize, ids: Vec<u32>, score: Vec<f32>, cap: usize) -> Result<Self> {
-        ensure!(ids.len().is_multiple_of(16) && ids.len() <= cap && cap.is_multiple_of(16), "{} rows (at most {cap})", ids.len());
+        ensure!(
+            ids.len().is_multiple_of(16) && ids.len() <= cap && cap.is_multiple_of(16),
+            "{} rows (at most {cap})",
+            ids.len()
+        );
         let mut row_of = vec![NONE; vocab];
         for (r, &t) in ids.iter().enumerate() {
             ensure!((t as usize) < vocab && row_of[t as usize] == NONE, "token {t} twice or beyond the vocabulary");
@@ -114,7 +122,8 @@ impl Rows {
 /// Where the rows learned for the model in `dir` are kept: $XDG_CACHE_HOME (else ~/.cache)/qwenny/draft-heads/<the
 /// model directory, / as _>.json
 fn saved_path(dir: &Path) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
     let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let name = dir.to_string_lossy().trim_matches('/').replace('/', "_");
@@ -127,7 +136,8 @@ fn read_saved(p: &Path, vocab: usize) -> Option<(Vec<u32>, Vec<f32>)> {
     let ids: Vec<u32> = serde_json::from_value(v["ids"].clone()).ok()?;
     let score: Vec<f32> = serde_json::from_value(v["score"].clone()).ok()?;
     let mut seen = vec![false; vocab];
-    let ok = ids.len() == score.len() && ids.len() <= MAX_ROWS
+    let ok = ids.len() == score.len()
+        && ids.len() <= MAX_ROWS
         && ids.iter().all(|&t| (t as usize) < vocab && !std::mem::replace(&mut seen[t as usize], true));
     if !ok {
         eprintln!("draft head: {} does not fit this model, starting from the draft vocabulary", p.display());
@@ -195,7 +205,9 @@ impl Adaptive {
         let Some(path) = &self.path else { return };
         let json = serde_json::json!({ "ids": self.rows.ids, "score": self.rows.score });
         let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        let done = path.parent().map_or(Ok(()), fs::create_dir_all)
+        let done = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
             .and_then(|_| fs::write(&tmp, json.to_string()))
             .and_then(|_| fs::rename(&tmp, path));
         match done {
@@ -227,12 +239,15 @@ pub fn draft_ids(dir: &Path, vocab: usize) -> Result<Option<Vec<u32>>> {
         Ok(v.iter().rev().fold(0, |a, &x| a << 8 | x as usize))
     };
     // the end of central directory record (no archive comment), then the central directory's entries
-    let end = b.len().checked_sub(22).filter(|&e| b[e..e + 4] == *b"PK\x05\x06")
+    let end = b
+        .len()
+        .checked_sub(22)
+        .filter(|&e| b[e..e + 4] == *b"PK\x05\x06")
         .with_context(|| format!("{}: not a zip archive", path.display()))?;
     let mut c = at(end + 16, 4)?;
     for _ in 0..at(end + 10, 2)? {
-        let (method, size, nl, el, cl, off) = (at(c + 10, 2)?, at(c + 20, 4)?, at(c + 28, 2)?, at(c + 30, 2)?,
-                                               at(c + 32, 2)?, at(c + 42, 4)?);
+        let (method, size, nl, el, cl, off) =
+            (at(c + 10, 2)?, at(c + 20, 4)?, at(c + 28, 2)?, at(c + 30, 2)?, at(c + 32, 2)?, at(c + 42, 4)?);
         if b.get(c + 46..c + 46 + nl).is_some_and(|n| n.ends_with(b"/data/0")) {
             ensure!(method == 0 && size % 8 == 0, "{}: {size} bytes (method {method}), not int64", path.display());
             let data = off + 30 + at(off + 26, 2)? + at(off + 28, 2)?;
@@ -265,7 +280,7 @@ mod tests {
     fn new_tokens_wait_for_a_tile_then_append() {
         let mut r = rows(64);
         assert!(r.take(&(100..115).collect::<Vec<_>>()).is_empty());
-        assert_eq!(r.take(&[100, 5, 115]), [2]);  // 100 again waits once; 115 is the 16th: a third tile
+        assert_eq!(r.take(&[100, 5, 115]), [2]); // 100 again waits once; 115 is the 16th: a third tile
         assert_eq!(r.ids.len(), 48);
         assert_eq!(r.row_of[115], 47);
         assert_eq!(r.score[5], 1.0);
@@ -288,10 +303,10 @@ mod tests {
         let mut r = rows(32);
         let all: Vec<u32> = (0..32).collect();
         r.take(&all);
-        assert!(r.take(&(200..216).collect::<Vec<_>>()).is_empty());  // every row in use: the new ones get none
+        assert!(r.take(&(200..216).collect::<Vec<_>>()).is_empty()); // every row in use: the new ones get none
         assert!(r.pending.is_empty() && (200..216).all(|t| r.row_of[t] == NONE && !r.waiting[t]));
         r.since = DECAY - 1;
-        r.take(&[0]);  // the halving: rows 1..31 fall below 1
+        r.take(&[0]); // the halving: rows 1..31 fall below 1
         assert_eq!(r.score[0], 1.0);
         assert!(!r.take(&(200..216).collect::<Vec<_>>()).is_empty());
         assert_eq!(r.row_of[0], 0);
@@ -325,7 +340,8 @@ mod tests {
         a.learn(&(100..116).collect::<Vec<_>>(), |ids, tiles| {
             got = Some((ids.len(), tiles.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(got, Some((48, vec![2])));
         assert!(a.dirty);
         assert_eq!(a.ids()[32..48], (100..116).collect::<Vec<_>>());
@@ -372,8 +388,11 @@ mod tests {
         let path = dir.join("mtp_draft_vocab_ids.pt");
         fs::write(&path, pt_file(&[7, 3, 7, 9, 3])).unwrap();
         assert_eq!(draft_ids(&dir, 100).unwrap(), Some(vec![7, 3, 9]));
-        for (bytes, what) in [(pt_file(&[7, 100]), "beyond the vocabulary"), (pt_file(&[-1]), "beyond the vocabulary"),
-                              (b"not a zip".repeat(4), "not a zip archive")] {
+        for (bytes, what) in [
+            (pt_file(&[7, 100]), "beyond the vocabulary"),
+            (pt_file(&[-1]), "beyond the vocabulary"),
+            (b"not a zip".repeat(4), "not a zip archive"),
+        ] {
             fs::write(&path, bytes).unwrap();
             let e = draft_ids(&dir, 100).unwrap_err().to_string();
             assert!(e.contains(what) && e.contains("mtp_draft_vocab_ids.pt"), "{e}");

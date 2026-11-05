@@ -71,10 +71,14 @@ impl Quant {
     /// in the value range: symmetric and integer-zero-point formats (compressed-tensors, GPTQ, AWQ)
     pub fn zero_points(&self) -> Option<Vec<u8>> {
         let max = ((1u32 << self.bits) - 1) as f32;
-        self.scales.iter().zip(&self.offsets).map(|(&s, &o)| {
-            let z = if s == 0.0 { 0.0 } else { -o / s };
-            (z.round() >= 0.0 && z.round() <= max && (z - z.round()).abs() < 1e-3).then(|| z.round() as u8)
-        }).collect()
+        self.scales
+            .iter()
+            .zip(&self.offsets)
+            .map(|(&s, &o)| {
+                let z = if s == 0.0 { 0.0 } else { -o / s };
+                (z.round() >= 0.0 && z.round() <= max && (z - z.round()).abs() < 1e-3).then(|| z.round() as u8)
+            })
+            .collect()
     }
 
     /// Matrices with the same columns and quantization, stacked by rows
@@ -82,7 +86,10 @@ impl Quant {
         let mut it = parts.into_iter();
         let mut out = it.next().context("nothing to stack")?;
         for p in it {
-            ensure!((p.bits, p.group, p.cols) == (out.bits, out.group, out.cols), "stacking differently quantized matrices");
+            ensure!(
+                (p.bits, p.group, p.cols) == (out.bits, out.group, out.cols),
+                "stacking differently quantized matrices"
+            );
             out.rows += p.rows;
             out.q.extend(p.q);
             out.scales.extend(p.scales);
@@ -95,7 +102,11 @@ impl Quant {
 /// A weight matrix as stored
 pub enum Matrix {
     /// bf16 bits [rows][cols]
-    Dense { w: Vec<u16>, rows: usize, cols: usize },
+    Dense {
+        w: Vec<u16>,
+        rows: usize,
+        cols: usize,
+    },
     Quant(Quant),
 }
 
@@ -116,10 +127,16 @@ pub struct Checkpoint {
 /// How a checkpoint's quantized matrices are stored
 #[derive(Clone, Copy, Debug)]
 enum Scheme {
-    Mlx { bits: usize, group: usize },
+    Mlx {
+        bits: usize,
+        group: usize,
+    },
     /// compressed-tensors pack-quantized; `group` 0: one group per row (strategy "channel"); a matrix is
     /// symmetric unless it stores `weight_zero_point`
-    Packed { bits: usize, group: usize },
+    Packed {
+        bits: usize,
+        group: usize,
+    },
 }
 
 /// compressed-tensors' quantization_config: its weight scheme (int, 4 or 8 bits, grouped or per channel, no activation
@@ -132,8 +149,12 @@ fn packed_scheme(qc: &Json) -> Result<Scheme> {
     let groups = qc["config_groups"].as_object().context("config_groups")?;
     let mut schemes = Vec::new();
     for g in groups.values() {
-        ensure!(g["input_activations"].is_null(), "activation quantization (w{}a{}) is not supported: weights only",
-                g["weights"]["num_bits"], g["input_activations"]["num_bits"]);
+        ensure!(
+            g["input_activations"].is_null(),
+            "activation quantization (w{}a{}) is not supported: weights only",
+            g["weights"]["num_bits"],
+            g["input_activations"]["num_bits"]
+        );
         let w = &g["weights"];
         ensure!(w["type"] == "int", "compressed-tensors weights of type {}: int only", w["type"]);
         let bits = w["num_bits"].as_u64().context("num_bits")? as usize;
@@ -143,13 +164,18 @@ fn packed_scheme(qc: &Json) -> Result<Scheme> {
             Some("channel") => 0,
             other => bail!("compressed-tensors strategy {other:?}: group or channel"),
         };
-        ensure!(w["actorder"].is_null() || w["actorder"] == "static" || w["actorder"] == "weight" || w["actorder"] == false,
-                "actorder {}: activation-ordered groups (g_idx) are not supported", w["actorder"]);
+        ensure!(
+            w["actorder"].is_null() || w["actorder"] == "static" || w["actorder"] == "weight" || w["actorder"] == false,
+            "actorder {}: activation-ordered groups (g_idx) are not supported",
+            w["actorder"]
+        );
         schemes.push((bits, group));
     }
     let &(bits, group) = schemes.first().context("no compressed-tensors config groups")?;
-    ensure!(schemes.iter().all(|s| s.1 == group) && (schemes.len() == 1 || group > 0),
-            "compressed-tensors config groups of different group sizes: {schemes:?}");
+    ensure!(
+        schemes.iter().all(|s| s.1 == group) && (schemes.len() == 1 || group > 0),
+        "compressed-tensors config groups of different group sizes: {schemes:?}"
+    );
     Ok(Scheme::Packed { bits, group })
 }
 
@@ -172,8 +198,12 @@ impl Checkpoint {
         let names: Vec<String> = match fs::read_to_string(dir.join("model.safetensors.index.json")) {
             Ok(text) => {
                 let idx: Json = serde_json::from_str(&text)?;
-                let mut files: Vec<String> = idx["weight_map"].as_object().context("weight_map")?.values()
-                    .filter_map(|v| v.as_str().map(String::from)).collect();
+                let mut files: Vec<String> = idx["weight_map"]
+                    .as_object()
+                    .context("weight_map")?
+                    .values()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
                 files.sort();
                 files.dedup();
                 files
@@ -194,26 +224,38 @@ impl Checkpoint {
         }
         // Qwen3.5 keeps its text model under model.language_model. (beside the vision tower and MTP): names as stored
         // (the embedding may be stored packed: HyperQwen's AutoRound keeps it int8)
-        let embed = |n: &str| index.contains_key(&format!("{n}.weight")) || index.contains_key(&format!("{n}.weight_packed"));
+        let embed =
+            |n: &str| index.contains_key(&format!("{n}.weight")) || index.contains_key(&format!("{n}.weight_packed"));
         let prefix = if embed("model.language_model.embed_tokens") {
             String::new()
         } else {
-            ["", "language_model."].into_iter()
+            ["", "language_model."]
+                .into_iter()
                 .find(|p| embed(&format!("{p}model.embed_tokens")))
-                .context("no model.embed_tokens.weight: not a Qwen3.5-style checkpoint")?.to_string()
+                .context("no model.embed_tokens.weight: not a Qwen3.5-style checkpoint")?
+                .to_string()
         };
         let index = index.into_iter().filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.to_string(), v))).collect();
         let (q, qc) = (&config["quantization"], &config["quantization_config"]);
         let quant = if q.is_object() {
-            ensure!(q["mode"].as_str().unwrap_or("affine") == "affine", "quantization mode {}: only MLX's affine one", q["mode"]);
-            let (bits, group) = (q["bits"].as_u64().context("quantization bits")? as usize,
-                                 q["group_size"].as_u64().context("quantization group_size")? as usize);
+            ensure!(
+                q["mode"].as_str().unwrap_or("affine") == "affine",
+                "quantization mode {}: only MLX's affine one",
+                q["mode"]
+            );
+            let (bits, group) = (
+                q["bits"].as_u64().context("quantization bits")? as usize,
+                q["group_size"].as_u64().context("quantization group_size")? as usize,
+            );
             ensure!([4, 8].contains(&bits), "{bits}-bit weights: 4 or 8");
             Some(Scheme::Mlx { bits, group })
         } else if qc.is_object() {
-            ensure!(qc["quant_method"] == "compressed-tensors",
-                    "quantization_config {}: compressed-tensors (llm-compressor, AutoRound, GPTQModel for vLLM) and MLX's \
-                     format are supported", qc["quant_method"]);
+            ensure!(
+                qc["quant_method"] == "compressed-tensors",
+                "quantization_config {}: compressed-tensors (llm-compressor, AutoRound, GPTQModel for vLLM) and MLX's \
+                     format are supported",
+                qc["quant_method"]
+            );
             Some(packed_scheme(qc)?)
         } else {
             None
@@ -266,7 +308,8 @@ impl Checkpoint {
         let format = |dtype: Dtype| float_format(dtype).with_context(|| format!("{base}: {dtype:?} values"));
         if !self.packed(base) {
             ensure!(!self.is_quant(base), "{base}: row reads of MLX-quantized matrices are not supported");
-            let (dtype, shape, data) = self.raw(&format!("{base}.weight")).with_context(|| format!("tensor {base}.weight"))?;
+            let (dtype, shape, data) =
+                self.raw(&format!("{base}.weight")).with_context(|| format!("tensor {base}.weight"))?;
             let (cols, (width, value)) = (shape[1], format(dtype)?);
             let mut out = Vec::with_capacity(ids.len() * cols);
             for &r in ids {
@@ -333,7 +376,10 @@ impl Checkpoint {
 
     fn words(&self, name: &str) -> Result<(Vec<u32>, Vec<usize>)> {
         let (dtype, shape, data) = self.raw(name).with_context(|| format!("tensor {name}"))?;
-        ensure!(matches!(dtype, Dtype::U32 | Dtype::I32) && shape.len() == 2, "{name} is {dtype:?} {shape:?}, expected packed 32-bit words");
+        ensure!(
+            matches!(dtype, Dtype::U32 | Dtype::I32) && shape.len() == 2,
+            "{name} is {dtype:?} {shape:?}, expected packed 32-bit words"
+        );
         Ok((data.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect(), shape.to_vec()))
     }
 
@@ -342,8 +388,10 @@ impl Checkpoint {
         let (rows, cols) = (shape[0], shape[1] * 32 / bits);
         let (scales, s_shape) = self.floats(&format!("{base}.scales"))?;
         let (offsets, _) = self.floats(&format!("{base}.biases"))?;
-        ensure!(s_shape == [rows, cols / group] && offsets.len() == scales.len(),
-                "{base}: scales {s_shape:?} for {rows} x {cols} in groups of {group}");
+        ensure!(
+            s_shape == [rows, cols / group] && offsets.len() == scales.len(),
+            "{base}: scales {s_shape:?} for {rows} x {cols} in groups of {group}"
+        );
         Ok(Quant { bits, group, rows, cols, q, scales, offsets })
     }
 
@@ -364,12 +412,19 @@ impl Checkpoint {
         // the matrix's own bits (config groups may differ in them)
         let bits = if (shape[1] * 32).is_multiple_of(cols) { shape[1] * 32 / cols } else { bits };
         ensure!([4, 8].contains(&bits), "{base}: {} words per row for {cols} columns", shape[1]);
-        ensure!(cols == shape[1] * 32 / bits, "{base}: {cols} columns in {} words of {bits}-bit values (padded rows are not supported)", shape[1]);
+        ensure!(
+            cols == shape[1] * 32 / bits,
+            "{base}: {cols} columns in {} words of {bits}-bit values (padded rows are not supported)",
+            shape[1]
+        );
         let group = if group == 0 { cols } else { group };
         ensure!(cols % group == 0, "{base}: {cols} columns in groups of {group}");
         let groups = cols / group;
         let (scales, s_shape) = self.floats(&format!("{base}.weight_scale"))?;
-        ensure!(s_shape.iter().product::<usize>() == rows * groups, "{base}: weight_scale {s_shape:?} for {rows} rows of {groups} groups");
+        ensure!(
+            s_shape.iter().product::<usize>() == rows * groups,
+            "{base}: weight_scale {s_shape:?} for {rows} rows of {groups} groups"
+        );
         let zeros: Vec<f32> = if !self.has_zero_point(base) {
             vec![(1 << (bits - 1)) as f32; rows * groups]
         } else {
@@ -377,13 +432,21 @@ impl Checkpoint {
             let (z, z_shape) = self.words(&format!("{base}.weight_zero_point"))?;
             let (per, mask) = (32 / bits, (1u32 << bits) - 1);
             let along_rows = z_shape == [rows.div_ceil(per), groups];
-            ensure!(along_rows || z_shape == [rows, groups.div_ceil(per)],
-                    "{base}: weight_zero_point {z_shape:?} for {rows} x {groups} groups");
-            (0..rows * groups).map(|i| {
-                let (r, g) = (i / groups, i % groups);
-                let v = if along_rows { z[(r / per) * groups + g] >> ((r % per) * bits) } else { z[r * z_shape[1] + g / per] >> ((g % per) * bits) };
-                (v & mask) as f32
-            }).collect()
+            ensure!(
+                along_rows || z_shape == [rows, groups.div_ceil(per)],
+                "{base}: weight_zero_point {z_shape:?} for {rows} x {groups} groups"
+            );
+            (0..rows * groups)
+                .map(|i| {
+                    let (r, g) = (i / groups, i % groups);
+                    let v = if along_rows {
+                        z[(r / per) * groups + g] >> ((r % per) * bits)
+                    } else {
+                        z[r * z_shape[1] + g / per] >> ((g % per) * bits)
+                    };
+                    (v & mask) as f32
+                })
+                .collect()
         };
         let offsets = scales.iter().zip(&zeros).map(|(s, z)| -s * z).collect();
         Ok(Quant { bits, group, rows, cols, q, scales, offsets })

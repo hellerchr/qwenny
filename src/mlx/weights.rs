@@ -33,28 +33,58 @@ impl Dims {
     pub fn of(config: &serde_json::Value) -> Result<Self> {
         let tc = config.get("text_config").unwrap_or(config);
         let get = |k: &str| tc[k].as_u64().map(|v| v as i32);
-        for (key, want) in [("num_key_value_heads", NKV), ("head_dim", HD),
-                            ("linear_num_key_heads", LK_HEADS), ("linear_key_head_dim", LKD),
-                            ("linear_value_head_dim", LVD), ("linear_conv_kernel_dim", CONV_K)] {
+        for (key, want) in [
+            ("num_key_value_heads", NKV),
+            ("head_dim", HD),
+            ("linear_num_key_heads", LK_HEADS),
+            ("linear_key_head_dim", LKD),
+            ("linear_value_head_dim", LVD),
+            ("linear_conv_kernel_dim", CONV_K),
+        ] {
             ensure!(get(key) == Some(want), "config {key} = {}, expected {want}", tc[key]);
         }
-        ensure!(tc["rms_norm_eps"].as_f64().is_some_and(|e| (e - EPS as f64).abs() < 1e-12), "rms_norm_eps {}", tc["rms_norm_eps"]);
-        ensure!(tc["attn_output_gate"].as_bool() == Some(true) && tc["attention_bias"].as_bool() == Some(false),
-                "attention without the output gate or with biases");
-        ensure!(tc.get("num_experts").and_then(|x| x.as_u64()).unwrap_or(0) == 0, "MoE Qwen checkpoints are not supported");
+        ensure!(
+            tc["rms_norm_eps"].as_f64().is_some_and(|e| (e - EPS as f64).abs() < 1e-12),
+            "rms_norm_eps {}",
+            tc["rms_norm_eps"]
+        );
+        ensure!(
+            tc["attn_output_gate"].as_bool() == Some(true) && tc["attention_bias"].as_bool() == Some(false),
+            "attention without the output gate or with biases"
+        );
+        ensure!(
+            tc.get("num_experts").and_then(|x| x.as_u64()).unwrap_or(0) == 0,
+            "MoE Qwen checkpoints are not supported"
+        );
         let rope = &tc["rope_parameters"];
-        ensure!(rope["rope_type"] == "default" && rope["rope_theta"].as_f64() == Some(THETA)
-                && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64), "rope {rope}");
-        Ok(Dims { nh: get("num_attention_heads").context("num_attention_heads")?,
-                  lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")?,
-                  vocab: tc["vocab_size"].as_u64().context("vocab_size")? as usize })
+        ensure!(
+            rope["rope_type"] == "default"
+                && rope["rope_theta"].as_f64() == Some(THETA)
+                && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64),
+            "rope {rope}"
+        );
+        Ok(Dims {
+            nh: get("num_attention_heads").context("num_attention_heads")?,
+            lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")?,
+            vocab: tc["vocab_size"].as_u64().context("vocab_size")? as usize,
+        })
     }
 
-    pub fn q_width(self) -> i32 { self.nh * HD }
-    pub fn kv_width(self) -> i32 { NKV * HD }
-    pub fn key_width(self) -> i32 { LK_HEADS * LKD }
-    pub fn value_width(self) -> i32 { self.lv_heads * LVD }
-    pub fn conv_width(self) -> i32 { 2 * self.key_width() + self.value_width() }
+    pub fn q_width(self) -> i32 {
+        self.nh * HD
+    }
+    pub fn kv_width(self) -> i32 {
+        NKV * HD
+    }
+    pub fn key_width(self) -> i32 {
+        LK_HEADS * LKD
+    }
+    pub fn value_width(self) -> i32 {
+        self.lv_heads * LVD
+    }
+    pub fn conv_width(self) -> i32 {
+        2 * self.key_width() + self.value_width()
+    }
 }
 
 /// x W^T for W [out][in], dense in f16 or in MLX's affine quantized layout.
@@ -117,8 +147,11 @@ impl Linear {
         Ok(match self {
             Linear::Dense(w) => Linear::Dense(w.take_axis(&idx, 0)?),
             Linear::Quant { w, scales, biases, group, bits } => Linear::Quant {
-                w: w.take_axis(&idx, 0)?, scales: scales.take_axis(&idx, 0)?, biases: biases.take_axis(&idx, 0)?,
-                group: *group, bits: *bits,
+                w: w.take_axis(&idx, 0)?,
+                scales: scales.take_axis(&idx, 0)?,
+                biases: biases.take_axis(&idx, 0)?,
+                group: *group,
+                bits: *bits,
             },
         })
     }
@@ -155,15 +188,26 @@ impl Linear {
 #[derive(Clone, Copy, Debug)]
 pub enum Spec {
     Dense,
-    Quant { group: i32, bits: i32, #[cfg_attr(not(has_metal), expect(dead_code))] draft: bool },
+    Quant {
+        group: i32,
+        bits: i32,
+        #[cfg_attr(not(has_metal), expect(dead_code))]
+        draft: bool,
+    },
 }
 
 impl Spec {
     fn for_draft(self) -> Self {
-        match self { Spec::Dense => self, Spec::Quant { group, bits, .. } => Spec::Quant { group, bits, draft: true } }
+        match self {
+            Spec::Dense => self,
+            Spec::Quant { group, bits, .. } => Spec::Quant { group, bits, draft: true },
+        }
     }
     fn n(self) -> usize {
-        match self { Spec::Dense => 1, Spec::Quant { .. } => 3 }
+        match self {
+            Spec::Dense => 1,
+            Spec::Quant { .. } => 3,
+        }
     }
 
     /// x W^T from the matrix's arrays (Linear::owned) at the front of `a`, as f32: products enter the f32
@@ -182,11 +226,21 @@ impl Spec {
             }
             // Measured on an M2 Pro only; the stock product may be better on chips with MLX's newer kernels.
             #[cfg(has_metal)]
-            Spec::Quant { group, bits: 4, draft: true } if x.shape()[0] == 1 && x.shape()[1] % 512 == 0 && group % 16 == 0 =>
-                super::metal::qmv(x, a),
+            Spec::Quant { group, bits: 4, draft: true }
+                if x.shape()[0] == 1 && x.shape()[1] % 512 == 0 && group % 16 == 0 =>
+            {
+                super::metal::qmv(x, a)
+            }
             #[cfg(has_metal)]
-            Spec::Quant { group, bits: bits @ (4 | 8), .. } if (1..=16).contains(&x.shape()[0]) && (x.shape()[0] >= 4 || bits == 4)
-                && group % 64 == 0 && x.shape()[1] % 64 == 0 && a[0].shape()[0] >= 1024 => super::metal::verify(x, a),
+            Spec::Quant { group, bits: bits @ (4 | 8), .. }
+                if (1..=16).contains(&x.shape()[0])
+                    && (x.shape()[0] >= 4 || bits == 4)
+                    && group % 64 == 0
+                    && x.shape()[1] % 64 == 0
+                    && a[0].shape()[0] >= 1024 =>
+            {
+                super::metal::verify(x, a)
+            }
             Spec::Quant { group, bits, .. } => ops::quantized_matmul(x, &a[0], &a[1], &a[2], true, group, bits),
         }?;
         Ok((y.as_dtype(Dtype::Float32)?, &a[self.n()..]))
@@ -239,7 +293,8 @@ pub struct Stages {
 impl Stages {
     fn of(l: &Layer, d: Dims, draft: bool) -> MResult<Self> {
         let spec = |s: Spec| if draft { s.for_draft() } else { s };
-        let (sp_in, sout, sgu, sdown) = (spec(l.in_proj.spec()), spec(l.out_proj.spec()), spec(l.gate_up.spec()), spec(l.down.spec()));
+        let (sp_in, sout, sgu, sdown) =
+            (spec(l.in_proj.spec()), spec(l.out_proj.spec()), spec(l.gate_up.spec()), spec(l.down.spec()));
         let mut pre_args = vec![l.input_norm.clone()];
         pre_args.extend(l.in_proj.owned());
         let pre = match l.kind {
@@ -310,7 +365,10 @@ impl Stages {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind { Delta, Attn }
+pub enum Kind {
+    Delta,
+    Attn,
+}
 
 pub struct Layer {
     pub kind: Kind,
@@ -377,17 +435,20 @@ fn symmetric_int8(m: Matrix) -> Result<Quant> {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let per = rows.div_ceil(threads).max(1);
     std::thread::scope(|sc| {
-        for (i, ((qc, sc_out), oc)) in q.chunks_mut(per * words).zip(scales.chunks_mut(per * groups))
-            .zip(offsets.chunks_mut(per * groups)).enumerate() {
+        for (i, ((qc, sc_out), oc)) in q
+            .chunks_mut(per * words)
+            .zip(scales.chunks_mut(per * groups))
+            .zip(offsets.chunks_mut(per * groups))
+            .enumerate()
+        {
             let w = &w;
             sc.spawn(move || {
                 for r in 0..sc_out.len() / groups {
                     let row = (i * per + r) * cols;
                     for g in 0..groups {
                         let at = row + g * group;
-                        let max = w[at..at + group].iter().fold(0f32, |m, &x| {
-                            m.max(f32::from_bits((x as u32) << 16).abs())
-                        });
+                        let max =
+                            w[at..at + group].iter().fold(0f32, |m, &x| m.max(f32::from_bits((x as u32) << 16).abs()));
                         let scale = if max > 0.0 { max / 127.0 } else { 1.0 };
                         sc_out[r * groups + g] = scale;
                         oc[r * groups + g] = -128.0 * scale;
@@ -487,7 +548,9 @@ impl Weights {
             };
             let in_ba = if kind == Kind::Delta {
                 Some(lin(&["in_proj_b", "in_proj_a"].map(|n| format!("{a}.{n}.weight")))?)
-            } else { None };
+            } else {
+                None
+            };
             let attn_norm = |n: &str| -> Result<Option<Array>> {
                 if kind == Kind::Attn { Ok(Some(norm(&format!("{a}.{n}.weight"))?)) } else { Ok(None) }
             };
@@ -507,23 +570,31 @@ impl Weights {
                 k_norm: attn_norm("k_norm")?,
                 conv_w: if kind == Kind::Delta {
                     let (w, shape) = ck.floats(&format!("{a}.conv1d.weight"))?;
-                    ensure!(shape.iter().product::<usize>() == d.conv_width() as usize * CONV_K as usize,
-                            "{a}.conv1d.weight: shape {shape:?}");
+                    ensure!(
+                        shape.iter().product::<usize>() == d.conv_width() as usize * CONV_K as usize,
+                        "{a}.conv1d.weight: shape {shape:?}"
+                    );
                     Some(Array::from_slice(&w, &[d.conv_width(), CONV_K]))
-                } else { None },
+                } else {
+                    None
+                },
                 a_log: delta_vec("A_log")?,
                 dt_bias: delta_vec("dt_bias")?,
                 delta_norm: delta_vec("norm.weight")?,
             })
         };
-        let layers = types.iter().enumerate().map(|(i, kind)| {
-            let kind = match kind.as_str() {
-                Some("linear_attention") => Kind::Delta,
-                Some("full_attention") => Kind::Attn,
-                other => bail!("layer {i}: unknown type {other:?}"),
-            };
-            load_layer(&format!("{text}.layers.{i}"), kind)
-        }).collect::<Result<Vec<_>>>()?;
+        let layers = types
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                let kind = match kind.as_str() {
+                    Some("linear_attention") => Kind::Delta,
+                    Some("full_attention") => Kind::Attn,
+                    other => bail!("layer {i}: unknown type {other:?}"),
+                };
+                load_layer(&format!("{text}.layers.{i}"), kind)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut mtp = if ck.has("mtp.fc.weight") {
             let layer = load_layer("mtp.layers.0", Kind::Attn)?;
             let stages = Stages::of(&layer, d, true)?;
@@ -539,22 +610,34 @@ impl Weights {
                 fc: lin(&["mtp.fc.weight".into()])?,
                 norm: norm("mtp.norm.weight")?,
                 head: if has_head { Some(lin(&["mtp.draft_lm_head.weight".into()])?) } else { None },
-                ids, adaptive: None, layer, stages,
+                ids,
+                adaptive: None,
+                layer,
+                stages,
             })
-        } else { None };
+        } else {
+            None
+        };
         let embed_base = format!("{text}.embed_tokens");
         let embed = dense(&[format!("{embed_base}.weight")], mats(&[format!("{embed_base}.weight")])?)?;
         let head_base = if ck.has("lm_head.weight") { "lm_head".to_string() } else { embed_base.clone() };
         let head = if ck.is_quant(&head_base) || head_base != embed_base {
             Some(lin(&[format!("{head_base}.weight")])?)
-        } else { None };
-        #[allow(clippy::collapsible_if)] // draft_ids reads files and may fail: only when MTP has a 4-bit head to draw from
+        } else {
+            None
+        };
+        #[allow(clippy::collapsible_if)]
+        // draft_ids reads files and may fail: only when MTP has a 4-bit head to draw from
         if let (Some(m), Some(source @ Linear::Quant { bits: 4, .. })) = (&mut mtp, &head) {
             if let Some(seed) = draft_ids(dir, d.vocab)? {
                 let adaptive = Adaptive::load(dir, d.vocab, &seed)?;
                 m.ids = adaptive.ids().to_vec();
                 m.head = Some(source.select_rows(&m.ids)?);
-                eprintln!("MLX adaptive draft vocabulary: {} rows (up to {})", m.ids.len(), crate::draft_vocab::MAX_ROWS);
+                eprintln!(
+                    "MLX adaptive draft vocabulary: {} rows (up to {})",
+                    m.ids.len(),
+                    crate::draft_vocab::MAX_ROWS
+                );
                 m.adaptive = Some(adaptive);
             }
         }
@@ -573,7 +656,15 @@ impl Weights {
             }
             all.extend(l.in_ba.iter().flat_map(Linear::arrays));
             all.extend([&l.input_norm, &l.post_norm]);
-            all.extend(l.q_norm.iter().chain(&l.k_norm).chain(&l.conv_w).chain(&l.a_log).chain(&l.dt_bias).chain(&l.delta_norm));
+            all.extend(
+                l.q_norm
+                    .iter()
+                    .chain(&l.k_norm)
+                    .chain(&l.conv_w)
+                    .chain(&l.a_log)
+                    .chain(&l.dt_bias)
+                    .chain(&l.delta_norm),
+            );
         }
         all.extend(self.stages.iter().flat_map(Stages::arrays));
         if let Some(m) = &self.mtp {
@@ -614,11 +705,19 @@ impl Weights {
 
     pub fn positions(&self) -> Vec<At> {
         let (mut ai, mut di) = (0, 0);
-        self.layers.iter().enumerate().map(|(li, l)| {
-            let at = At { li, ai, di };
-            if l.kind == Kind::Delta { di += 1 } else { ai += 1 }
-            at
-        }).collect()
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| {
+                let at = At { li, ai, di };
+                if l.kind == Kind::Delta {
+                    di += 1
+                } else {
+                    ai += 1
+                }
+                at
+            })
+            .collect()
     }
 
     pub fn layers(&mut self, m: &mut impl Mix, mut h: Array, prompt: bool) -> MResult<Array> {
@@ -639,11 +738,11 @@ impl Weights {
         }
         Ok(h)
     }
-
 }
 
 fn run_layer(l: &Layer, st: &mut Stages, at: At, m: &mut impl Mix, h: &Array, small: bool) -> MResult<Array> {
-    let with = |front: Vec<Array>, rest: &[Array]| -> Vec<Array> { front.into_iter().chain(rest.iter().cloned()).collect() };
+    let with =
+        |front: Vec<Array>, rest: &[Array]| -> Vec<Array> { front.into_iter().chain(rest.iter().cloned()).collect() };
     match l.kind {
         Kind::Attn => {
             let (cos, sin) = m.rope();
@@ -660,7 +759,11 @@ fn run_layer(l: &Layer, st: &mut Stages, at: At, m: &mut impl Mix, h: &Array, sm
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct At { pub li: usize, pub ai: usize, pub di: usize }
+pub struct At {
+    pub li: usize,
+    pub ai: usize,
+    pub di: usize,
+}
 
 /// The cache-dependent parts of a step. Arrays have no batch dimension: each segment is one sequence.
 pub trait Mix {
@@ -673,8 +776,17 @@ pub trait Mix {
     fn attend(&mut self, ai: usize, q: &Array, kq: &Array, ks: &Array, vq: &Array, vs: &Array) -> MResult<Array>;
     /// qkv [T][C], z [T][Hv*Dv], beta, log decay and decay [T][Hv]; result [T][Hv*Dv]. `small`: compiled stages.
     #[allow(clippy::too_many_arguments)]
-    fn delta(&mut self, di: usize, layer: &Layer, small: bool, qkv: &Array, z: &Array, beta: &Array, lg: &Array,
-             e: &Array) -> MResult<Array>;
+    fn delta(
+        &mut self,
+        di: usize,
+        layer: &Layer,
+        small: bool,
+        qkv: &Array,
+        z: &Array,
+        beta: &Array,
+        lg: &Array,
+        e: &Array,
+    ) -> MResult<Array>;
 }
 
 pub fn rms(x: &Array, w: &Array) -> MResult<Array> {
@@ -697,8 +809,11 @@ pub fn rope(x: &Array, cos: &Array, sin: &Array) -> MResult<Array> {
 pub fn quantize_kv(x: &Array) -> MResult<(Array, Array)> {
     let mx = ops::max_axis(ops::abs(x)?, -1, true)?;
     let scale = ops::divide(&mx, Array::from_f32(127.0))?;
-    let inv = ops::select(ops::gt(&mx, Array::from_f32(0.0))?,
-                          ops::divide(Array::from_f32(127.0), &mx)?, Array::from_f32(0.0))?;
+    let inv = ops::select(
+        ops::gt(&mx, Array::from_f32(0.0))?,
+        ops::divide(Array::from_f32(127.0), &mx)?,
+        Array::from_f32(0.0),
+    )?;
     let q = ops::round(ops::multiply(x, inv)?, None)?.as_dtype(Dtype::Int8)?;
     Ok((q, scale))
 }

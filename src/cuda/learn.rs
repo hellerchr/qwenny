@@ -5,14 +5,17 @@ use crate::cuda::core::cfg;
 use crate::training::{Opts, f32_bytes, splitmix};
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, result as blas, sys as bsys};
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, result as drv};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, result as drv,
+};
 use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
 /// Loss scale of the f16 build (halved after a step whose gradients overflowed)
 pub const F16_LOSS_SCALE: f32 = 1024.0;
 
 /// The kernels of train_common.cuh
-const KERNELS: [&str; 7] = ["dropout", "dropout_add_grad", "dropout_add_act", "sum_squares", "adamw", "to_act_copy", "gather_rows"];
+const KERNELS: [&str; 7] =
+    ["dropout", "dropout_add_grad", "dropout_add_act", "sum_squares", "adamw", "to_act_copy", "gather_rows"];
 
 pub struct Buf {
     _mem: CudaSlice<u8>,
@@ -123,8 +126,15 @@ pub struct Learn {
 
 impl Learn {
     /// `names`: the trainer's own kernels in `module` (besides train_common.cuh's); `init`: the arena's values
-    pub fn new(s: Arc<CudaStream>, module: &Arc<CudaModule>, names: &[&'static str], o: Opts, layout: Layout,
-               init: &[f32], sc: Scratch) -> Result<Self> {
+    pub fn new(
+        s: Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        names: &[&'static str],
+        o: Opts,
+        layout: Layout,
+        init: &[f32],
+        sc: Scratch,
+    ) -> Result<Self> {
         let blas = CudaBlas::new(s.clone())?;
         let mut f = HashMap::new();
         for &name in KERNELS.iter().chain(names) {
@@ -198,8 +208,23 @@ impl Learn {
     /// Row-major C[m][n] = alpha * op(A) op(B) + beta * C, with op(A) [m][k] (A stored [k][m] if ta) and op(B)
     /// [k][n] (B stored [n][k] if tb); ld* are row strides in elements; A and B act, C f32 if c32 else act.
     #[allow(clippy::too_many_arguments)]
-    pub fn mm(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, b: u64, ldb: usize,
-              beta: f32, c: u64, ldc: usize, c32: bool) -> Result<()> {
+    pub fn mm(
+        &self,
+        ta: bool,
+        tb: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: u64,
+        lda: usize,
+        b: u64,
+        ldb: usize,
+        beta: f32,
+        c: u64,
+        ldc: usize,
+        c32: bool,
+    ) -> Result<()> {
         use bsys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
         let op = |t: bool| if t { CUBLAS_OP_T } else { CUBLAS_OP_N };
         let at = self.act_type();
@@ -207,7 +232,13 @@ impl Learn {
         use bsys::cublasComputeType_t::{CUBLAS_COMPUTE_16F, CUBLAS_COMPUTE_32F, CUBLAS_COMPUTE_32F_PEDANTIC};
         // f16 accumulation needs f16 C and f16 alpha, beta
         let acc16 = self.o.f16 && !c32;
-        let compute = if self.o.f32 { CUBLAS_COMPUTE_32F_PEDANTIC } else if acc16 { CUBLAS_COMPUTE_16F } else { CUBLAS_COMPUTE_32F };
+        let compute = if self.o.f32 {
+            CUBLAS_COMPUTE_32F_PEDANTIC
+        } else if acc16 {
+            CUBLAS_COMPUTE_16F
+        } else {
+            CUBLAS_COMPUTE_32F
+        };
         let (alpha16, beta16) = (half::f16::from_f32(alpha), half::f16::from_f32(beta));
         let (pa, pb) = if acc16 {
             (&alpha16 as *const half::f16 as *const c_void, &beta16 as *const half::f16 as *const c_void)
@@ -217,9 +248,29 @@ impl Learn {
         // column-major: C^T = op(B)^T op(A)^T; a batch of one (strides 0)
         unsafe {
             blas::gemm_strided_batched_ex(
-                *self.blas.handle(), op(tb), op(ta), n as i32, m as i32, k as i32,
-                pa, b as *const c_void, at, ldb as i32, 0, a as *const c_void, at, lda as i32, 0, pb,
-                c as *mut c_void, ct, ldc as i32, 0, 1, compute, bsys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                *self.blas.handle(),
+                op(tb),
+                op(ta),
+                n as i32,
+                m as i32,
+                k as i32,
+                pa,
+                b as *const c_void,
+                at,
+                ldb as i32,
+                0,
+                a as *const c_void,
+                at,
+                lda as i32,
+                0,
+                pb,
+                c as *mut c_void,
+                ct,
+                ldc as i32,
+                0,
+                1,
+                compute,
+                bsys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )?;
         }
         Ok(())
@@ -267,18 +318,47 @@ impl Learn {
         if !train || self.o.dropout == 0.0 {
             return Ok(x);
         }
-        self.launch("dropout", n.div_ceil(8 * 256), 256, &[P(x), P(self.xd.p), P(n as u64), F(self.o.dropout), P(seed)])?;
+        self.launch(
+            "dropout",
+            n.div_ceil(8 * 256),
+            256,
+            &[P(x), P(self.xd.p), P(n as u64), F(self.o.dropout), P(seed)],
+        )?;
         Ok(self.xd.p)
     }
 
     /// y[:, col..] += scale * dropout(x) A^T B^T for each module; U = dropout(x) A^T saved at u (row stride ldu)
     #[allow(clippy::too_many_arguments)]
-    pub fn lora_fwd(&self, g: &Group, x: u64, t: usize, y: u64, ldy: usize, u: u64, train: bool, seed: u64) -> Result<()> {
+    pub fn lora_fwd(
+        &self,
+        g: &Group,
+        x: u64,
+        t: usize,
+        y: u64,
+        ldy: usize,
+        u: u64,
+        train: bool,
+        seed: u64,
+    ) -> Result<()> {
         let (r, es, ldu) = (self.o.rank, self.es as u64, self.ldu);
         self.lora_u(g, x, t, u, train, seed)?;
         for (i, m) in g.mods.iter().enumerate() {
-            self.mm(false, true, t, m.out, r, self.lscale, u + (i * r) as u64 * es, ldu, self.pa(m.b), r, 1.0,
-                    y + m.col as u64 * es, ldy, false)?;
+            self.mm(
+                false,
+                true,
+                t,
+                m.out,
+                r,
+                self.lscale,
+                u + (i * r) as u64 * es,
+                ldu,
+                self.pa(m.b),
+                r,
+                1.0,
+                y + m.col as u64 * es,
+                ldy,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -286,31 +366,106 @@ impl Learn {
     /// Only U = dropout(x) A^T of `lora_fwd` (a recomputed forward whose output is not needed)
     pub fn lora_u(&self, g: &Group, x: u64, t: usize, u: u64, train: bool, seed: u64) -> Result<()> {
         let xd = self.lora_input(x, t * g.inp, train, seed)?;
-        self.mm(false, true, t, g.mods.len() * self.o.rank, g.inp, 1.0, xd, g.inp, self.pa(g.a), g.inp, 0.0, u, self.ldu, false)
+        self.mm(
+            false,
+            true,
+            t,
+            g.mods.len() * self.o.rank,
+            g.inp,
+            1.0,
+            xd,
+            g.inp,
+            self.pa(g.a),
+            g.inp,
+            0.0,
+            u,
+            self.ldu,
+            false,
+        )
     }
 
     /// Gradients of A and B from dy (the module outputs' gradient), and dx += the LoRA path's input gradient (dx f32
     /// if `dx_grad` and g32(), else act).
     #[allow(clippy::too_many_arguments)]
-    pub fn lora_bwd(&self, g: &Group, dy: u64, ldy: usize, x: u64, t: usize, u: u64, dx: u64, dx_grad: bool, seed: u64)
-    -> Result<()> {
+    pub fn lora_bwd(
+        &self,
+        g: &Group,
+        dy: u64,
+        ldy: usize,
+        x: u64,
+        t: usize,
+        u: u64,
+        dx: u64,
+        dx_grad: bool,
+        seed: u64,
+    ) -> Result<()> {
         let (r, es, ldu) = (self.o.rank, self.es as u64, self.ldu);
         let mr = g.mods.len() * r;
         let xd = self.lora_input(x, t * g.inp, true, seed)?;
         for (i, m) in g.mods.iter().enumerate() {
             let dyi = dy + m.col as u64 * es;
             let ui = u + (i * r) as u64 * es;
-            self.mm(false, false, t, r, m.out, 1.0, dyi, ldy, self.pa(m.b), r, 0.0, self.vbuf.p + (i * r) as u64 * es, mr, false)?;
+            self.mm(
+                false,
+                false,
+                t,
+                r,
+                m.out,
+                1.0,
+                dyi,
+                ldy,
+                self.pa(m.b),
+                r,
+                0.0,
+                self.vbuf.p + (i * r) as u64 * es,
+                mr,
+                false,
+            )?;
             self.mm(true, false, m.out, r, t, self.lscale, dyi, ldy, ui, ldu, 1.0, self.pgr(m.b), r, true)?;
         }
         self.mm(true, false, mr, g.inp, t, self.lscale, self.vbuf.p, mr, xd, g.inp, 1.0, self.pgr(g.a), g.inp, true)?;
         if self.o.dropout == 0.0 {
-            self.mm(false, false, t, g.inp, mr, self.lscale, self.vbuf.p, mr, self.pa(g.a), g.inp, 1.0, dx, g.inp, dx_grad && self.g32())?;
+            self.mm(
+                false,
+                false,
+                t,
+                g.inp,
+                mr,
+                self.lscale,
+                self.vbuf.p,
+                mr,
+                self.pa(g.a),
+                g.inp,
+                1.0,
+                dx,
+                g.inp,
+                dx_grad && self.g32(),
+            )?;
         } else {
-            self.mm(false, false, t, g.inp, mr, self.lscale, self.vbuf.p, mr, self.pa(g.a), g.inp, 0.0, self.tmp32.p, g.inp, true)?;
+            self.mm(
+                false,
+                false,
+                t,
+                g.inp,
+                mr,
+                self.lscale,
+                self.vbuf.p,
+                mr,
+                self.pa(g.a),
+                g.inp,
+                0.0,
+                self.tmp32.p,
+                g.inp,
+                true,
+            )?;
             let n = t * g.inp;
             let k = if dx_grad { "dropout_add_grad" } else { "dropout_add_act" };
-            self.launch(k, n.div_ceil(8 * 256), 256, &[P(dx), P(self.tmp32.p), P(n as u64), F(self.o.dropout), P(seed)])?;
+            self.launch(
+                k,
+                n.div_ceil(8 * 256),
+                256,
+                &[P(dx), P(self.tmp32.p), P(n as u64), F(self.o.dropout), P(seed)],
+            )?;
         }
         Ok(())
     }
@@ -334,9 +489,28 @@ impl Learn {
         self.adam_t += 1;
         let (b1, b2) = (0.9f32, 0.999f32);
         let (bc1, bc2) = (1.0 - b1.powi(self.adam_t), 1.0 - b2.powi(self.adam_t));
-        self.elementwise("adamw", self.n_params, &[P(self.p32.p), P(self.pg.p), P(self.pm.p), P(self.pv.p), P(self.pa.p),
-            P(self.n_params as u64), P(self.sumsq.p), F(max_norm), F(lr), F(b1), F(b2), F(1e-8), F(wd), F(bc1), F(bc2),
-            F(1.0 / self.loss_scale)])?;
+        self.elementwise(
+            "adamw",
+            self.n_params,
+            &[
+                P(self.p32.p),
+                P(self.pg.p),
+                P(self.pm.p),
+                P(self.pv.p),
+                P(self.pa.p),
+                P(self.n_params as u64),
+                P(self.sumsq.p),
+                F(max_norm),
+                F(lr),
+                F(b1),
+                F(b2),
+                F(1e-8),
+                F(wd),
+                F(bc1),
+                F(bc2),
+                F(1.0 / self.loss_scale),
+            ],
+        )?;
         Ok(norm)
     }
 

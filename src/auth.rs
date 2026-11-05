@@ -21,7 +21,8 @@ const KEY_PREFIX: &str = "qwk_";
 
 /// $XDG_DATA_HOME (else ~/.local/share)/qwenny/qwenny.db
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("qwenny/qwenny.db")
@@ -59,7 +60,9 @@ fn random_hex() -> String {
 fn hash_password(pw: &str) -> Result<String> {
     ensure!(pw.chars().count() >= 8, "the password needs 8 characters at least");
     let salt = SaltString::encode_b64(&random::<16>()).map_err(|e| anyhow::anyhow!("a salt: {e}"))?;
-    Ok(Argon2::default().hash_password(pw.as_bytes(), &salt).map_err(|e| anyhow::anyhow!("hashing the password: {e}"))?
+    Ok(Argon2::default()
+        .hash_password(pw.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("hashing the password: {e}"))?
         .to_string())
 }
 
@@ -128,7 +131,10 @@ impl Auth {
         let token = random_hex();
         let db = self.db();
         db.execute("DELETE FROM sessions WHERE expires < ?1", params![now()])?;
-        db.execute("INSERT INTO sessions (token_hash, expires) VALUES (?1, ?2)", params![sha(&token), now() + SESSION_SECS])?;
+        db.execute(
+            "INSERT INTO sessions (token_hash, expires) VALUES (?1, ?2)",
+            params![sha(&token), now() + SESSION_SECS],
+        )?;
         Ok(token)
     }
 
@@ -142,8 +148,11 @@ impl Auth {
     }
 
     pub fn session(&self, token: &str) -> Result<bool> {
-        Ok(self.db().query_row("SELECT COUNT(*) FROM sessions WHERE token_hash = ?1 AND expires >= ?2",
-                               params![sha(token), now()], |r| r.get::<_, i64>(0))? > 0)
+        Ok(self.db().query_row(
+            "SELECT COUNT(*) FROM sessions WHERE token_hash = ?1 AND expires >= ?2",
+            params![sha(token), now()],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
     }
 
     pub fn logout(&self, token: &str) -> Result<()> {
@@ -176,14 +185,16 @@ impl Auth {
 
     /// Whether the API requires a key (else it is open)
     pub fn require_key(&self) -> Result<bool> {
-        let v: Option<String> = self.db().query_row("SELECT value FROM settings WHERE key = 'require_key'", [], |r| r.get(0))
-            .optional()?;
+        let v: Option<String> =
+            self.db().query_row("SELECT value FROM settings WHERE key = 'require_key'", [], |r| r.get(0)).optional()?;
         Ok(v.as_deref() == Some("1"))
     }
 
     pub fn set_require_key(&self, on: bool) -> Result<()> {
-        self.db().execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('require_key', ?1)",
-                          params![if on { "1" } else { "0" }])?;
+        self.db().execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('require_key', ?1)",
+            params![if on { "1" } else { "0" }],
+        )?;
         Ok(())
     }
 
@@ -193,8 +204,10 @@ impl Auth {
         let key = format!("{KEY_PREFIX}{}", random_hex());
         let shown = format!("{}…{}", &key[..KEY_PREFIX.len() + 4], &key[key.len() - 4..]);
         let db = self.db();
-        db.execute("INSERT INTO api_keys (name, key_hash, shown, created) VALUES (?1, ?2, ?3, ?4)",
-                   params![name.trim(), sha(&key), shown, now()])?;
+        db.execute(
+            "INSERT INTO api_keys (name, key_hash, shown, created) VALUES (?1, ?2, ?3, ?4)",
+            params![name.trim(), sha(&key), shown, now()],
+        )?;
         Ok((db.last_insert_rowid(), key))
     }
 

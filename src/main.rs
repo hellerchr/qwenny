@@ -11,15 +11,15 @@ mod draft_vocab;
 mod engine;
 mod hub;
 mod lora;
+#[cfg(has_mlx)]
+mod mlx;
+#[cfg(has_cuda)]
+mod preference;
 mod sample;
 mod server;
 mod sessions;
 #[cfg(has_cuda)]
 mod training;
-#[cfg(has_mlx)]
-mod mlx;
-#[cfg(has_cuda)]
-mod preference;
 
 use anyhow::{Context, Result, bail, ensure};
 use engine::Engine;
@@ -109,7 +109,8 @@ impl Opts {
     fn load(&self, dir: &str) -> Result<Box<dyn Engine>> {
         let adapter = self.adapter()?;
         let slots = self.get("slots", 1)?;
-        let mut m = engine::load(Path::new(dir), self.get("ctx", 4096)?, slots, self.int8, adapter.as_ref().map(|a| &a.1))?;
+        let mut m =
+            engine::load(Path::new(dir), self.get("ctx", 4096)?, slots, self.int8, adapter.as_ref().map(|a| &a.1))?;
         if adapter.is_some() {
             for s in 0..slots as u32 {
                 m.set_adapter(s, true)?;
@@ -145,15 +146,21 @@ impl Opts {
         let v = match vals.as_slice() {
             [] => return Ok(None),
             [v] => *v,
-            _ => bail!("serving several distinct named adapters at once is not supported yet; compose several into \
-                        one with --adapter=<name>=<dir1>,<dir2>,..."),
+            _ => bail!(
+                "serving several distinct named adapters at once is not supported yet; compose several into \
+                        one with --adapter=<name>=<dir1>,<dir2>,..."
+            ),
         };
         // [<name>=]<dir>[,<dir>...]: a leading <name>= only when it is not itself a path or a comma-list
         let (name, rest) = match v.split_once('=') {
-            Some((n, d)) if !n.is_empty() && !n.contains('/') && !n.contains(',') && !Path::new(v).exists() => (Some(n.to_string()), d),
+            Some((n, d)) if !n.is_empty() && !n.contains('/') && !n.contains(',') && !Path::new(v).exists() => {
+                (Some(n.to_string()), d)
+            }
             _ => (None, v),
         };
-        let dirs: Vec<std::path::PathBuf> = rest.split(',').filter(|s| !s.is_empty())
+        let dirs: Vec<std::path::PathBuf> = rest
+            .split(',')
+            .filter(|s| !s.is_empty())
             .map(|d| std::fs::canonicalize(tilde(d)).with_context(|| format!("--adapter: {d}")))
             .collect::<Result<_>>()?;
         ensure!(!dirs.is_empty(), "--adapter: no directory given");
@@ -163,16 +170,24 @@ impl Opts {
     #[cfg(has_cuda)]
     fn lora(&self) -> Result<training::Opts> {
         Ok(training::Opts {
-            rank: self.get("rank", 16)?, alpha: self.get("alpha", 32.0)?, dropout: self.get("dropout", 0.05)?,
-            micro_tokens: 4096, f32: self.precision == "f32", f16: self.precision == "f16", layers: 0,
+            rank: self.get("rank", 16)?,
+            alpha: self.get("alpha", 32.0)?,
+            dropout: self.get("dropout", 0.05)?,
+            micro_tokens: 4096,
+            f32: self.precision == "f32",
+            f16: self.precision == "f16",
+            layers: 0,
         })
     }
 
     #[cfg(has_cuda)]
     fn train_opts(&self) -> Result<training::TrainOpts> {
         Ok(training::TrainOpts {
-            epochs: self.get("epochs", 3)?, batch: self.get("batch", 8)?, lr: self.get("lr", 2e-4)?,
-            max_len: self.get("max-len", 4096)?, init: self.path("init-adapter"),
+            epochs: self.get("epochs", 3)?,
+            batch: self.get("batch", 8)?,
+            lr: self.get("lr", 2e-4)?,
+            max_len: self.get("max-len", 4096)?,
+            init: self.path("init-adapter"),
         })
     }
 
@@ -252,7 +267,11 @@ fn did_you_mean<'a>(k: &str, names: impl Iterator<Item = &'a &'static str>) -> S
         }
         row[b.len()]
     };
-    names.map(|n| (dist(k, n), n)).filter(|(d, _)| *d <= 2).min().map_or(String::new(), |(_, n)| format!(" (did you mean --{n}?)"))
+    names
+        .map(|n| (dist(k, n), n))
+        .filter(|(d, _)| *d <= 2)
+        .min()
+        .map_or(String::new(), |(_, n)| format!(" (did you mean --{n}?)"))
 }
 
 const SEE_HELP: &str = "qwenny --help lists the commands and options";
@@ -262,7 +281,11 @@ fn main() -> Result<()> {
     if all.is_empty() || all.iter().any(|a| a == "--help" || a == "-h") || all[0] == "help" {
         // not println!: `qwenny --help | head` must not panic on the closed pipe
         use std::io::Write;
-        let _ = writeln!(std::io::stdout(), "{}", if all.get(1).is_some_and(|a| a == "checks") { HELP_CHECKS } else { HELP });
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            if all.get(1).is_some_and(|a| a == "checks") { HELP_CHECKS } else { HELP }
+        );
         return Ok(());
     }
     let (mut args, mut flags, mut values) = (Vec::new(), Vec::new(), Vec::new());
@@ -285,11 +308,19 @@ fn main() -> Result<()> {
     let Some((mut keys, switches, positional)) = strict(cmd) else { bail!("no command {cmd}: {SEE_HELP}") };
     keys.push("backend");
     for (k, _) in &values {
-        ensure!(keys.contains(&k.as_str()), "{cmd} has no option --{k}{}", did_you_mean(k, keys.iter().chain(switches.iter())));
+        ensure!(
+            keys.contains(&k.as_str()),
+            "{cmd} has no option --{k}{}",
+            did_you_mean(k, keys.iter().chain(switches.iter()))
+        );
     }
     for f in &flags {
         ensure!(!keys.contains(&&f[2..]), "{f} needs a value: {f}=<value>");
-        ensure!(switches.contains(&&f[2..]), "{cmd} has no option {f}{}", did_you_mean(&f[2..], keys.iter().chain(switches.iter())));
+        ensure!(
+            switches.contains(&&f[2..]),
+            "{cmd} has no option {f}{}",
+            did_you_mean(&f[2..], keys.iter().chain(switches.iter()))
+        );
     }
     let a: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
     ensure!(a.len() >= *positional.start(), "{cmd}: missing arguments ({SEE_HELP})");
@@ -301,7 +332,9 @@ fn main() -> Result<()> {
         ensure!(Path::new(a[0]).exists(), "{}: no such file or directory", a[0]);
     }
     let mut opts = Opts {
-        int8: !flags.iter().any(|f| *f == "--bf16"), precision: String::new(), values,
+        int8: !flags.iter().any(|f| *f == "--bf16"),
+        precision: String::new(),
+        values,
         switches: flags.iter().map(|f| f[2..].to_string()).collect(),
     };
     opts.precision = opts.get("precision", "f16".to_string())?;
@@ -337,8 +370,11 @@ fn main() -> Result<()> {
                 None => (None, None),
             };
             let base = opts.get("name", "qwenny".to_string())?;
-            ensure!(name.as_ref().is_none_or(|n| *n != base), "the adapter's name is the base model's (--name): give it \
-                     another with --adapter=<name>=<dir>");
+            ensure!(
+                name.as_ref().is_none_or(|n| *n != base),
+                "the adapter's name is the base model's (--name): give it \
+                     another with --adapter=<name>=<dir>"
+            );
             // no explicit name= : apply the adapter to the one served model (no separate pristine base)
             let adapter_use = match name {
                 Some(n) => server::AdapterUse::Named(n),
@@ -350,14 +386,26 @@ fn main() -> Result<()> {
             let native = native_ctx(&model).unwrap_or(32768);
             let (ctx, slots, int8) = (opts.get("ctx", native)?, opts.get("slots", 16)?, opts.int8);
             // several files, comma-separated: their presets one after the other
-            let presets = opts.get("decisions", String::new())?.split(',').filter(|f| !f.is_empty())
-                .map(|f| Ok(serde_json::from_str::<Vec<serde_json::Value>>(&std::fs::read_to_string(f).with_context(|| f.to_string())?)?))
-                .collect::<Result<Vec<_>>>()?.concat();
+            let presets = opts
+                .get("decisions", String::new())?
+                .split(',')
+                .filter(|f| !f.is_empty())
+                .map(|f| {
+                    Ok(serde_json::from_str::<Vec<serde_json::Value>>(
+                        &std::fs::read_to_string(f).with_context(|| f.to_string())?,
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .concat();
             let so = server::ServeOpts {
-                host: opts.get("host", "0.0.0.0".to_string())?, port: opts.get("port", 18023)?, name: base,
+                host: opts.get("host", "0.0.0.0".to_string())?,
+                port: opts.get("port", 18023)?,
+                name: base,
                 adapter: adapter_use,
-                drafts: opts.opt("drafts")?, sessions: opts.opt("slots")?,
-                presets: serde_json::Value::Array(presets), db: opts.path("db").unwrap_or_else(auth::default_path),
+                drafts: opts.opt("drafts")?,
+                sessions: opts.opt("slots")?,
+                presets: serde_json::Value::Array(presets),
+                db: opts.path("db").unwrap_or_else(auth::default_path),
                 fit_ctx: !opts.has("ctx"),
             };
             server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
@@ -377,8 +425,11 @@ fn main() -> Result<()> {
                 let po = preference::PrefOpts { beta: opts.get("beta", 0.1)?, nll: opts.get("nll", 1.0)? };
                 preference::train(&model, p(0), a.get(1).map(Path::new), lo, to, po)
             } else {
-                ensure!(!opts.has("beta") && !opts.has("nll"), "--beta and --nll are options of \
-                         preference training (rows with \"chosen\" and \"rejected\")");
+                ensure!(
+                    !opts.has("beta") && !opts.has("nll"),
+                    "--beta and --nll are options of \
+                         preference training (rows with \"chosen\" and \"rejected\")"
+                );
                 training::train(&model, p(0), a.get(1).map(Path::new), lo, to)
             }
         }
@@ -397,7 +448,10 @@ fn main() -> Result<()> {
         "tokcheck" => checks::tokcheck(m, a[0], a[1]),
         "chatcheck" => {
             ensure!(Path::new(a[0]).is_file(), "chatcheck: {} is not a file; make one with tools/make_tokref.py", a[0]);
-            ensure!(chat::Chat::load(&model)?.check(Path::new(a[0]))?, "chatcheck: the prompts differ from Transformers'");
+            ensure!(
+                chat::Chat::load(&model)?.check(Path::new(a[0]))?,
+                "chatcheck: the prompts differ from Transformers'"
+            );
             Ok(())
         }
         "samplecheck" => checks::samplecheck(&opts, m),
@@ -412,7 +466,9 @@ fn main() -> Result<()> {
         #[cfg(has_cuda)]
         "dpocheck" => preference::dpocheck(&model, p(0), opts.lora()?, opts.switch("packed")),
         #[cfg(not(has_cuda))]
-        "train" | "traincheck" | "datacheck" | "dpocheck" | "layercheck" | "capture" => bail!("{cmd}: CUDA backend only so far"),
+        "train" | "traincheck" | "datacheck" | "dpocheck" | "layercheck" | "capture" => {
+            bail!("{cmd}: CUDA backend only so far")
+        }
         _ => unreachable!("{cmd}: in `strict`, not here"),
     }
 }
@@ -422,7 +478,9 @@ fn password(opts: &Opts) -> Result<()> {
     use std::io::{IsTerminal, Write};
     let a = auth::Auth::open(&opts.path("db").unwrap_or_else(auth::default_path))?;
     let tty = std::io::stdin().is_terminal();
-    let stty = |arg: &str| { let _ = std::process::Command::new("stty").arg(arg).stdin(std::process::Stdio::inherit()).status(); };
+    let stty = |arg: &str| {
+        let _ = std::process::Command::new("stty").arg(arg).stdin(std::process::Stdio::inherit()).status();
+    };
     let ask = |prompt: &str| -> Result<String> {
         if tty {
             print!("{prompt}");

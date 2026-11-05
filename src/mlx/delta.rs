@@ -70,18 +70,27 @@ pub fn token(s: &Array, t: Tok) -> MResult<(Array, Array)> {
     let m = ops::matmul(&s4, ops::expand_dims(t.kq, 1)?)?; // [Lk][G][Dv][2]: S k, S q
     let (dkk, dq) = (last(&m, 0)?, last(&m, 1)?);
     let e = t.e.reshape(&[lk, g, 1])?;
-    let delta = ops::multiply(ops::subtract(t.v.reshape(&[lk, g, dv])?, ops::multiply(&e, &dkk)?)?, t.b.reshape(&[lk, g, 1])?)?;
+    let delta =
+        ops::multiply(ops::subtract(t.v.reshape(&[lk, g, dv])?, ops::multiply(&e, &dkk)?)?, t.b.reshape(&[lk, g, 1])?)?;
     let o = ops::add(ops::multiply(&e, &dq)?, ops::multiply(&delta, t.dot.reshape(&[lk, 1, 1])?)?)?;
     let k = t.kq.index((.., .., 0..1)).reshape(&[lk, 1, 1, dk])?;
-    let s = ops::add(ops::multiply(e.reshape(&[lk, g, 1, 1])?, &s4)?, ops::multiply(ops::expand_dims(&delta, -1)?, &k)?)?;
+    let s =
+        ops::add(ops::multiply(e.reshape(&[lk, g, 1, 1])?, &s4)?, ops::multiply(ops::expand_dims(&delta, -1)?, &k)?)?;
     Ok((s.reshape(&[hv, dv, dk])?, o.reshape(&[hv, dv])?))
 }
 
 /// n tokens (a multiple of CH) from state s0: q, k [n][Hv][Dk], v [n][Hv][Dv], lg (log decay), b [n][Hv]. Returns o
 /// [n][Hv][Dv], the state after the last token and the state after `at` tokens (`at` a multiple of CH, <= n). Zero
 /// tokens (k = v = b = lg = 0) leave the state as it is: padding.
-pub fn chunked(s0: &Array, q: &Array, k: &Array, v: &Array, lg: &Array, b: &Array, at: i32)
-               -> MResult<(Array, Array, Array)> {
+pub fn chunked(
+    s0: &Array,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    lg: &Array,
+    b: &Array,
+    at: i32,
+) -> MResult<(Array, Array, Array)> {
     let (n, hv, dk, dv) = (q.shape()[0], q.shape()[1], q.shape()[2], v.shape()[2]);
     let nc = n / CH;
     // heads first: [Hv][nc][CH][d], [Hv][nc][CH]
@@ -150,10 +159,12 @@ fn inv_unit_lower(a: &Array) -> MResult<Array> {
         let tt = t.reshape(&[sh[0], sh[1], pairs, 2, s, s])?;
         let half = |i: i32| tt.index((.., .., .., i..i + 1)).squeeze_axes(&[3]);
         let (t1, t2) = (half(0)?, half(1)?);
-        let a21: Vec<Array> = (0..pairs).map(|p| {
-            let o = p * 2 * s;
-            block(a, o + s..o + 2 * s, o..o + s)
-        }).collect();
+        let a21: Vec<Array> = (0..pairs)
+            .map(|p| {
+                let o = p * 2 * s;
+                block(a, o + s..o + 2 * s, o..o + s)
+            })
+            .collect();
         let a21 = ops::stack(&a21, 2)?;
         let t21 = ops::negative(ops::matmul(ops::matmul(&t2, &a21)?, &t1)?)?;
         let top = ops::concatenate(&[&t1, &ops::zeros_like(&t1)?], -1)?;
@@ -171,10 +182,12 @@ mod tests {
     /// uniform [lo, hi) values from a fixed seed (mlx_rs::random does not link on Linux)
     fn values(shape: &[i32], lo: f32, hi: f32, seed: &mut u64) -> Array {
         let n: i32 = shape.iter().product();
-        let v: Vec<f32> = (0..n).map(|_| {
-            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            lo + (hi - lo) * ((*seed >> 40) as f32 / (1u64 << 24) as f32)
-        }).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                lo + (hi - lo) * ((*seed >> 40) as f32 / (1u64 << 24) as f32)
+            })
+            .collect();
         Array::from_slice(&v, shape)
     }
 
@@ -192,7 +205,12 @@ mod tests {
         let mut seed = 7;
         let q1 = unit(values(&[n, lk, d], -1.0, 1.0, &mut seed));
         let k1 = unit(values(&[n, lk, d], -1.0, 1.0, &mut seed));
-        let rep = |x: &Array| ops::broadcast_to(ops::expand_dims(x, 2).unwrap(), &[n, lk, hv / lk, d]).unwrap().reshape(&[n, hv, d]).unwrap();
+        let rep = |x: &Array| {
+            ops::broadcast_to(ops::expand_dims(x, 2).unwrap(), &[n, lk, hv / lk, d])
+                .unwrap()
+                .reshape(&[n, hv, d])
+                .unwrap()
+        };
         let (q, k) = (rep(&q1), rep(&k1));
         let v = values(&[n, hv, d], -1.0, 1.0, &mut seed);
         let lg = values(&[n, hv], -0.5, 0.0, &mut seed);
@@ -204,7 +222,9 @@ mod tests {
         let kq = ops::stack(&[&k1, &q1], -1).unwrap();
         let mut st = s0.clone();
         let mut worst = 0f32;
-        let max = |a: &Array, b: &Array| ops::max(ops::abs(ops::subtract(a, b).unwrap()).unwrap(), None).unwrap().item_exact::<f32>();
+        let max = |a: &Array, b: &Array| {
+            ops::max(ops::abs(ops::subtract(a, b).unwrap()).unwrap(), None).unwrap().item_exact::<f32>()
+        };
         for i in 0..n {
             let r = |x: &Array| row(x, i).unwrap();
             let (s2, oi) = token(&st, Tok { kq: &r(&kq), v: &r(&v), e: &r(&e), b: &r(&b), dot: &r(&dot) }).unwrap();

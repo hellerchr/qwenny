@@ -4,7 +4,7 @@
 // on Metal, metal.rs has the delta rule's kernels and only its tests use this one
 #[cfg_attr(has_metal, allow(dead_code))]
 mod delta;
-pub mod model;
-mod weights;
 #[cfg(has_metal)]
 mod metal;
+pub mod model;
+mod weights;

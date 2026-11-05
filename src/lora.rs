@@ -3,7 +3,11 @@
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::{Value as Json, json};
-use std::{collections::HashMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// A matrix of a composed adapter: name, output rows, input cols, the adapters (index + kept slots) that touch it
 type PlanEntry<'a> = (&'a String, usize, usize, Vec<(usize, Vec<usize>)>);
@@ -29,7 +33,9 @@ pub fn floats(st: &SafeTensors, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let t = st.tensor(name)?;
     let v = match t.dtype() {
         Dtype::F32 => f32s(t.data()),
-        Dtype::BF16 => t.data().as_chunks().0.iter().map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16)).collect(),
+        Dtype::BF16 => {
+            t.data().as_chunks().0.iter().map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16)).collect()
+        }
         d => anyhow::bail!("{name}: dtype {d:?}"),
     };
     Ok((v, t.shape().to_vec()))
@@ -48,13 +54,19 @@ pub fn read_config(dir: &Path) -> Result<Config> {
     let path = dir.join("adapter_config.json");
     let cfg: Json = serde_json::from_str(&fs::read_to_string(&path).with_context(|| path.display().to_string())?)?;
     ensure!(cfg["peft_type"].as_str().is_none_or(|t| t == "LORA"), "{} is not a LoRA", dir.display());
-    ensure!(cfg["use_rslora"].as_bool() != Some(true) && cfg["use_dora"].as_bool() != Some(true), "rsLoRA/DoRA adapter");
+    ensure!(
+        cfg["use_rslora"].as_bool() != Some(true) && cfg["use_dora"].as_bool() != Some(true),
+        "rsLoRA/DoRA adapter"
+    );
     let empty = |k: &str| cfg[k].is_null() || cfg[k].as_object().is_some_and(|o| o.is_empty());
     ensure!(empty("rank_pattern") && empty("alpha_pattern"), "an adapter with a rank_pattern or alpha_pattern");
     // modules_to_save replaces whole weights, not an additive BA delta: it cannot be served unmerged or composed.
     let empty_list = |k: &str| empty(k) || cfg[k].as_array().is_some_and(|a| a.is_empty());
-    ensure!(empty_list("modules_to_save"), "an adapter with modules_to_save (a full-weight replacement, not a \
-            stackable additive delta)");
+    ensure!(
+        empty_list("modules_to_save"),
+        "an adapter with modules_to_save (a full-weight replacement, not a \
+            stackable additive delta)"
+    );
     ensure!(cfg["lora_bias"].as_bool() != Some(true), "a LoRA adapter with lora_bias (bias terms are not served)");
     Ok(Config {
         r: cfg["r"].as_u64().context("r")? as usize,
@@ -64,8 +76,14 @@ pub fn read_config(dir: &Path) -> Result<Config> {
 }
 
 /// adapter_config.json in PEFT's format into `out`; its target modules are those of the lora_A tensors in `names`
-pub fn write_config<'a>(out: &Path, base: &str, rank: usize, alpha: f32, dropout: f32, names: impl Iterator<Item = &'a str>)
-    -> Result<()> {
+pub fn write_config<'a>(
+    out: &Path,
+    base: &str,
+    rank: usize,
+    alpha: f32,
+    dropout: f32,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<()> {
     // "...layers.3.self_attn.q_proj.lora_A.weight" -> "q_proj"
     let mut targets: Vec<&str> = names.filter_map(|n| n.strip_suffix(".lora_A.weight")?.rsplit('.').next()).collect();
     targets.sort();
@@ -81,8 +99,13 @@ pub fn write_config<'a>(out: &Path, base: &str, rank: usize, alpha: f32, dropout
 }
 
 /// `tensors` (name, dtype, shape, little-endian bytes) as a safetensors file, with PyTorch's metadata
-pub fn save_tensors<'a>(path: &Path, tensors: impl IntoIterator<Item = (String, Dtype, Vec<usize>, &'a [u8])>) -> Result<()> {
-    let views = tensors.into_iter().map(|(n, d, s, b)| Ok((n, safetensors::tensor::TensorView::new(d, s, b)?)))
+pub fn save_tensors<'a>(
+    path: &Path,
+    tensors: impl IntoIterator<Item = (String, Dtype, Vec<usize>, &'a [u8])>,
+) -> Result<()> {
+    let views = tensors
+        .into_iter()
+        .map(|(n, d, s, b)| Ok((n, safetensors::tensor::TensorView::new(d, s, b)?)))
         .collect::<Result<Vec<_>>>()?;
     let meta: HashMap<String, String> = [("format".to_string(), "pt".to_string())].into();
     safetensors::serialize_to_file(views, Some(meta), path)?;
@@ -94,14 +117,19 @@ impl Adapter {
         let Config { r, alpha, base } = read_config(dir)?;
         let bytes = fs::read(dir.join("adapter_model.safetensors"))?;
         let st = SafeTensors::deserialize(&bytes)?;
-        ensure!(!st.names().iter().any(|n| n.contains(".lora_") && n.ends_with(".bias")),
-                "a LoRA adapter with bias tensors (bias terms are not served)");
+        ensure!(
+            !st.names().iter().any(|n| n.contains(".lora_") && n.ends_with(".bias")),
+            "a LoRA adapter with bias tensors (bias terms are not served)"
+        );
         let mut pairs = HashMap::new();
         for name in st.names() {
             let Some(stem) = name.strip_suffix(".lora_A.weight") else { continue };
             let (a, sa) = floats(&st, name)?;
             let (b, sb) = floats(&st, &format!("{stem}.lora_B.weight"))?;
-            ensure!(sa.len() == 2 && sb.len() == 2 && sa[0] == sb[1] && sa[0] == r, "{stem}: shapes {sa:?} {sb:?} (r {r})");
+            ensure!(
+                sa.len() == 2 && sb.len() == 2 && sa[0] == sb[1] && sa[0] == r,
+                "{stem}: shapes {sa:?} {sb:?} (r {r})"
+            );
             let base = stem.strip_prefix("base_model.model.").unwrap_or(stem).to_string() + ".weight";
             pairs.insert(base, (a, b, sa[0]));
         }
@@ -146,9 +174,11 @@ impl Adapter {
         // the rank slots an adapter actually contributes for a matrix: outer product Bᵢ[:,k]·Aᵢ[k,:] is nonzero
         let kept = |a: &[f32], b: &[f32], r: usize| -> Vec<usize> {
             let (cols, rows) = (a.len() / r, b.len() / r);
-            (0..r).filter(|&k| {
-                a[k * cols..(k + 1) * cols].iter().any(|&x| x != 0.0) && (0..rows).any(|o| b[o * r + k] != 0.0)
-            }).collect()
+            (0..r)
+                .filter(|&k| {
+                    a[k * cols..(k + 1) * cols].iter().any(|&x| x != 0.0) && (0..rows).any(|o| b[o * r + k] != 0.0)
+                })
+                .collect()
         };
         // every target matrix, deterministic order
         let mut names: Vec<&String> = parts.iter().flat_map(|p| p.pairs.keys()).collect();
@@ -160,23 +190,34 @@ impl Adapter {
         for name in names {
             let (mut rows, mut cols, mut blocks, mut sum) = (None, None, Vec::new(), 0usize);
             for (pi, p) in parts.iter().enumerate() {
-                let Some((a, b, r)) = p.pairs.get(name).map(|(a, b, r)| (a.as_slice(), b.as_slice(), *r)) else { continue };
+                let Some((a, b, r)) = p.pairs.get(name).map(|(a, b, r)| (a.as_slice(), b.as_slice(), *r)) else {
+                    continue;
+                };
                 let (c, ro) = (a.len() / r, b.len() / r);
-                if let Some(pc) = cols { ensure!(pc == c, "{name}: input dim {c} vs {pc} across stacked adapters"); }
-                if let Some(pr) = rows { ensure!(pr == ro, "{name}: output dim {ro} vs {pr} across stacked adapters"); }
+                if let Some(pc) = cols {
+                    ensure!(pc == c, "{name}: input dim {c} vs {pc} across stacked adapters");
+                }
+                if let Some(pr) = rows {
+                    ensure!(pr == ro, "{name}: output dim {ro} vs {pr} across stacked adapters");
+                }
                 cols = Some(c);
                 rows = Some(ro);
                 let ks = kept(a, b, r);
                 sum += ks.len();
-                if !ks.is_empty() { blocks.push((pi, ks)); }
+                if !ks.is_empty() {
+                    blocks.push((pi, ks));
+                }
             }
-            if blocks.is_empty() { continue; }
+            if blocks.is_empty() {
+                continue;
+            }
             max_sum = max_sum.max(sum);
             plan.push((name, rows.unwrap(), cols.unwrap(), blocks));
         }
         ensure!(max_sum > 0, "the composed adapters change nothing (all factors zero)");
-        let r_pad = *RANKS.iter().find(|&&r| r >= max_sum)
-            .with_context(|| format!("combined LoRA rank {max_sum} exceeds the largest served rank {}", RANKS[RANKS.len() - 1]))?;
+        let r_pad = *RANKS.iter().find(|&&r| r >= max_sum).with_context(|| {
+            format!("combined LoRA rank {max_sum} exceeds the largest served rank {}", RANKS[RANKS.len() - 1])
+        })?;
         let mut pairs = HashMap::new();
         for (name, rows, cols, blocks) in plan {
             let mut a = vec![0f32; r_pad * cols]; // [R_pad][in], real rows packed first, rest zero
@@ -204,8 +245,15 @@ impl Adapter {
     /// change nothing)
     pub fn check(&self, ck: &crate::checkpoint::Checkpoint) -> Result<()> {
         let missing: Vec<&String> = self.pairs.keys().filter(|n| !ck.has(n)).collect();
-        ensure!(missing.is_empty(), "the adapter does not fit this model: {} of its {} matrices are not in it (e.g. {}); \
-                 it was trained on {}", missing.len(), self.pairs.len(), missing[0], self.base);
+        ensure!(
+            missing.is_empty(),
+            "the adapter does not fit this model: {} of its {} matrices are not in it (e.g. {}); \
+                 it was trained on {}",
+            missing.len(),
+            self.pairs.len(),
+            missing[0],
+            self.base
+        );
         Ok(())
     }
 
@@ -234,8 +282,10 @@ impl Adapter {
         let Some((a, b, r)) = self.pairs.get(name) else { return Ok(false) };
         let r = *r;
         let cols = a.len() / r;
-        ensure!(a.len() % r == 0 && b.len() % r == 0 && (b.len() / r) * cols == w.len(),
-                "{name}: the adapter's shape does not fit the model: is it for another one?");
+        ensure!(
+            a.len() % r == 0 && b.len() % r == 0 && (b.len() / r) * cols == w.len(),
+            "{name}: the adapter's shape does not fit the model: is it for another one?"
+        );
         let scale = self.scale;
         let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
         let per = (w.len() / cols).div_ceil(threads) * cols;
@@ -299,21 +349,30 @@ fn writer_a(ck: &crate::checkpoint::Checkpoint, base: &str, r: &[f32]) -> Result
     let reduce = |rows: usize, cols: usize, row_f32: &(dyn Fn(usize, &mut [f32]) + Sync)| -> Vec<f32> {
         let per = rows.div_ceil(threads).max(1);
         let partials: Vec<Vec<f32>> = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..rows).step_by(per).map(|r0| {
-                s.spawn(move || {
-                    let (mut acc, mut buf) = (vec![0f32; cols], vec![0f32; cols]);
-                    let end = (r0 + per).min(rows);
-                    for (row, &rr) in (r0..end).zip(&r[r0..end]) {
-                        row_f32(row, &mut buf);
-                        for (a, &b) in acc.iter_mut().zip(&buf) { *a += rr * b; }
-                    }
-                    acc
+            let hs: Vec<_> = (0..rows)
+                .step_by(per)
+                .map(|r0| {
+                    s.spawn(move || {
+                        let (mut acc, mut buf) = (vec![0f32; cols], vec![0f32; cols]);
+                        let end = (r0 + per).min(rows);
+                        for (row, &rr) in (r0..end).zip(&r[r0..end]) {
+                            row_f32(row, &mut buf);
+                            for (a, &b) in acc.iter_mut().zip(&buf) {
+                                *a += rr * b;
+                            }
+                        }
+                        acc
+                    })
                 })
-            }).collect();
+                .collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let mut a = vec![0f32; cols];
-        for p in partials { for (x, &y) in a.iter_mut().zip(&p) { *x += y; } }
+        for p in partials {
+            for (x, &y) in a.iter_mut().zip(&p) {
+                *x += y;
+            }
+        }
         a
     };
     match ck.matrix(base)? {
@@ -369,9 +428,16 @@ pub fn bake<'a>(model: &Path, r: &dyn Fn(usize) -> Option<&'a [f32]>, out: &Path
     }
     ensure!(!tensors.is_empty(), "no residual-writer matrices to edit under model.language_model.layers.*");
     fs::create_dir_all(out)?;
-    save_tensors(&out.join("adapter_model.safetensors"), tensors.iter().map(|(n, d, s, b)| (n.clone(), *d, s.clone(), &b[..])))?;
+    save_tensors(
+        &out.join("adapter_model.safetensors"),
+        tensors.iter().map(|(n, d, s, b)| (n.clone(), *d, s.clone(), &b[..])),
+    )?;
     write_config(out, &crate::hub::name(model), RANK, alpha * RANK as f32, 0.0, tensors.iter().map(|t| t.0.as_str()))?;
-    println!("baked {} residual-writer matrices (rank {RANK}, alpha {alpha}) into {}", tensors.len() / 2, out.display());
+    println!(
+        "baked {} residual-writer matrices (rank {RANK}, alpha {alpha}) into {}",
+        tensors.len() / 2,
+        out.display()
+    );
     Ok(())
 }
 

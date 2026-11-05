@@ -2,11 +2,14 @@
 //! launcher, a step's tokens, segments and logit rows on the device (`Step`), sampling on the GPU
 //! (kernels/sampling.cuh) and the CUDA graph cache. The model (qwen/) adds its layers, caches and the kernels of its
 //! own module, which instantiates the shared ones.
+use crate::checkpoint::{Checkpoint, Quant};
 use crate::engine::Tok;
 use crate::sample;
-use crate::checkpoint::{Checkpoint, Quant};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, sys};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+    sys,
+};
 use cudarc::nvrtc::Ptx;
 use std::{cell::RefCell, collections::HashMap, hash::Hash, sync::Arc};
 
@@ -123,7 +126,10 @@ impl Mat {
     /// Pack `src` [rows][cols] (bf16 bits or f32) as int8 or f16; `silu`: see row_order.
     pub fn new<V: Val>(s: &Arc<CudaStream>, src: &[V], cols: usize, silu: bool, int8: bool) -> Result<Self> {
         let rows = src.len() / cols;
-        ensure!(rows.is_multiple_of(16) && cols.is_multiple_of(256) && rows * cols == src.len(), "matrix of {rows} x {cols}");
+        ensure!(
+            rows.is_multiple_of(16) && cols.is_multiple_of(256) && rows * cols == src.len(),
+            "matrix of {rows} x {cols}"
+        );
         let (w, sc) = pack(src, cols, &row_order(rows, silu), int8);
         Mat::upload(s, &w, &sc, rows, cols, if int8 { Wt::I8 } else { Wt::F16 })
     }
@@ -133,8 +139,11 @@ impl Mat {
     /// (`zeros`: its zero points, Quant::zero_points)
     pub fn marlin_rows(s: &Arc<CudaStream>, q: &Quant, zeros: &[u8], rows: &[usize], cap: usize) -> Result<Self> {
         ensure!(q.bits == 4, "Marlin packs int4 matrices, not {}-bit ones", q.bits);
-        ensure!(rows.len().is_multiple_of(16) && cap.is_multiple_of(256) && rows.len() <= cap && !rows.is_empty(),
-                "{} rows (room for {cap})", rows.len());
+        ensure!(
+            rows.len().is_multiple_of(16) && cap.is_multiple_of(256) && rows.len() <= cap && !rows.is_empty(),
+            "{} rows (room for {cap})",
+            rows.len()
+        );
         let sym = zeros.iter().all(|&z| z == 8);
         let order: Vec<usize> = rows.iter().copied().chain(std::iter::repeat(rows[0])).take(cap).collect();
         let (w, sc) = pack_marlin(q, &order, (!sym).then_some(zeros));
@@ -148,7 +157,8 @@ impl Mat {
     /// columns, rows a multiple of 256 (Marlin's 256-output tiles of steps over 16 tokens), columns of 128; `silu`: see
     /// row_order.
     pub fn marlin(s: &Arc<CudaStream>, q: &Quant, silu: bool) -> Result<Option<Self>> {
-        let fits = q.bits == 4 && q.group.is_multiple_of(QG) && q.rows.is_multiple_of(256) && q.cols.is_multiple_of(128);
+        let fits =
+            q.bits == 4 && q.group.is_multiple_of(QG) && q.rows.is_multiple_of(256) && q.cols.is_multiple_of(128);
         let Some(zeros) = fits.then(|| q.zero_points()).flatten() else { return Ok(None) };
         Mat::marlin_rows(s, q, &zeros, &row_order(q.rows, silu), q.rows).map(Some)
     }
@@ -156,7 +166,10 @@ impl Mat {
     /// A stored symmetric int8 matrix as it is (compressed-tensors: value + 128, a scale per row and group of a multiple
     /// of 128 columns; the int8 kernels' format); `silu`: see row_order.
     pub fn int8(s: &Arc<CudaStream>, q: &Quant, silu: bool) -> Result<Option<Self>> {
-        let fits = q.bits == 8 && q.group.is_multiple_of(QG) && q.rows.is_multiple_of(16) && q.cols.is_multiple_of(Wt::I8.stage_cols());
+        let fits = q.bits == 8
+            && q.group.is_multiple_of(QG)
+            && q.rows.is_multiple_of(16)
+            && q.cols.is_multiple_of(Wt::I8.stage_cols());
         if !fits || q.zero_points().is_none_or(|z| z.iter().any(|&z| z != 128)) {
             return Ok(None);
         }
@@ -204,7 +217,6 @@ impl Mat {
         }
         Mat::new(s, &v, cols, silu, int8 && !ck.prequantized()).with_context(|| names[0].clone())
     }
-
 }
 
 /// a0..a7 of the mma A fragment of lane (g, t) for the k16 step at column k0: (row, column) in the tile
@@ -424,26 +436,42 @@ impl Gemm {
     pub fn load(s: &Arc<CudaStream>, m: &Arc<CudaModule>, max_cols: usize) -> Result<Self> {
         let mut mf = Vec::new();
         for cfg in MARLIN_CFG {
-            for (epi, zp) in [("plain", false), ("silu", false), ("argmax", false), ("plain_z", true), ("silu_z", true),
-                              ("argmax_z", true)] {
+            for (epi, zp) in [
+                ("plain", false),
+                ("silu", false),
+                ("argmax", false),
+                ("plain_z", true),
+                ("silu_z", true),
+                ("argmax_z", true),
+            ] {
                 let k = m.load_function(&format!("marlin_m{}_n{}_{epi}", cfg.0, cfg.1))?;
-                k.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                marlin_smem(cfg, zp) as i32)?;
+                k.set_attribute(
+                    sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    marlin_smem(cfg, zp) as i32,
+                )?;
                 mf.push(k);
             }
         }
         let sms = s.context().attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
-        let mk = Marlin { f: mf, sms, red: s.alloc_zeros(sms * MARLIN_SLOT)?, locks: s.alloc_zeros(sms)?,
-                          rows: s.alloc_zeros(MAX_OUT * max_cols)?, gather: m.load_function("marlin_gather")?,
-                          put: m.load_function("marlin_put_block")? };
+        let mk = Marlin {
+            f: mf,
+            sms,
+            red: s.alloc_zeros(sms * MARLIN_SLOT)?,
+            locks: s.alloc_zeros(sms)?,
+            rows: s.alloc_zeros(MAX_OUT * max_cols)?,
+            gather: m.load_function("marlin_gather")?,
+            put: m.load_function("marlin_put_block")?,
+        };
         let mut f = Vec::new();
         for wt in ["f16", "i8"] {
             for tt in ["t8", "t16", "t32", "t64"] {
                 for epi in ["plain", "silu", "argmax"] {
                     let k = m.load_function(&format!("gemm_{wt}_{tt}_{epi}"))?;
                     if tt == "t64" {
-                        k.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                        PROMPT_SMEM as i32)?;
+                        k.set_attribute(
+                            sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            PROMPT_SMEM as i32,
+                        )?;
                     }
                     f.push(k);
                 }
@@ -454,15 +482,30 @@ impl Gemm {
 
     /// y = w . x for the step's tokens (Argmax: its logit rows, keeping the running argmax in `st.keys`); split-K
     /// partial products for decode-sized steps. Returns the split factor.
-    pub fn run<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, st: &Step, w: &Mat, x: &CudaSlice<X>,
-                                            y: &CudaSlice<Y>, epi: Epi) -> Result<usize> {
+    pub fn run<X: DeviceRepr, Y: DeviceRepr>(
+        &self,
+        s: &Arc<CudaStream>,
+        st: &Step,
+        w: &Mat,
+        x: &CudaSlice<X>,
+        y: &CudaSlice<Y>,
+        epi: Epi,
+    ) -> Result<usize> {
         self.run_split(s, st, w, x, y, epi, false)
     }
 
     /// run; `whole`: a plain product without split K, accumulated as the SwiGLU epilogue's (the same values)
     #[allow(clippy::too_many_arguments)]
-    pub fn run_split<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, st: &Step, w: &Mat, x: &CudaSlice<X>,
-                                                  y: &CudaSlice<Y>, epi: Epi, whole: bool) -> Result<usize> {
+    pub fn run_split<X: DeviceRepr, Y: DeviceRepr>(
+        &self,
+        s: &Arc<CudaStream>,
+        st: &Step,
+        w: &Mat,
+        x: &CudaSlice<X>,
+        y: &CudaSlice<Y>,
+        epi: Epi,
+        whole: bool,
+    ) -> Result<usize> {
         if matches!(w.wt, Wt::Marlin | Wt::MarlinZ) {
             if epi == Epi::Argmax {
                 // the logit rows of the step's tokens, gathered: Marlin reads A rows contiguously
@@ -473,7 +516,11 @@ impl Gemm {
                     return Ok(1);
                 }
                 unsafe {
-                    s.launch_builder(&mk.gather).arg(x).arg(&st.out_rows).arg(&mk.rows).arg(&k8)
+                    s.launch_builder(&mk.gather)
+                        .arg(x)
+                        .arg(&st.out_rows)
+                        .arg(&mk.rows)
+                        .arg(&k8)
                         .launch(cfg((n, 1, 1), 128))?;
                 }
                 self.marlin(s, n, w, &mk.rows, y, epi, &st.keys)?;
@@ -519,8 +566,16 @@ impl Gemm {
     /// Plain: y f32 [n][rows] (one part); Silu: f16 [n][rows / 2].
     /// Argmax: y f32 [n][rows] and the running argmax over the `valid` rows in `keys`.
     #[allow(clippy::too_many_arguments)] // a kernel launch: stream, shape, weights, in/out buffers, epilogue, keys
-    fn marlin<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, n: usize, w: &Mat, x: &CudaSlice<X>,
-                                           y: &CudaSlice<Y>, epi: Epi, keys: &CudaSlice<u64>) -> Result<()> {
+    fn marlin<X: DeviceRepr, Y: DeviceRepr>(
+        &self,
+        s: &Arc<CudaStream>,
+        n: usize,
+        w: &Mat,
+        x: &CudaSlice<X>,
+        y: &CudaSlice<Y>,
+        epi: Epi,
+        keys: &CudaSlice<u64>,
+    ) -> Result<()> {
         let mk = &self.mk;
         let (blocks, pad) = (n.div_ceil(16), n.div_ceil(16) * 16 - n);
         let (rows, cols) = (w.tiles as i32 * 16, w.cols as i32);
@@ -536,9 +591,20 @@ impl Gemm {
             let (m, row0) = (m as i32, 16 * i as i32);
             let (zp, valid) = (w.wt == Wt::MarlinZ, w.valid as i32);
             let mut l = s.launch_builder(&mk.f[6 * c + 3 * zp as usize + epi as usize]);
-            l.arg(x).arg(&w.w).arg(y).arg(&w.s).arg(&m).arg(&rows).arg(&cols).arg(&row0).arg(&mk.red).arg(&mk.locks)
-                .arg(keys).arg(&valid);
-            let lc = LaunchConfig { shared_mem_bytes: marlin_smem(MARLIN_CFG[c], zp) as u32, ..cfg((mk.sms, 1, 1), 256) };
+            l.arg(x)
+                .arg(&w.w)
+                .arg(y)
+                .arg(&w.s)
+                .arg(&m)
+                .arg(&rows)
+                .arg(&cols)
+                .arg(&row0)
+                .arg(&mk.red)
+                .arg(&mk.locks)
+                .arg(keys)
+                .arg(&valid);
+            let lc =
+                LaunchConfig { shared_mem_bytes: marlin_smem(MARLIN_CFG[c], zp) as u32, ..cfg((mk.sms, 1, 1), 256) };
             unsafe { l.launch(lc) }?;
             i += 4 * par;
         }
@@ -550,13 +616,23 @@ impl Gemm {
     /// `stage`: device buffers of block_stage's sizes the block goes through (allocated once: no device memory is
     /// taken while serving)
     #[allow(clippy::too_many_arguments)]
-    pub fn put_block(&self, s: &Arc<CudaStream>, m: &mut Mat, q: &Quant, zeros: &[u8], block: usize, rows: &[usize],
-                     stage: &mut (CudaSlice<u32>, CudaSlice<u16>)) -> Result<()> {
+    pub fn put_block(
+        &self,
+        s: &Arc<CudaStream>,
+        m: &mut Mat,
+        q: &Quant,
+        zeros: &[u8],
+        block: usize,
+        rows: &[usize],
+        stage: &mut (CudaSlice<u32>, CudaSlice<u16>),
+    ) -> Result<()> {
         let (n, k, groups) = (m.tiles * 16, q.cols, q.cols / QG);
         ensure!(rows.len() == 16 && (block + 1) * 16 <= n && k == m.cols, "block {block} of a matrix of {n} rows");
         let zp = m.wt == Wt::MarlinZ;
-        ensure!(zp || rows.iter().all(|&r| (0..q.cols / q.group).all(|g| zeros[r * (q.cols / q.group) + g] == 8)),
-                "rows with zero points for a symmetric matrix");
+        ensure!(
+            zp || rows.iter().all(|&r| (0..q.cols / q.group).all(|g| zeros[r * (q.cols / q.group) + g] == 8)),
+            "rows with zero points for a symmetric matrix"
+        );
         let blk = block % 4;
         let mut w = vec![0u32; k / 16 * 32];
         for k16 in 0..k / 16 {
@@ -581,7 +657,16 @@ impl Gemm {
         let (wd, sd) = (&stage.0, &stage.1);
         let (ni, c64, bi, gi, ti) = (n as i32, (block / 4) as i32, blk as i32, groups as i32, tables as i32);
         unsafe {
-            s.launch_builder(&self.mk.put).arg(&m.w).arg(&m.s).arg(wd).arg(sd).arg(&ni).arg(&c64).arg(&bi).arg(&gi).arg(&ti)
+            s.launch_builder(&self.mk.put)
+                .arg(&m.w)
+                .arg(&m.s)
+                .arg(wd)
+                .arg(sd)
+                .arg(&ni)
+                .arg(&c64)
+                .arg(&bi)
+                .arg(&gi)
+                .arg(&ti)
                 .launch(cfg((k / 16, 1, 1), 32))?;
         }
         m.valid = m.valid.max((block + 1) * 16);
@@ -680,11 +765,26 @@ pub struct Step {
 
 impl Step {
     /// The sampler kernels come from the model's module (sampling.cuh, built for its vocabulary).
-    pub fn new(s: &Arc<CudaStream>, m: &Arc<CudaModule>, slots: usize, max_ctx: usize, vocab: usize, layout: Segments)
-    -> Result<Self> {
+    pub fn new(
+        s: &Arc<CudaStream>,
+        m: &Arc<CudaModule>,
+        slots: usize,
+        max_ctx: usize,
+        vocab: usize,
+        layout: Segments,
+    ) -> Result<Self> {
         let zi = |n: usize| s.alloc_zeros::<i32>(n);
         Ok(Step {
-            n: 0, n_out: 0, segs: 0, ndec: 0, ntile: 0, max_seg: 0, dec_max_pos: 0, tile_max_pos: 0, ndseg: 0, dmax: 0,
+            n: 0,
+            n_out: 0,
+            segs: 0,
+            ndec: 0,
+            ntile: 0,
+            max_seg: 0,
+            dec_max_pos: 0,
+            tile_max_pos: 0,
+            ndseg: 0,
+            dmax: 0,
             ids: zi(MAX_TOK)?,
             tok_slot: zi(MAX_TOK)?,
             tok_pos: zi(MAX_TOK)?,
@@ -732,7 +832,13 @@ impl Step {
     /// Copy a step's tokens, segments and logit rows to the device. Tokens of one sequence must be contiguous and in
     /// order; `out`: indices into `toks` whose logits are wanted; `marks`: per segment, the tokens to add to its slot's
     /// seen set (None: all of the segment's tokens).
-    pub fn upload(&mut self, s: &Arc<CudaStream>, toks: &[Tok], out: &[usize], marks: Option<&[Vec<u32>]>) -> Result<()> {
+    pub fn upload(
+        &mut self,
+        s: &Arc<CudaStream>,
+        toks: &[Tok],
+        out: &[usize],
+        marks: Option<&[Vec<u32>]>,
+    ) -> Result<()> {
         let n = toks.len();
         ensure!((1..=MAX_TOK).contains(&n), "step of {n} tokens");
         ensure!(out.len() <= MAX_OUT && out.iter().all(|&o| o < n), "logit rows {out:?}");
@@ -797,7 +903,8 @@ impl Step {
         put(&col(|t| t.id), &mut self.ids)?;
         put(&col(|t| t.slot), &mut self.tok_slot)?;
         put(&col(|t| t.pos), &mut self.tok_pos)?;
-        for (v, dst) in seg.iter().zip([&mut self.seg_start, &mut self.seg_len, &mut self.seg_slot, &mut self.seg_pos0]) {
+        for (v, dst) in seg.iter().zip([&mut self.seg_start, &mut self.seg_len, &mut self.seg_slot, &mut self.seg_pos0])
+        {
             put(v, dst)?;
         }
         put(&mark, &mut self.mark)?;
@@ -841,8 +948,13 @@ impl Step {
     /// Add the step's committed tokens to the seen sets of their slots (first kernel of a step)
     pub fn mark_seen(&self, s: &Arc<CudaStream>) -> Result<()> {
         unsafe {
-            s.launch_builder(&self.mark_seen).arg(&self.seen).arg(&self.mark).arg(&self.mark_at).arg(&self.seg_slot)
-                .arg(&self.seg_pos0).launch(cfg((self.segs, 1, 1), 256))?;
+            s.launch_builder(&self.mark_seen)
+                .arg(&self.seen)
+                .arg(&self.mark)
+                .arg(&self.mark_at)
+                .arg(&self.seg_slot)
+                .arg(&self.seg_pos0)
+                .launch(cfg((self.segs, 1, 1), 256))?;
         }
         Ok(())
     }
@@ -868,14 +980,28 @@ impl Step {
         let flat: Vec<f32> = params.iter().flatten().copied().collect();
         s.memcpy_htod(&flat, &mut self.sparams.slice_mut(0..n * 8))?;
         unsafe {
-            s.launch_builder(&self.sample_rows).arg(&self.logits).arg(&self.out_rows).arg(&self.tok_slot).arg(&self.ids)
-                .arg(&self.row_first).arg(&self.seen).arg(&self.outs).arg(&self.sparams).arg(&self.qtok).arg(&self.qn)
-                .arg(&self.qid).arg(&self.qp).arg(&self.sampled).arg(&self.accepted)
+            s.launch_builder(&self.sample_rows)
+                .arg(&self.logits)
+                .arg(&self.out_rows)
+                .arg(&self.tok_slot)
+                .arg(&self.ids)
+                .arg(&self.row_first)
+                .arg(&self.seen)
+                .arg(&self.outs)
+                .arg(&self.sparams)
+                .arg(&self.qtok)
+                .arg(&self.qn)
+                .arg(&self.qid)
+                .arg(&self.qp)
+                .arg(&self.sampled)
+                .arg(&self.accepted)
                 .launch(cfg((n, 1, 1), 1024))?;
         }
         let toks = s.clone_dtoh(&self.sampled.slice(0..n))?;
         let acc = s.clone_dtoh(&self.accepted.slice(0..n))?;
-        (0..n).map(|j| if acc[j] < 0 { self.sample_on_host(s, j, &params[j]) } else { Ok((toks[j] as u32, acc[j] != 0)) }).collect()
+        (0..n)
+            .map(|j| if acc[j] < 0 { self.sample_on_host(s, j, &params[j]) } else { Ok((toks[j] as u32, acc[j] != 0)) })
+            .collect()
     }
 
     /// `sample_rows` for row `j` on the host, from the logits and penalty sets on the device
@@ -907,11 +1033,20 @@ impl Step {
     /// column i the token head_ids[i], or i), a token drawn on the device from the row's sampling of them (read back
     /// with chain_drafts); `params` as for sample, with u1 the draw and u2 the draft's index t in its chain. Its
     /// distribution q is kept for (slot, t), for the sampler's rows whose draft is marked sampled (params[6] = -d - 2).
-    pub fn draft_sample(&mut self, s: &Arc<CudaStream>, width: usize, ld: usize, head_ids: Option<&CudaSlice<i32>>,
-                        params: &[[f32; 8]]) -> Result<()> {
+    pub fn draft_sample(
+        &mut self,
+        s: &Arc<CudaStream>,
+        width: usize,
+        ld: usize,
+        head_ids: Option<&CudaSlice<i32>>,
+        params: &[[f32; 8]],
+    ) -> Result<()> {
         let n = params.len();
-        ensure!(n == self.n_out && params.iter().all(|p| (p[5] as usize) < QD && p[0] > 0.0),
-                "{n} draft sampling rows for {} logit rows", self.n_out);
+        ensure!(
+            n == self.n_out && params.iter().all(|p| (p[5] as usize) < QD && p[0] > 0.0),
+            "{n} draft sampling rows for {} logit rows",
+            self.n_out
+        );
         let flat: Vec<f32> = params.iter().flatten().copied().collect();
         s.memcpy_htod(&flat, &mut self.dparams.slice_mut(0..n * 8))?;
         let (w, ldi, null) = (width as i32, ld as i32, 0u64);
@@ -922,8 +1057,17 @@ impl Step {
                 Some(h) => l.arg(h),
                 None => l.arg(&null),
             };
-            l.arg(&self.out_rows).arg(&self.tok_slot).arg(&self.seen).arg(&self.outs).arg(&self.dparams).arg(&self.drafts)
-                .arg(&self.qtok).arg(&self.qn).arg(&self.qid).arg(&self.qp).launch(cfg((n, 1, 1), 1024))?;
+            l.arg(&self.out_rows)
+                .arg(&self.tok_slot)
+                .arg(&self.seen)
+                .arg(&self.outs)
+                .arg(&self.dparams)
+                .arg(&self.drafts)
+                .arg(&self.qtok)
+                .arg(&self.qn)
+                .arg(&self.qid)
+                .arg(&self.qp)
+                .launch(cfg((n, 1, 1), 1024))?;
         }
         Ok(())
     }
@@ -945,7 +1089,8 @@ impl Step {
     pub fn draft_q(&self, s: &Arc<CudaStream>, slot: usize, t: usize) -> Result<(Vec<(u32, f32)>, u32)> {
         ensure!(slot < self.slots && t < QD, "draft {t} of slot {slot}");
         let q = slot * QD + t;
-        let (n, tok) = (s.clone_dtoh(&self.qn.slice(q..q + 1))?[0] as usize, s.clone_dtoh(&self.qtok.slice(q..q + 1))?[0]);
+        let (n, tok) =
+            (s.clone_dtoh(&self.qn.slice(q..q + 1))?[0] as usize, s.clone_dtoh(&self.qtok.slice(q..q + 1))?[0]);
         let ids = s.clone_dtoh(&self.qid.slice(q * QCAP..q * QCAP + n))?;
         let ps = s.clone_dtoh(&self.qp.slice(q * QCAP..q * QCAP + n))?;
         Ok((ids.into_iter().map(|i| i as u32).zip(ps).collect(), tok as u32))
@@ -991,7 +1136,10 @@ fn oom(e: &anyhow::Error) -> bool {
 impl<K: Hash + Eq + Clone> Graphs<K> {
     /// `pool`: the cache pool whose free pages go back to the driver when device memory outside it runs short
     pub fn new(pool: Option<Arc<crate::cuda::vmm::Pool>>) -> Self {
-        Graphs { cache: RefCell::new(GraphCache { graphs: HashMap::new(), tick: 0, cap: usize::MAX, low: usize::MAX }), pool }
+        Graphs {
+            cache: RefCell::new(GraphCache { graphs: HashMap::new(), tick: 0, cap: usize::MAX, low: usize::MAX }),
+            pool,
+        }
     }
 
     /// Drop the captured graphs whose keys `keep` refuses (their kernels' arguments changed)
@@ -1029,8 +1177,12 @@ impl<K: Hash + Eq + Clone> Graphs<K> {
             // no memory for the graph (nothing of the step ran): fewer graphs from now on, this step without one
             Err(e) if oom(&e) => {
                 let cap = c.graphs.len() * 3 / 4;
-                eprintln!("graphs: no device memory for a new CUDA graph ({} MiB free): {cap} kept of {}, a step of {n} \
-                           tokens runs without one", free_mem()? >> 20, c.graphs.len());
+                eprintln!(
+                    "graphs: no device memory for a new CUDA graph ({} MiB free): {cap} kept of {}, a step of {n} \
+                           tokens runs without one",
+                    free_mem()? >> 20,
+                    c.graphs.len()
+                );
                 c.cap = cap;
                 Self::evict(s, &mut c)?;
                 launch()
@@ -1047,19 +1199,28 @@ impl<K: Hash + Eq + Clone> Graphs<K> {
             let n = c.cap.min(c.graphs.len());
             let cap = if c.cap == usize::MAX { n } else { n - n / 16 };
             c.low = free;
-            eprintln!("graphs: {} MiB of device memory free outside the cache: at most {cap} CUDA graphs kept (of {})",
-                      free >> 20, c.graphs.len());
+            eprintln!(
+                "graphs: {} MiB of device memory free outside the cache: at most {cap} CUDA graphs kept (of {})",
+                free >> 20,
+                c.graphs.len()
+            );
             c.cap = cap;
         }
         if c.graphs.len() >= c.cap {
             c.cap = c.cap.max(1);
             Self::evict(s, c)?;
         }
-        if free < GRAPH_FLOOR / 2 && let Some(p) = &self.pool {
+        if free < GRAPH_FLOOR / 2
+            && let Some(p) = &self.pool
+        {
             let pages = p.release((GRAPH_FLOOR - free).div_ceil(p.page()))?;
             if pages > 0 {
-                eprintln!("cache: {pages} free pages of {} MiB back to the driver ({} MiB of device memory free outside \
-                           the cache)", p.page() >> 20, free >> 20);
+                eprintln!(
+                    "cache: {pages} free pages of {} MiB back to the driver ({} MiB of device memory free outside \
+                           the cache)",
+                    p.page() >> 20,
+                    free >> 20
+                );
             }
         }
         Ok(())

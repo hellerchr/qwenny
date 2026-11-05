@@ -43,7 +43,10 @@ impl DraftHead {
         let order: Vec<usize> = adaptive.ids().iter().map(|&t| t as usize).collect();
         let mat = Mat::marlin_rows(s, &q, &zeros, &order, MAX_ROWS)?;
         let mut ids = s.alloc_zeros(MAX_ROWS)?;
-        s.memcpy_htod(&adaptive.ids().iter().map(|&t| t as i32).collect::<Vec<_>>(), &mut ids.slice_mut(0..order.len()))?;
+        s.memcpy_htod(
+            &adaptive.ids().iter().map(|&t| t as i32).collect::<Vec<_>>(),
+            &mut ids.slice_mut(0..order.len()),
+        )?;
         let stage = Gemm::block_stage(s, &mat)?;
         Ok(Some(DraftHead { mat, ids, vocab: adaptive, q, zeros, stage }))
     }
