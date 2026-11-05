@@ -65,8 +65,7 @@ pub enum Wt {
     F16,
     /// stored q + 128, an f32 scale per row and 128 columns
     I8,
-    /// symmetric int4 (zero point 8) in Marlin's layout (pack_marlin; kernels/marlin.cuh), for modules with f16
-    /// inputs that instantiate it (Qwen): every product of a step size
+    /// symmetric int4 (zero point 8) in Marlin's layout (pack_marlin; kernels/marlin.cuh): every product of a step size
     Marlin,
     /// int4 with zero points (AWQ's, asymmetric) in Marlin's layout: the scales followed by (8 - z) * scale
     MarlinZ,
@@ -121,20 +120,12 @@ impl Mat {
         Ok(Mat { w: s.clone_htod(w)?, s: s.clone_htod(sc)?, tiles, cols, wt, split, valid: rows })
     }
 
-    /// Pack `src` [rows][cols] (bf16 bits) as int8 or f16; `silu`: see row_order.
-    pub fn new(s: &Arc<CudaStream>, src: &[u16], cols: usize, silu: bool, int8: bool) -> Result<Self> {
+    /// Pack `src` [rows][cols] (bf16 bits or f32) as int8 or f16; `silu`: see row_order.
+    pub fn new<V: Val>(s: &Arc<CudaStream>, src: &[V], cols: usize, silu: bool, int8: bool) -> Result<Self> {
         let rows = src.len() / cols;
         ensure!(rows % 16 == 0 && cols % 256 == 0 && rows * cols == src.len(), "matrix of {rows} x {cols}");
         let (w, sc) = pack(src, cols, &row_order(rows, silu), int8);
         Mat::upload(s, &w, &sc, rows, cols, if int8 { Wt::I8 } else { Wt::F16 })
-    }
-
-    /// Pack `src` [rows][cols] (f32) as f16, rows in order (a LoRA's A)
-    pub fn f16(s: &Arc<CudaStream>, src: &[f32], cols: usize) -> Result<Self> {
-        let rows = src.len() / cols;
-        ensure!(rows % 16 == 0 && cols % 256 == 0 && rows * cols == src.len(), "matrix of {rows} x {cols}");
-        let (w, sc) = pack(src, cols, &row_order(rows, false), false);
-        Mat::upload(s, &w, &sc, rows, cols, Wt::F16)
     }
 
     /// Rows `rows` (whole tiles) of a stored int4 matrix that Mat::marlin takes, in a matrix of `cap` rows (a multiple
@@ -159,9 +150,7 @@ impl Mat {
     pub fn marlin(s: &Arc<CudaStream>, q: &Quant, silu: bool) -> Result<Option<Self>> {
         let fits = q.bits == 4 && q.group % QG == 0 && q.rows % 256 == 0 && q.cols % 128 == 0;
         let Some(zeros) = fits.then(|| q.zero_points()).flatten() else { return Ok(None) };
-        let sym = zeros.iter().all(|&z| z == 8);
-        let (w, sc) = pack_marlin(q, &row_order(q.rows, silu), (!sym).then_some(&zeros[..]));
-        Ok(Some(Mat::upload(s, &w, &sc, q.rows, q.cols, if sym { Wt::Marlin } else { Wt::MarlinZ })?))
+        Mat::marlin_rows(s, q, &zeros, &row_order(q.rows, silu), q.rows).map(Some)
     }
 
     /// A stored symmetric int8 matrix as it is (compressed-tensors: value + 128, a scale per row and group of a multiple
@@ -183,17 +172,7 @@ impl Mat {
                     sc[(tile * groups + gi) * 16 + r] = q.scales[row * qgroups + gi * QG / q.group];
                 }
             }
-            let mut o = tile * 16 * cols;
-            for k32 in 0..cols / 32 {
-                for lane in 0..32 {
-                    for ks in 0..2 {
-                        for (r, c) in frag(k32 * 32 + ks * 16, lane) {
-                            w[o] = value(rows[r], c);
-                            o += 1;
-                        }
-                    }
-                }
-            }
+            frags_int8(&mut w[tile * 16 * cols..][..16 * cols], cols, |r, c| value(rows[r], c));
         }
         Ok(Some(Mat::upload(s, &w, &sc, q.rows, q.cols, Wt::I8)?))
     }
@@ -235,6 +214,39 @@ fn frag(k0: usize, lane: usize) -> [(usize, usize); 8] {
     [(g, c), (g, c + 1), (g + 8, c), (g + 8, c + 1), (g, c + 8), (g, c + 9), (g + 8, c + 8), (g + 8, c + 9)]
 }
 
+/// One 16-row tile of int8 in mma A-fragment order: two k16 steps per 16-byte load of a lane; `value`: (row, column) in the tile
+fn frags_int8(tile: &mut [u8], cols: usize, value: impl Fn(usize, usize) -> u8) {
+    let mut o = 0;
+    for k32 in 0..cols / 32 {
+        for lane in 0..32 {
+            for ks in 0..2 {
+                for (r, c) in frag(k32 * 32 + ks * 16, lane) {
+                    tile[o] = value(r, c);
+                    o += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Marlin's word of lane `lane` for the k16 step at column k0, of a block of 16 outputs `rows` (see pack_marlin)
+fn marlin_word(q: &Quant, rows: &[usize], k0: usize, lane: usize) -> u32 {
+    let (g, t, words) = (lane / 4, lane % 4, q.cols / 8);
+    let value = |row: usize, c: usize| q.q[row * words + c / 8] >> ((c % 8) * 4) & 15;
+    let mut word = 0u32;
+    for x in 0..8 {
+        word |= value(rows[g + 8 * ((x >> 1) & 1)], k0 + 2 * t + 8 * (x & 1) + (x >> 2)) << (4 * x);
+    }
+    word
+}
+
+/// Row `row`'s f16 scale in group `gi` (of QG columns), and (8 - z) * scale with `zeros` (exact: see pack_marlin)
+fn marlin_scale(q: &Quant, zeros: Option<&[u8]>, row: usize, gi: usize) -> (u16, u16) {
+    let g = row * (q.cols / q.group) + gi * QG / q.group;
+    let f16 = |v: f32| half::f16::from_f32(v).to_bits();
+    (f16(q.scales[g]), zeros.map_or(0, |z| f16((8.0 - z[g] as f32) * q.scales[g])))
+}
+
 /// Pack a stored int4 matrix's rows `order` (Marlin's outputs n) for Marlin, as Marlin's `Layer.pack`
 /// (with `_get_perms`) lays out B = W^T [k][n]: per k16 step, per 64 outputs, lane l holds 4 words, one per 16-output
 /// block j, with the mma B fragments of outputs 16 j + g (n8 tile 0) and 16 j + 8 + g (tile 1), g = l / 4, at columns
@@ -246,16 +258,15 @@ fn frag(k0: usize, lane: usize) -> [(usize, usize); 8] {
 /// same layout (exact in f16: |8 - z| has at most 3 significant bits; marlin::scale_z).
 fn pack_marlin(q: &Quant, order: &[usize], zeros: Option<&[u8]>) -> (Vec<u8>, Vec<f32>) {
     let (n, k, groups) = (order.len(), q.cols, q.cols / QG);
-    let (qgroups, words) = (q.cols / q.group, q.cols / 8);
-    let value = |row: usize, c: usize| q.q[row * words + c / 8] >> ((c % 8) * 4) & 15;
     let mut sc = vec![0u16; groups * n * if zeros.is_some() { 2 } else { 1 }];
     for (o, &row) in order.iter().enumerate() {
         let (c64, c) = (o / 64, o % 64);
         for gi in 0..groups {
-            let (at, g) = (c64 * 64 + 8 * (c % 8) + c / 8, row * qgroups + gi * QG / q.group);
-            sc[gi * n + at] = half::f16::from_f32(q.scales[g]).to_bits();
-            if let Some(z) = zeros {
-                sc[(groups + gi) * n + at] = half::f16::from_f32((8.0 - z[g] as f32) * q.scales[g]).to_bits();
+            let at = c64 * 64 + 8 * (c % 8) + c / 8;
+            let (scale, offset) = marlin_scale(q, zeros, row, gi);
+            sc[gi * n + at] = scale;
+            if zeros.is_some() {
+                sc[(groups + gi) * n + at] = offset;
             }
         }
     }
@@ -273,13 +284,8 @@ fn pack_marlin(q: &Quant, order: &[usize], zeros: Option<&[u8]>) -> (Vec<u8>, Ve
                     let mut o = 0;
                     for c64 in 0..n / 64 {
                         for lane in 0..32 {
-                            let (g, t) = (lane / 4, lane % 4);
                             for blk in 0..4 {
-                                let mut word = 0u32;
-                                for x in 0..8 {
-                                    let out = c64 * 64 + blk * 16 + g + 8 * ((x >> 1) & 1);
-                                    word |= value(order[out], k0 + 2 * t + 8 * (x & 1) + (x >> 2)) << (4 * x);
-                                }
+                                let word = marlin_word(q, &order[c64 * 64 + blk * 16..][..16], k0, lane);
                                 ws[o..o + 4].copy_from_slice(&word.to_le_bytes());
                                 o += 4;
                             }
@@ -300,7 +306,7 @@ pub fn part_len<'a>(mats: impl IntoIterator<Item = &'a Mat>) -> usize {
 }
 
 /// A matrix element as stored on the host: bf16 bits or f32
-trait Val: Copy + Sync {
+pub trait Val: Copy + Sync {
     fn f(self) -> f32;
 }
 
@@ -341,19 +347,10 @@ fn pack<V: Val>(src: &[V], cols: usize, order: &[usize], int8: bool) -> (Vec<u8>
                 }
             }
         }
-        let mut o = 0;
         if int8 {
-            for k32 in 0..cols / 32 {
-                for lane in 0..32 {
-                    for ks in 0..2 {
-                        for (r, c) in frag(k32 * 32 + ks * 16, lane) {
-                            wt[o] = q[r * cols + c];
-                            o += 1;
-                        }
-                    }
-                }
-            }
+            frags_int8(wt, cols, |r, c| q[r * cols + c]);
         } else {
+            let mut o = 0;
             for k16 in 0..cols / 16 {
                 for lane in 0..32 {
                     for (r, c) in frag(k16 * 16, lane) {
@@ -415,33 +412,30 @@ struct Marlin {
     put: CudaFunction,
 }
 
-/// The matrix kernels of a model's module (GEMM_SET in its .cu): [weights: f16, i8, i4][token tile: t8, t16, t32,
-/// t64][epilogue]; and Marlin's, if the module has them (MARLIN_SET: Qwen)
-pub struct Gemm(Vec<CudaFunction>, Option<Marlin>);
+/// The matrix kernels of a model's module: GEMM_SET's [weights: f16, i8][token tile: t8, t16, t32, t64][epilogue] and
+/// Marlin's (MARLIN_SET)
+pub struct Gemm {
+    f: Vec<CudaFunction>,
+    mk: Marlin,
+}
 
 impl Gemm {
-    /// `marlin`: the module has Marlin's kernels (matrices Wt::Marlin, Wt::MarlinZ), for products of at most
-    /// `max_cols` columns
-    pub fn load(s: &Arc<CudaStream>, m: &Arc<CudaModule>, marlin: bool, max_cols: usize) -> Result<Self> {
-        let marlin = match marlin {
-            true => {
-                let mut f = Vec::new();
-                for cfg in MARLIN_CFG {
-                    for (epi, zp) in [("plain", false), ("silu", false), ("argmax", false), ("plain_z", true),
-                                      ("silu_z", true), ("argmax_z", true)] {
-                        let k = m.load_function(&format!("marlin_m{}_n{}_{epi}", cfg.0, cfg.1))?;
-                        k.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                        marlin_smem(cfg, zp) as i32)?;
-                        f.push(k);
-                    }
-                }
-                let sms = s.context().attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
-                Some(Marlin { f, sms, red: s.alloc_zeros(sms * MARLIN_SLOT)?, locks: s.alloc_zeros(sms)?,
-                              rows: s.alloc_zeros(MAX_OUT * max_cols)?, gather: m.load_function("marlin_gather")?,
-                              put: m.load_function("marlin_put_block")? })
+    /// For products of at most `max_cols` columns
+    pub fn load(s: &Arc<CudaStream>, m: &Arc<CudaModule>, max_cols: usize) -> Result<Self> {
+        let mut mf = Vec::new();
+        for cfg in MARLIN_CFG {
+            for (epi, zp) in [("plain", false), ("silu", false), ("argmax", false), ("plain_z", true), ("silu_z", true),
+                              ("argmax_z", true)] {
+                let k = m.load_function(&format!("marlin_m{}_n{}_{epi}", cfg.0, cfg.1))?;
+                k.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                marlin_smem(cfg, zp) as i32)?;
+                mf.push(k);
             }
-            false => None,
-        };
+        }
+        let sms = s.context().attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        let mk = Marlin { f: mf, sms, red: s.alloc_zeros(sms * MARLIN_SLOT)?, locks: s.alloc_zeros(sms)?,
+                          rows: s.alloc_zeros(MAX_OUT * max_cols)?, gather: m.load_function("marlin_gather")?,
+                          put: m.load_function("marlin_put_block")? };
         let mut f = Vec::new();
         for wt in ["f16", "i8"] {
             for tt in ["t8", "t16", "t32", "t64"] {
@@ -455,7 +449,7 @@ impl Gemm {
                 }
             }
         }
-        Ok(Gemm(f, marlin))
+        Ok(Gemm { f, mk })
     }
 
     /// y = w . x for the step's tokens (Argmax: its logit rows, keeping the running argmax in `st.keys`); split-K
@@ -472,7 +466,7 @@ impl Gemm {
         if matches!(w.wt, Wt::Marlin | Wt::MarlinZ) {
             if epi == Epi::Argmax {
                 // the logit rows of the step's tokens, gathered: Marlin reads A rows contiguously
-                let mk = self.1.as_ref().context("a Marlin matrix in a module without Marlin's kernels")?;
+                let mk = &self.mk;
                 let (n, k8) = (st.n_out, (w.cols / 8) as i32);
                 ensure!(n * w.cols <= mk.rows.len(), "{n} rows of {} columns to gather", w.cols);
                 if n == 0 {
@@ -496,7 +490,7 @@ impl Gemm {
             _ => 1,
         };
         let variant = tile.unwrap_or(DEC_TILES.len());
-        let f = &self.0[(w.wt as usize * 4 + variant) * 3 + epi as usize];
+        let f = &self.f[(w.wt as usize * 4 + variant) * 3 + epi as usize];
         let ldy = match epi {
             Epi::Silu => w.tiles * 8,
             _ => w.tiles * 16,
@@ -513,9 +507,7 @@ impl Gemm {
         l.arg(&cols).arg(&tiles).arg(&ni).arg(&kper).arg(y).arg(&ldy).arg(&st.keys);
         let grid_z = if tile.is_some() { 1 } else { n.div_ceil(8 * PNTT) };
         let warps = if tile.is_some() { WARPS } else { PWARPS };
-        // prompt kernels: 16-row tiles per warp (prompt_tiles in the kernels)
-        let per_warp = 1;
-        let lc = cfg((w.tiles.div_ceil(warps * per_warp), split, grid_z), warps * 32);
+        let lc = cfg((w.tiles.div_ceil(warps), split, grid_z), warps * 32);
         let lc = if tile.is_some() { lc } else { LaunchConfig { shared_mem_bytes: PROMPT_SMEM as u32, ..lc } };
         unsafe { l.launch(lc) }?;
         Ok(split)
@@ -528,7 +520,7 @@ impl Gemm {
     /// Argmax: y f32 [n][rows] and the running argmax over the `valid` rows in `keys`.
     fn marlin<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, n: usize, w: &Mat, x: &CudaSlice<X>,
                                            y: &CudaSlice<Y>, epi: Epi, keys: &CudaSlice<u64>) -> Result<()> {
-        let mk = self.1.as_ref().context("a Marlin matrix in a module without Marlin's kernels")?;
+        let mk = &self.mk;
         let (blocks, pad) = (n.div_ceil(16), n.div_ceil(16) * 16 - n);
         let (rows, cols) = (w.tiles as i32 * 16, w.cols as i32);
         let mut i = 0;
@@ -551,9 +543,7 @@ impl Gemm {
         }
         Ok(())
     }
-}
 
-impl Gemm {
     /// Write the stored rows `rows` (16 of them) of `q` as the 16-row block `block` of a Marlin matrix from
     /// Mat::marlin_rows (a draft head learning a row; its quantization, `zeros` its zero points), counting it as valid.
     /// `stage`: device buffers of block_stage's sizes the block goes through (allocated once: no device memory is
@@ -561,33 +551,26 @@ impl Gemm {
     #[allow(clippy::too_many_arguments)]
     pub fn put_block(&self, s: &Arc<CudaStream>, m: &mut Mat, q: &Quant, zeros: &[u8], block: usize, rows: &[usize],
                      stage: &mut (CudaSlice<u32>, CudaSlice<u16>)) -> Result<()> {
-        let mk = self.1.as_ref().context("a Marlin matrix in a module without Marlin's kernels")?;
         let (n, k, groups) = (m.tiles * 16, q.cols, q.cols / QG);
         ensure!(rows.len() == 16 && (block + 1) * 16 <= n && k == m.cols, "block {block} of a matrix of {n} rows");
         let zp = m.wt == Wt::MarlinZ;
         ensure!(zp || rows.iter().all(|&r| (0..q.cols / q.group).all(|g| zeros[r * (q.cols / q.group) + g] == 8)),
                 "rows with zero points for a symmetric matrix");
-        let (qgroups, words) = (q.cols / q.group, q.cols / 8);
-        let value = |row: usize, c: usize| q.q[row * words + c / 8] >> ((c % 8) * 4) & 15;
         let blk = block % 4;
         let mut w = vec![0u32; k / 16 * 32];
         for k16 in 0..k / 16 {
             for lane in 0..32 {
-                let (g, t) = (lane / 4, lane % 4);
-                for x in 0..8 {
-                    let r = g + 8 * ((x >> 1) & 1);
-                    w[k16 * 32 + lane] |= value(rows[r], k16 * 16 + 2 * t + 8 * (x & 1) + (x >> 2)) << (4 * x);
-                }
+                w[k16 * 32 + lane] = marlin_word(q, rows, k16 * 16, lane);
             }
         }
         let tables = if zp { 2 } else { 1 };
         let mut sc = vec![0u16; tables * groups * 16];
         for (r, &row) in rows.iter().enumerate() {
             for gi in 0..groups {
-                let g = row * qgroups + gi * QG / q.group;
-                sc[gi * 16 + r] = half::f16::from_f32(q.scales[g]).to_bits();
+                let (scale, offset) = marlin_scale(q, zp.then_some(zeros), row, gi);
+                sc[gi * 16 + r] = scale;
                 if zp {
-                    sc[(groups + gi) * 16 + r] = half::f16::from_f32((8.0 - zeros[g] as f32) * q.scales[g]).to_bits();
+                    sc[(groups + gi) * 16 + r] = offset;
                 }
             }
         }
@@ -597,7 +580,7 @@ impl Gemm {
         let (wd, sd) = (&stage.0, &stage.1);
         let (ni, c64, bi, gi, ti) = (n as i32, (block / 4) as i32, blk as i32, groups as i32, tables as i32);
         unsafe {
-            s.launch_builder(&mk.put).arg(&m.w).arg(&m.s).arg(wd).arg(sd).arg(&ni).arg(&c64).arg(&bi).arg(&gi).arg(&ti)
+            s.launch_builder(&self.mk.put).arg(&m.w).arg(&m.s).arg(wd).arg(sd).arg(&ni).arg(&c64).arg(&bi).arg(&gi).arg(&ti)
                 .launch(cfg((k / 16, 1, 1), 32))?;
         }
         m.valid = m.valid.max((block + 1) * 16);
@@ -634,8 +617,7 @@ pub struct Step {
     pub ndec: usize,
     pub ntile: usize,
     pub max_seg: usize,
-    /// Smallest and largest position among the decode-attention tokens; largest among the prompt-tile tokens
-    pub dec_min_pos: usize,
+    /// Largest position among the decode-attention tokens; among the prompt-tile tokens
     pub dec_max_pos: usize,
     pub tile_max_pos: usize,
     pub ids: CudaSlice<i32>,
@@ -701,7 +683,7 @@ impl Step {
     -> Result<Self> {
         let zi = |n: usize| s.alloc_zeros::<i32>(n);
         Ok(Step {
-            n: 0, n_out: 0, segs: 0, ndec: 0, ntile: 0, max_seg: 0, dec_min_pos: 0, dec_max_pos: 0, tile_max_pos: 0, ndseg: 0, dmax: 0,
+            n: 0, n_out: 0, segs: 0, ndec: 0, ntile: 0, max_seg: 0, dec_max_pos: 0, tile_max_pos: 0, ndseg: 0, dmax: 0,
             ids: zi(MAX_TOK)?,
             tok_slot: zi(MAX_TOK)?,
             tok_pos: zi(MAX_TOK)?,
@@ -804,39 +786,34 @@ impl Step {
         let row_first: Vec<i32> =
             out.iter().map(|&o| *seg[0].iter().rev().find(|&&st| st as usize <= o).unwrap()).collect();
         let col = |f: fn(&Tok) -> u32| toks.iter().map(|t| f(t) as i32).collect::<Vec<_>>();
-        s.memcpy_htod(&col(|t| t.id), &mut self.ids.slice_mut(0..n))?;
-        s.memcpy_htod(&col(|t| t.slot), &mut self.tok_slot.slice_mut(0..n))?;
-        s.memcpy_htod(&col(|t| t.pos), &mut self.tok_pos.slice_mut(0..n))?;
+        // to the front of `dst`
+        let put = |v: &[i32], dst: &mut CudaSlice<i32>| -> Result<()> {
+            if !v.is_empty() {
+                s.memcpy_htod(v, &mut dst.slice_mut(0..v.len()))?;
+            }
+            Ok(())
+        };
+        put(&col(|t| t.id), &mut self.ids)?;
+        put(&col(|t| t.slot), &mut self.tok_slot)?;
+        put(&col(|t| t.pos), &mut self.tok_pos)?;
         for (v, dst) in seg.iter().zip([&mut self.seg_start, &mut self.seg_len, &mut self.seg_slot, &mut self.seg_pos0]) {
-            s.memcpy_htod(v, &mut dst.slice_mut(0..ns))?;
+            put(v, dst)?;
         }
-        if !mark.is_empty() {
-            s.memcpy_htod(&mark, &mut self.mark.slice_mut(0..mark.len()))?;
-        }
-        s.memcpy_htod(&mark_at, &mut self.mark_at.slice_mut(0..ns + 1))?;
-        if !out.is_empty() {
-            let o: Vec<i32> = out.iter().map(|&o| o as i32).collect();
-            s.memcpy_htod(&o, &mut self.out_rows.slice_mut(0..o.len()))?;
-            s.memcpy_htod(&row_first, &mut self.row_first.slice_mut(0..o.len()))?;
-        }
-        if !dtok.is_empty() {
-            s.memcpy_htod(&dtok, &mut self.dtok.slice_mut(0..dtok.len()))?;
-            s.memcpy_htod(&dseg, &mut self.dseg.slice_mut(0..dseg.len()))?;
-            s.memcpy_htod(&dkeys, &mut self.dkeys.slice_mut(0..dkeys.len()))?;
-        }
-        if !ptile.is_empty() {
-            s.memcpy_htod(&ptile, &mut self.ptile.slice_mut(0..ptile.len()))?;
-        }
-        let pos = |ts: &mut dyn Iterator<Item = i32>| ts.map(|t| toks[t as usize].pos as usize).collect::<Vec<_>>();
-        let dpos = pos(&mut dtok.iter().copied());
-        let tpos = pos(&mut ptile.chunks(2).map(|c| c[0] + c[1] - 1));
+        put(&mark, &mut self.mark)?;
+        put(&mark_at, &mut self.mark_at)?;
+        put(&out.iter().map(|&o| o as i32).collect::<Vec<_>>(), &mut self.out_rows)?;
+        put(&row_first, &mut self.row_first)?;
+        put(&dtok, &mut self.dtok)?;
+        put(&dseg, &mut self.dseg)?;
+        put(&dkeys, &mut self.dkeys)?;
+        put(&ptile, &mut self.ptile)?;
         (self.n, self.n_out, self.segs, self.ndec, self.ntile) = (n, out.len(), ns, dtok.len(), ptile.len() / 2);
         self.ndseg = dseg.len() / 2;
         self.dmax = dseg.chunks(2).map(|d| d[1] as usize).max().unwrap_or(0);
         self.max_seg = seg[1].iter().copied().max().unwrap_or(0) as usize;
-        self.dec_max_pos = dpos.iter().copied().max().unwrap_or(0);
-        self.dec_min_pos = dpos.iter().copied().min().unwrap_or(0);
-        self.tile_max_pos = tpos.into_iter().max().unwrap_or(0);
+        let pos = |t: i32| toks[t as usize].pos as usize;
+        self.dec_max_pos = dtok.iter().map(|&t| pos(t)).max().unwrap_or(0);
+        self.tile_max_pos = ptile.chunks(2).map(|c| pos(c[0] + c[1] - 1)).max().unwrap_or(0);
         Ok(())
     }
 

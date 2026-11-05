@@ -6,7 +6,8 @@
 //! delta added first (the product then runs plain, not with the SwiGLU epilogue). Steps without adapter tokens skip
 //! all of it. A and B are f16 on the device: f16 holds a bf16 adapter's values exactly (in f16's normal range) and an
 //! f32 one to 11 bits, as the f16 weights of a 16-bit model; the products accumulate in f32.
-use crate::cuda::core::{Gemm, Mat, Step, cfg, row_order};
+use super::Stack;
+use crate::cuda::core::{Mat, cfg, row_order};
 use crate::lora::Adapter;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, PushKernelArg};
@@ -32,7 +33,7 @@ impl Kernels {
 
 /// The adapted modules of the products that read one input: A of each stacked, [modules * r (padded to 16)][in]
 pub struct LoraA {
-    a: Mat,
+    pub a: Mat,
     r: usize,
 }
 
@@ -84,7 +85,7 @@ pub fn load(s: &Arc<CudaStream>, ad: &Adapter, stacks: &[Stacked], cols: usize, 
     let m = (a.len() / cols).next_multiple_of(16);
     ensure!(m <= MAXM, "{m} LoRA rows on one input (at most {MAXM})");
     a.resize(m * cols, 0.0);
-    let a = Mat::f16(s, &a, cols).context("LoRA A")?;
+    let a = Mat::new(s, &a, cols, false, false).context("LoRA A")?;
     let mut bs = Vec::new();
     for (st, o) in stacks.iter().zip(&offs) {
         if o.iter().all(|&x| x < 0) {
@@ -125,45 +126,35 @@ pub fn load(s: &Arc<CudaStream>, ad: &Adapter, stacks: &[Stacked], cols: usize, 
 }
 
 impl LoraA {
-    pub fn mat(&self) -> &Mat {
-        &self.a
-    }
-
-    /// xa = A x for the step's tokens into `part` (split-K partial products); returns the split
-    pub fn run(&self, mm: &Gemm, s: &Arc<CudaStream>, st: &Step, x: &CudaSlice<u16>, part: &CudaSlice<f32>)
-    -> Result<usize> {
-        mm.run(s, st, &self.a, x, part, crate::cuda::core::Epi::Plain)
-    }
-
-    fn rank(&self) -> usize {
-        RANKS.iter().position(|&r| r == self.r).unwrap()
-    }
-
-    /// y (a plain product's split 0, [n][rows]) += s B xa for the tokens of adapter slots; `xa`, `split`: run's
-    #[allow(clippy::too_many_arguments)]
-    pub fn add(&self, k: &Kernels, s: &Arc<CudaStream>, st: &Step, scales: &CudaSlice<f32>, xa: &CudaSlice<f32>,
-               split: usize, b: &LoraB, y: &CudaSlice<f32>) -> Result<()> {
-        let (spi, m, rows, n, ldy) = (split as i32, (self.a.tiles * 16) as i32, b.rows as i32, st.n as i32, b.rows as i32);
+    /// The kernel for this rank of `f`, on the plain product y (split 0 or 1, [n][rows]), xa = A x in `lpart` of `split`
+    /// parts (s of the slots that use the adapter); and mid when it is written. A block per 256 rows it writes, of y's or
+    /// of mid's half of them.
+    fn launch(&self, f: &[CudaFunction], x: &Stack, split: usize, b: &LoraB, y: &CudaSlice<f32>, mid: Option<&CudaSlice<u16>>)
+    -> Result<()> {
+        let (spi, m, rows, n) = (split as i32, (self.a.tiles * 16) as i32, b.rows as i32, x.st.n as i32);
+        let per = if mid.is_some() { 2 * 256 } else { 256 };
+        let rank = RANKS.iter().position(|&r| r == self.r).unwrap();
         unsafe {
-            s.launch_builder(&k.add[self.rank()]).arg(xa).arg(&spi).arg(&m).arg(&b.b).arg(&rows).arg(&b.tab)
-                .arg(&st.tok_slot).arg(scales).arg(&n).arg(y).arg(&ldy)
-                .launch(cfg((b.rows.div_ceil(256), st.n.div_ceil(TT), 1), 256))?;
+            let mut l = x.s.launch_builder(&f[rank]);
+            l.arg(&x.b.lpart).arg(&spi).arg(&m).arg(&b.b).arg(&rows).arg(&b.tab).arg(&x.st.tok_slot).arg(&x.scales).arg(&n)
+                .arg(y).arg(&rows);
+            if let Some(mid) = mid {
+                l.arg(mid);
+            }
+            l.launch(cfg((b.rows.div_ceil(per), x.st.n.div_ceil(TT), 1), 256))?;
         }
         Ok(())
+    }
+
+    /// y (a plain product's split 0, [n][rows]) += s B xa for the tokens of adapter slots; xa in `lpart`, of `split` parts
+    pub fn add(&self, x: &Stack, split: usize, b: &LoraB, y: &CudaSlice<f32>) -> Result<()> {
+        self.launch(&x.lk.add, x, split, b, y, None)
     }
 
     /// mid = SwiGLU of the plain [gate; up] product y (split 1, [n][rows]) with s B xa added for the tokens of adapter
     /// slots, as the SwiGLU epilogue writes it
-    #[allow(clippy::too_many_arguments)]
-    pub fn silu(&self, k: &Kernels, s: &Arc<CudaStream>, st: &Step, scales: &CudaSlice<f32>, xa: &CudaSlice<f32>,
-                split: usize, b: &LoraB, y: &CudaSlice<f32>, mid: &CudaSlice<u16>) -> Result<()> {
-        let (spi, m, rows, n, ldy) = (split as i32, (self.a.tiles * 16) as i32, b.rows as i32, st.n as i32, b.rows as i32);
-        unsafe {
-            s.launch_builder(&k.silu[self.rank()]).arg(xa).arg(&spi).arg(&m).arg(&b.b).arg(&rows).arg(&b.tab)
-                .arg(&st.tok_slot).arg(scales).arg(&n).arg(y).arg(&ldy).arg(mid)
-                .launch(cfg((b.rows.div_ceil(2 * 256), st.n.div_ceil(TT), 1), 256))?;
-        }
-        Ok(())
+    pub fn silu(&self, x: &Stack, split: usize, b: &LoraB, y: &CudaSlice<f32>, mid: &CudaSlice<u16>) -> Result<()> {
+        self.launch(&x.lk.silu, x, split, b, y, Some(mid))
     }
 }
 
@@ -180,7 +171,7 @@ impl LayerLora {
     pub fn mats(&self) -> impl Iterator<Item = &Mat> {
         let a = [self.inp.as_ref().map(|x| &x.0), self.out.as_ref().map(|x| &x.0), self.gate_up.as_ref().map(|x| &x.0),
                  self.down.as_ref().map(|x| &x.0)];
-        a.into_iter().flatten().map(|a| a.mat())
+        a.into_iter().flatten().map(|a| &a.a)
     }
 }
 

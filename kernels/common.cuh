@@ -1,4 +1,4 @@
-// Helpers shared by every kernel file: warp and block reductions, bf16 and f16 conversions.
+// Helpers shared by every kernel file: warp and block reductions, f16 conversions, shared-memory copies.
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -6,13 +6,9 @@
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
-// The matrix products' input type (a model's .cu may define it before including this file): float, or __half (the
-// products round their input to f16 anyway: written as f16 by its producer, it is staged with cp.async)
-#ifndef XIN
-#define XIN float
-#endif
-__device__ __forceinline__ void st_x(float* p, float v) { *p = v; }
-__device__ __forceinline__ void st_x(__half* p, float v) { *p = __float2half_rn(v); }
+// The matrix products' input type: they round it to f16 anyway, so its producer writes f16 and it is staged with cp.async
+#define XIN __half
+__device__ __forceinline__ void st_x(XIN* p, float v) { *p = __float2half_rn(v); }
 
 // Asynchronous copies global -> shared (cp.async; wait with cp.async.wait_group). !ok: zero-fill the 16 bytes.
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok = true) {
@@ -28,12 +24,6 @@ __device__ __forceinline__ void cp_async4(void* dst, const void* src) {
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const __half* p) {
     uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-}
-
-__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const __half* p) {
-    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 
@@ -55,28 +45,21 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
     return t;
 }
 
-__device__ __forceinline__ void bf16x4(uint2 u, float* f) {
-    f[0] = __uint_as_float(u.x << 16); f[1] = __uint_as_float(u.x & 0xffff0000u);
-    f[2] = __uint_as_float(u.y << 16); f[3] = __uint_as_float(u.y & 0xffff0000u);
-}
-
 __device__ __forceinline__ uint32_t pack_half2(float a, float b) {
     __half2 h = __floats2half2_rn(a, b);
     return *(uint32_t*)&h;
-}
-
-template <int N>
-__device__ __forceinline__ void warp_sum_n(float (&v)[N]) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-#pragma unroll
-        for (int i = 0; i < N; i++) v[i] += __shfl_xor_sync(0xffffffff, v[i], o);
 }
 
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
     return v;
+}
+
+// Order-preserving map of a float to an unsigned int
+__device__ __forceinline__ unsigned ordered(float v) {
+    unsigned u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
 // Sum of the `splits` partial products [split][n][ld] at row t, column c

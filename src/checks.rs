@@ -447,7 +447,7 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     ensure!(!rows.is_empty(), "no prompts in {prompts}");
 
     let adapter = opts.adapter()?;
-    let mut m = crate::cuda::qwen::Model::load_only(Path::new(dir), ctx, 1, opts.int8, adapter.as_ref().map(|a| &a.1), None)?;
+    let mut m = crate::cuda::qwen::Model::load(Path::new(dir), ctx, 1, opts.int8, adapter.as_ref().map(|a| &a.1))?;
     if adapter.is_some() {
         m.set_adapter(0, true)?;
     }

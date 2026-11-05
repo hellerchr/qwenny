@@ -114,12 +114,12 @@ impl DeltaNet {
         Ok(())
     }
 
-    /// Map slot `slot`'s memory (zeroed when new); false when the pages ran out
     /// Device bytes a slot maps (its state buffers, replay banks and ring, in whole pages)
     pub fn slot_bytes(&self) -> usize {
         self.ss * 4
     }
 
+    /// Map slot `slot`'s memory (zeroed when new); false when the pages ran out
     pub fn map(&mut self, slot: usize) -> Result<bool> {
         if !self.mapped[slot] {
             self.mapped[slot] = self.mem.map(slot * self.ss * 4, (slot + 1) * self.ss * 4)?;

@@ -6,7 +6,7 @@
 // mma fragments of the decode attention: keys [slot][NKV][cap][HD] with the dims of each 64-dim block reordered
 // (kslot), values in blocks of 16 keys [slot][NKV][cap / 16][HD][16] with the keys of a block reordered (vslot). A step
 // runs attn_prep (q, k, v of every token; k, v into the cache; into the output what the attention multiplies it by:
-// the sigmoid gate), then the decode tokens (attn_decode by key splits, attn_combine) and the prompt tiles
+// the sigmoid gate), then the decode tokens (attn_mq by key splits, attn_combine) and the prompt tiles
 // (attn_prefill on tensor cores), which multiply their result into that output. Scores are in base 2: attn_prep scales
 // q by log2(e) over sqrt(HD).
 
@@ -26,11 +26,6 @@ __device__ __forceinline__ int kslot(int d) {
     int b = d >> 6, w = d & 15, t4 = (w & 7) >> 1, e = (w & 1) | ((w >> 3) << 1);
     return b * 64 + t4 * 16 + ((d & 63) >> 4) * 4 + e;
 }
-// the dim of byte i of a key row (the inverse of kslot)
-__device__ __forceinline__ int kdim(int i) {
-    int b = i >> 6, t4 = (i & 63) >> 4, st = (i & 15) >> 2, e = i & 3;
-    return b * 64 + st * 16 + 2 * t4 + (e & 1) + ((e >> 1) << 3);
-}
 // Byte of (position, dim) in a head's values: blocks of 16 keys, [block][dim][16]; key j of a block at byte t4 * 4 + e
 // for j = 2 t4 + (e & 1) + 8 (e >> 1): lane t4 reads the B fragment of one n8 tile of dims (keys 2 t4, 2 t4 + 1,
 // 2 t4 + 8, 2 t4 + 9) as 4 bytes
@@ -38,43 +33,17 @@ __device__ __forceinline__ size_t vslot(int pos, int d) {
     int j = pos & 15, t4 = (j & 7) >> 1, e = (j & 1) | ((j >> 3) << 1);
     return ((size_t)(pos >> 4) * HD + d) * 16 + t4 * 4 + e;
 }
-// the key (within its block of 16) of byte i of a value run (the inverse of vslot's order)
-__device__ __forceinline__ int vkey(int i) { return 2 * (i >> 2) + (i & 1) + ((i & 2) << 2); }
-// The cache holds q + 128 (KV_BIAS). Two of its bytes (sel) -> half2 1152 + q, exactly, in one prmt; the attention
+// The cache holds q + 128. Two of its bytes (sel) -> half2 1152 + q, exactly, in one prmt; the attention
 // kernels subtract 1152 times the row sums of Q (scores) and of P (outputs) instead of converting every value
 #define KV_OFF 1152.f
 __device__ __forceinline__ uint32_t kv_half2(uint32_t w, uint32_t sel) { return __byte_perm(w, 0x64646464u, sel); }
 
-// 8 int8 (two words) -> 8 floats
-__device__ __forceinline__ void i8x8(uint2 u, float* f) {
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        f[i] = (float)(int8_t)(u.x >> (8 * i));
-        f[4 + i] = (float)(int8_t)(u.y >> (8 * i));
-    }
-}
-
 // Keys per split of a decode token with `keys` keys: a multiple of 16, at least KPS, at most DSPLITS splits. A function of
 // `keys` alone, so a token gets the same splits (the same sums) in any step: a draft as with one token per step. The
-// size changes every 16 * DSPLITS keys; Step::new cuts a short segment where it changes (dchunk in core.rs).
+// size changes every 16 * DSPLITS keys; Step::upload cuts a short segment where it changes (Segments::cut).
 #define DSPLITS 128
 __device__ __forceinline__ int dchunk(int keys) { return max(KPS, ((keys + DSPLITS - 1) / DSPLITS + 15) / 16 * 16); }
 __device__ __forceinline__ int nsplits(int keys, int z) { int c = dchunk(keys); return min(z, (keys + c - 1) / c); }
-
-
-
-__device__ __forceinline__ void bf16x8(uint4 u, float* f) {
-    bf16x4(make_uint2(u.x, u.y), f);
-    bf16x4(make_uint2(u.z, u.w), f + 4);
-}
-
-// 8 bf16 -> 8 f16 (exact for normal values below 65504)
-__device__ __forceinline__ uint4 bf16x8_half(uint4 u) {
-    float f[8];
-    bf16x8(u, f);
-    return make_uint4(pack_half2(f[0], f[1]), pack_half2(f[2], f[3]), pack_half2(f[4], f[5]), pack_half2(f[6], f[7]));
-}
-
 
 // A key (or value) head of a token into the cache, one warp, the lane's HD / 32 values v[j] of dims lane + 32 j: int8
 // with the head's scale at this position, in the cache's layout (kslot, vslot)
@@ -104,7 +73,7 @@ __device__ __forceinline__ void kv_store(const float* v, bool key, int8_t* kc, i
 // all but the first); no tile computes another's S, and the small block (shared memory for Q only) keeps many blocks
 // resident. One split: the block finishes its rows (out *= normalized result); else it writes the partials (max, sum,
 // acc) for attn_combine.
-#define MQ 8  // most tokens of a short segment (SEGMENTS.short in attn.rs)
+#define MQ 8  // most tokens of a short segment (segments() in attn.rs)
 template <int RT>
 __device__ __forceinline__ void attn_mq_tc(const float* q, const int8_t* kc, const int8_t* vc, const float* ks,
                                            const float* vs, const int* dseg, const int* dtok, const int* tok_slot,

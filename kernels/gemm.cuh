@@ -12,10 +12,10 @@
 // (blockIdx.z); X is staged in shared memory as f16 per chunk of KC columns.
 
 #define WARPS 4      // decode kernels
-#define PWARPS 8     // prompt kernels: more rows per block share the staged X
-#ifndef PNTT
+#define PWARPS 8     // prompt kernels: more rows per block share the staged X (one 16-row tile per warp: 2 measured
+                     // 1.8 % slower on the 27B: one block per SM)
 #define PNTT 8       // prompt kernels: n8 token tiles per block
-#endif
+#define KC 128       // prompt kernels: columns staged per chunk, one scale group
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile(
@@ -30,9 +30,6 @@ __device__ __forceinline__ uint32_t u8x2_half2(uint32_t w, uint32_t sel) {
     __half2 r = __hsub2(*(__half2*)&h, __half2(__float2half(1152.f), __float2half(1152.f)));
     return *(uint32_t*)&r;
 }
-
-// 16-row tiles per warp of the prompt kernels (2 measured 1.8 % slower on the 27B: one block per SM)
-template <int WB> __host__ __device__ constexpr int prompt_tiles() { return 1; }
 
 // columns per 16-byte load of a lane, k16 steps in it
 template <int WB> __host__ __device__ constexpr int cols_per_load() { return 256 / WB; }
@@ -71,12 +68,9 @@ __device__ __forceinline__ uint4 ld_stream(const uint4* a, unsigned long long po
 }
 
 
-// Order-preserving map of a float to an unsigned int; key = (ordered value, ~index): atomicMax picks the largest
-// logit and, among equal ones, the lowest index.
+// key = (ordered value, ~index): atomicMax picks the largest logit and, among equal ones, the lowest index.
 __device__ __forceinline__ unsigned long long argmax_key(float v, int i) {
-    uint32_t b = __float_as_uint(v);
-    b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
-    return ((unsigned long long)b << 32) | (0xffffffffu - (uint32_t)i);
+    return ((unsigned long long)ordered(v) << 32) | (0xffffffffu - (uint32_t)i);
 }
 
 // Matrix product epilogue: acc holds rows g, g + 8 of the warp's tile (c0, c1: row g, tokens 2 t4 and 2 t4 + 1 of
@@ -119,79 +113,52 @@ __device__ __forceinline__ void epilogue(const float (&acc)[NTT][4], int tile, i
     }
 }
 
-// WB: weight width (16, 8, 4); NTT: n8 token tiles per block; KC: columns staged per chunk.
+// WB: weight width (16, 8); NTT: n8 token tiles per block.
 // xrows: X row of token t (null: t). EPI_PLAIN writes Y + split * n * ldy (partial products, summed by the
 // consumer); EPI_SILU: tile p holds rows 8p..8p+7 of w1 and of w3, Y[t][8p + g] = silu(w1 . x) * (w3 . x);
 // EPI_ARGMAX: plain, plus the running argmax key per token.
-template <int WB, int NTT, int KC, int EPI, class XT>
+template <int WB, int NTT, int EPI>
 __device__ __forceinline__ void gemm(const uint4* __restrict__ W, const float* __restrict__ S,
-                                     const XT* __restrict__ X, const int* __restrict__ xrows, int K, int ntiles,
+                                     const XIN* __restrict__ X, const int* __restrict__ xrows, int K, int ntiles,
                                      int n, int kper, float* __restrict__ Y, int ldy, unsigned long long* keys) {
     constexpr int TOK = 8 * NTT, PAD = KC + 8;  // row stride of 4 (mod 32) words: conflict-free B fragment loads
-    constexpr int G = KC / 128;                     // scale groups per chunk
     constexpr int CPL = cols_per_load<WB>(), VPC = KC / CPL;  // uint4 per lane per chunk
-    constexpr bool Q = WB == 8;  // Q: f32 scales applied per group after the products
-    constexpr int MT = prompt_tiles<WB>();    // 16-row tiles per warp: each X fragment feeds MT products
+    constexpr bool Q = WB == 8;  // Q: f32 scales applied after the products
     extern __shared__ __align__(16) __half xsm[];  // [2][TOK * PAD]: dynamic (PROMPT_SMEM bytes)
     __half (*xs)[TOK * PAD] = (__half (*)[TOK * PAD])xsm;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
-    int tile0 = (blockIdx.x * PWARPS + warp) * MT;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2;
+    int tile = blockIdx.x * PWARPS + warp;
     int tok0 = blockIdx.z * TOK;
     int k0 = blockIdx.y * kper, k1 = min(K, k0 + kper), nch = (k1 - k0) / KC;
-    const uint4* wp[MT];
-    const float* sp[MT];
-    bool live[MT];
-#pragma unroll
-    for (int mt = 0; mt < MT; mt++) {
-        int tile = tile0 + mt;
-        live[mt] = tile < ntiles;
-        wp[mt] = W + (size_t)min(tile, ntiles - 1) * (K / CPL) * 32 + (k0 / CPL) * 32 + lane;
-        sp[mt] = S + ((size_t)min(tile, ntiles - 1) * (K / 128) + k0 / 128) * 16;
-    }
-    bool active = live[0];
+    bool active = tile < ntiles;
+    const uint4* wp = W + (size_t)min(tile, ntiles - 1) * (K / CPL) * 32 + (k0 / CPL) * 32 + lane;
+    const float* sp = S + ((size_t)min(tile, ntiles - 1) * (K / 128) + k0 / 128) * 16;
 
-    // stage X columns [kc, kc + KC) of the block's tokens as f16 (f16 X: cp.async, waited for before the barrier
-    // that ends the chunk computed meanwhile)
+    // stage X columns [kc, kc + KC) of the block's tokens (cp.async, waited for before the barrier that ends the chunk
+    // computed meanwhile)
     auto stage = [&](int c, int buf) {
         int kc = k0 + c * KC;
-        if constexpr (sizeof(XT) == 2) {
-            for (int i = threadIdx.x; i < TOK * KC / 8; i += PWARPS * 32) {
-                int r = i / (KC / 8), col = (i % (KC / 8)) * 8, t = tok0 + r;
-                cp_async16(&xs[buf][r * PAD + col], X + (size_t)(t < n ? (xrows ? xrows[t] : t) : 0) * K + kc + col, t < n);
-            }
-            return;
-        }
-        for (int i = threadIdx.x; i < TOK * KC / 4; i += PWARPS * 32) {
-            int r = i / (KC / 4), col = (i % (KC / 4)) * 4, t = tok0 + r;
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (t < n) v = __ldg((const float4*)((const float*)X + (size_t)(xrows ? xrows[t] : t) * K + kc + col));
-            uint2 hv = make_uint2(pack_half2(v.x, v.y), pack_half2(v.z, v.w));
-            *(uint2*)&xs[buf][r * PAD + col] = hv;
+        for (int i = threadIdx.x; i < TOK * KC / 8; i += PWARPS * 32) {
+            int r = i / (KC / 8), col = (i % (KC / 8)) * 8, t = tok0 + r;
+            cp_async16(&xs[buf][r * PAD + col], X + (size_t)(t < n ? (xrows ? xrows[t] : t) : 0) * K + kc + col, t < n);
         }
     };
-    uint4 wc[MT][VPC], wn[MT][VPC];
-    float sc[MT][G][2], sn[MT][G][2];
-    auto load = [&](int c, uint4 (*w)[VPC], float (*s)[G][2]) {
+    uint4 wc[VPC], wn[VPC];
+    float sc[2], sn[2];
+    auto load = [&](int c, uint4* w, float* s) {
         if (!active || c >= nch) return;
 #pragma unroll
-        for (int mt = 0; mt < MT; mt++) {
+        for (int v = 0; v < VPC; v++) w[v] = __ldg(wp + (size_t)(c * VPC + v) * 32);
 #pragma unroll
-            for (int v = 0; v < VPC; v++) w[mt][v] = __ldg(wp[mt] + (size_t)(c * VPC + v) * 32);
-#pragma unroll
-            for (int q = 0; q < G; q++)
-#pragma unroll
-                for (int r = 0; r < 2; r++) {
-                    if (Q) s[mt][q][r] = __ldg(sp[mt] + (c * G + q) * 16 + g + 8 * r);
-                }
+        for (int r = 0; r < 2; r++) {
+            if (Q) s[r] = __ldg(sp + c * 16 + g + 8 * r);
         }
     };
-    float acc[MT][NTT][4];
+    float acc[NTT][4];
 #pragma unroll
-    for (int mt = 0; mt < MT; mt++)
+    for (int j = 0; j < NTT; j++)
 #pragma unroll
-        for (int j = 0; j < NTT; j++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) acc[mt][j][i] = 0.f;
+        for (int i = 0; i < 4; i++) acc[j][i] = 0.f;
 
     load(0, wc, sc);
     stage(0, 0);
@@ -205,43 +172,30 @@ __device__ __forceinline__ void gemm(const uint4* __restrict__ W, const float* _
         }
         if (active) {
             const __half* xb = xs[buf];
+            float tmp[NTT][4];
+            if (Q) {
 #pragma unroll
-            for (int q = 0; q < G; q++) {
-                float tmp[Q ? MT : 1][Q ? NTT : 1][4];
-                if (Q) {
+                for (int j = 0; j < NTT; j++)
 #pragma unroll
-                    for (int mt = 0; mt < MT; mt++)
+                    for (int i = 0; i < 4; i++) tmp[j][i] = 0.f;
+            }
 #pragma unroll
-                        for (int j = 0; j < NTT; j++)
+            for (int ks = 0; ks < 8; ks++) {  // k16 steps of the chunk
+                uint32_t a[4];
+                a_frag<WB>(wc, ks, a);
 #pragma unroll
-                            for (int i = 0; i < 4; i++) tmp[Q ? mt : 0][Q ? j : 0][i] = 0.f;
+                for (int jp = 0; jp < NTT / 2; jp++) {  // two n8 token tiles per ldmatrix.x4
+                    uint32_t bf[4];
+                    ldsm_x4(bf, xb + (jp * 16 + (lane & 7) + ((lane >> 4) << 3)) * PAD + ks * 16 + ((lane >> 3) & 1) * 8);
+                    mma16816(Q ? tmp[2 * jp] : acc[2 * jp], a, bf[0], bf[1]);
+                    mma16816(Q ? tmp[2 * jp + 1] : acc[2 * jp + 1], a, bf[2], bf[3]);
                 }
+            }
+            if (Q) {
 #pragma unroll
-                for (int ks = 0; ks < 8; ks++) {  // k16 steps of the group
-                    uint32_t a[MT][4];
-#pragma unroll
-                    for (int mt = 0; mt < MT; mt++) a_frag<WB>(wc[mt] + q * (128 / CPL), ks, a[mt]);
-                    int kk = q * 128 + ks * 16;
-#pragma unroll
-                    for (int jp = 0; jp < NTT / 2; jp++) {  // two n8 token tiles per ldmatrix.x4
-                        uint32_t bf[4];
-                        ldsm_x4(bf, xb + (jp * 16 + (lane & 7) + ((lane >> 4) << 3)) * PAD + kk + ((lane >> 3) & 1) * 8);
-#pragma unroll
-                        for (int mt = 0; mt < MT; mt++) {
-                            mma16816(Q ? tmp[Q ? mt : 0][Q ? 2 * jp : 0] : acc[mt][2 * jp], a[mt], bf[0], bf[1]);
-                            mma16816(Q ? tmp[Q ? mt : 0][Q ? 2 * jp + 1 : 0] : acc[mt][2 * jp + 1], a[mt], bf[2], bf[3]);
-                        }
-                    }
-                }
-                if (Q) {
-#pragma unroll
-                    for (int mt = 0; mt < MT; mt++)
-#pragma unroll
-                        for (int j = 0; j < NTT; j++) {
-                            float* t = tmp[Q ? mt : 0][Q ? j : 0];
-                            acc[mt][j][0] += sc[mt][q][0] * t[0]; acc[mt][j][1] += sc[mt][q][0] * t[1];
-                            acc[mt][j][2] += sc[mt][q][1] * t[2]; acc[mt][j][3] += sc[mt][q][1] * t[3];
-                        }
+                for (int j = 0; j < NTT; j++) {
+                    acc[j][0] += sc[0] * tmp[j][0]; acc[j][1] += sc[0] * tmp[j][1];
+                    acc[j][2] += sc[1] * tmp[j][2]; acc[j][3] += sc[1] * tmp[j][3];
                 }
             }
         }
@@ -249,20 +203,12 @@ __device__ __forceinline__ void gemm(const uint4* __restrict__ W, const float* _
         __syncthreads();
         if (c + 1 < nch) {
 #pragma unroll
-            for (int mt = 0; mt < MT; mt++) {
-#pragma unroll
-                for (int v = 0; v < VPC; v++) wc[mt][v] = wn[mt][v];
-#pragma unroll
-                for (int q = 0; q < G; q++) {
-                    sc[mt][q][0] = sn[mt][q][0]; sc[mt][q][1] = sn[mt][q][1];
-                }
-            }
+            for (int v = 0; v < VPC; v++) wc[v] = wn[v];
+            sc[0] = sn[0]; sc[1] = sn[1];
         }
     }
-#pragma unroll
-    for (int mt = 0; mt < MT; mt++)
-        if (live[mt])
-            epilogue<NTT, EPI>(acc[mt], tile0 + mt, tok0, n, Y + (EPI == EPI_PLAIN ? (size_t)blockIdx.y * n * ldy : 0), ldy, keys);
+    if (active)
+        epilogue<NTT, EPI>(acc, tile, tok0, n, Y + (EPI == EPI_PLAIN ? (size_t)blockIdx.y * n * ldy : 0), ldy, keys);
 }
 
 // Decode-sized steps (8 * NTT tokens at most): the block stages its K range of X (KD / NTT columns at a time; one
@@ -270,35 +216,16 @@ __device__ __forceinline__ void gemm(const uint4* __restrict__ W, const float* _
 // (128 columns of f16, 256 of int8), two stages in flight, each weight fragment used for NTT n8 token tiles.
 #define KD 1024
 #define DEC_LOADS 8  // loads of 16 bytes per lane and decode stage
-// Before X is staged (the first weights already in flight): nothing, or wait until the producer of X in the same
-// kernel is done with the block's K range (X then read through L2).
-struct NoWait {
-    __device__ void operator()() const {}
-    static constexpr bool coherent = false;
-};
-struct ChunkWait {
-    const unsigned* ready;
-    unsigned need;
-    __device__ void operator()() const {
-        if (threadIdx.x == 0) {
-            unsigned v;
-            do {
-                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(ready) : "memory");
-            } while (v < need);
-        }
-        __syncthreads();
-    }
-    static constexpr bool coherent = true;
-};
 
-// Block (bx, by): tiles bx * WARPS .., K range by * kper ..; xs: TOK * (KD / NTT + 8) halves of shared memory
-template <int WB, int NTT, int EPI, class Wait = NoWait, class XT = float>
+// Block (x, y): tiles x * WARPS .., K range y * kper ..; xs: TOK * (KD / NTT + 8) halves of shared memory
+template <int WB, int NTT, int EPI>
 __device__ __forceinline__ void gemm_dec(const uint4* __restrict__ W, const float* __restrict__ S,
-                                         const XT* __restrict__ X, const int* __restrict__ xrows, int K,
+                                         const XIN* __restrict__ X, const int* __restrict__ xrows, int K,
                                          int ntiles, int n, int kper, float* __restrict__ Y, int ldy,
-                                         unsigned long long* keys, int bx, int by, __half* xs, Wait wait = {}) {
+                                         unsigned long long* keys, __half* xs) {
     constexpr int CPL = cols_per_load<WB>(), TOK = 8 * NTT, PAD = KD / NTT + 8, VS = DEC_LOADS, SC = VS * CPL, G = SC / 128;
     constexpr bool Q = WB == 8;  // Q: f32 scales applied per group after the products
+    int bx = blockIdx.x, by = blockIdx.y;
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     int tile = bx * WARPS + warp;
     unsigned long long pol = evict_first_policy();
@@ -355,25 +282,13 @@ __device__ __forceinline__ void gemm_dec(const uint4* __restrict__ W, const floa
             }
         };
         load(0, wa, sa);  // the first weights do not depend on X: in flight while X is staged
-        if (k0 == kb) wait();
         if (k0 > kb) __syncthreads();
-        if constexpr (sizeof(XT) == 2) {  // f16 X: copied as it is (cp.async.cg reads through L2: coherent)
-            for (int i = threadIdx.x; i < TOK * kr / 8; i += WARPS * 32) {
-                int r = i / (kr / 8), col = (i % (kr / 8)) * 8;
-                cp_async16(&xs[r * PAD + col], X + (size_t)(r < n ? (xrows ? xrows[r] : r) : 0) * K + k0 + col, r < n);
-            }
-            cp_async_wait_all();
-        } else {
-            for (int i = threadIdx.x; i < TOK * kr / 4; i += WARPS * 32) {
-                int r = i / (kr / 4), col = (i % (kr / 4)) * 4;
-                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (r < n) {
-                    const float4* xp = (const float4*)((const float*)X + (size_t)(xrows ? xrows[r] : r) * K + k0 + col);
-                    v = Wait::coherent ? __ldcg(xp) : __ldg(xp);
-                }
-                *(uint2*)&xs[r * PAD + col] = make_uint2(pack_half2(v.x, v.y), pack_half2(v.z, v.w));
-            }
+        // X is copied as it is (cp.async.cg reads through L2: coherent)
+        for (int i = threadIdx.x; i < TOK * kr / 8; i += WARPS * 32) {
+            int r = i / (kr / 8), col = (i % (kr / 8)) * 8;
+            cp_async16(&xs[r * PAD + col], X + (size_t)(r < n ? (xrows ? xrows[r] : r) : 0) * K + k0 + col, r < n);
         }
+        cp_async_wait_all();
         __syncthreads();
         if (!live) continue;
         for (int st = 0; st < ns; st += 2) {
@@ -394,22 +309,18 @@ __device__ __forceinline__ void gemm_dec(const uint4* __restrict__ W, const floa
              float* Y, int ldy, unsigned long long* keys) {                                                       \
         if (DEC) {                                                                                                \
             __shared__ __align__(16) __half xs[8 * NTT * (KD / NTT + 8)];                                         \
-            gemm_dec<WB, NTT, EPI>(W, S, X, xrows, K, ntiles, n, kper, Y, ldy, keys, blockIdx.x, blockIdx.y, xs); \
+            gemm_dec<WB, NTT, EPI>(W, S, X, xrows, K, ntiles, n, kper, Y, ldy, keys, xs);                       \
         }                                                                                                         \
         else                                                                                                      \
-            gemm<WB, NTT, 128, EPI, XIN>(W, S, X, xrows, K, ntiles, n, kper, Y, ldy, keys);                      \
+            gemm<WB, NTT, EPI>(W, S, X, xrows, K, ntiles, n, kper, Y, ldy, keys);                                \
     }
+#define GEMM_TILE(WT, TT, WB, NTT, DEC)                                     \
+    GEMM_KERNEL(gemm_##WT##_##TT##_plain, WB, NTT, DEC, EPI_PLAIN)          \
+    GEMM_KERNEL(gemm_##WT##_##TT##_silu, WB, NTT, DEC, EPI_SILU)            \
+    GEMM_KERNEL(gemm_##WT##_##TT##_argmax, WB, NTT, DEC, EPI_ARGMAX)
 // decode steps of up to 8, 16, 32 tokens (gemm_dec); prompt chunks: 64 tokens per block. WB: weight bits.
 #define GEMM_SET(WT, WB)                                                    \
-    GEMM_KERNEL(gemm_##WT##_t8_plain, WB, 1, 1, EPI_PLAIN)                  \
-    GEMM_KERNEL(gemm_##WT##_t8_silu, WB, 1, 1, EPI_SILU)                    \
-    GEMM_KERNEL(gemm_##WT##_t8_argmax, WB, 1, 1, EPI_ARGMAX)                \
-    GEMM_KERNEL(gemm_##WT##_t16_plain, WB, 2, 1, EPI_PLAIN)                 \
-    GEMM_KERNEL(gemm_##WT##_t16_silu, WB, 2, 1, EPI_SILU)                   \
-    GEMM_KERNEL(gemm_##WT##_t16_argmax, WB, 2, 1, EPI_ARGMAX)               \
-    GEMM_KERNEL(gemm_##WT##_t32_plain, WB, 4, 1, EPI_PLAIN)                 \
-    GEMM_KERNEL(gemm_##WT##_t32_silu, WB, 4, 1, EPI_SILU)                   \
-    GEMM_KERNEL(gemm_##WT##_t32_argmax, WB, 4, 1, EPI_ARGMAX)               \
-    GEMM_KERNEL(gemm_##WT##_t64_plain, WB, PNTT, 0, EPI_PLAIN)              \
-    GEMM_KERNEL(gemm_##WT##_t64_silu, WB, PNTT, 0, EPI_SILU)                \
-    GEMM_KERNEL(gemm_##WT##_t64_argmax, WB, PNTT, 0, EPI_ARGMAX)
+    GEMM_TILE(WT, t8, WB, 1, 1)                                             \
+    GEMM_TILE(WT, t16, WB, 2, 1)                                            \
+    GEMM_TILE(WT, t32, WB, 4, 1)                                            \
+    GEMM_TILE(WT, t64, WB, PNTT, 0)

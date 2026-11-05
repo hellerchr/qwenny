@@ -78,7 +78,7 @@ impl Quant {
     }
 
     /// Matrices with the same columns and quantization, stacked by rows
-        pub fn stack(parts: Vec<Quant>) -> Result<Quant> {
+    pub fn stack(parts: Vec<Quant>) -> Result<Quant> {
         let mut it = parts.into_iter();
         let mut out = it.next().context("nothing to stack")?;
         for p in it {
@@ -93,7 +93,6 @@ impl Quant {
 }
 
 /// A weight matrix as stored
-#[cfg_attr(not(has_mlx), allow(dead_code))]
 pub enum Matrix {
     /// bf16 bits [rows][cols]
     Dense { w: Vec<u16>, rows: usize, cols: usize },
@@ -152,6 +151,16 @@ fn packed_scheme(qc: &Json) -> Result<Scheme> {
     ensure!(schemes.iter().all(|s| s.1 == group) && (schemes.len() == 1 || group > 0),
             "compressed-tensors config groups of different group sizes: {schemes:?}");
     Ok(Scheme::Packed { bits, group })
+}
+
+/// Bytes per value of a tensor stored as floats, and the value at the front of a slice as f32
+fn float_format(dtype: Dtype) -> Option<(usize, fn(&[u8]) -> f32)> {
+    match dtype {
+        Dtype::BF16 => Some((2, |c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))),
+        Dtype::F16 => Some((2, |c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())),
+        Dtype::F32 => Some((4, |c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
+        _ => None,
+    }
 }
 
 impl Checkpoint {
@@ -244,36 +253,22 @@ impl Checkpoint {
     /// A tensor stored as floats (bf16, f16 or f32), as f32, and its shape
     pub fn floats(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
         let (dtype, shape, data) = self.raw(name).with_context(|| format!("tensor {name}"))?;
-        let v = match dtype {
-            Dtype::BF16 => data.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
-            Dtype::F16 => data.chunks_exact(2).map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect(),
-            Dtype::F32 => data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
-            other => bail!("{name} is {other:?}, expected floats"),
-        };
-        Ok((v, shape.to_vec()))
+        let (width, value) = float_format(dtype).with_context(|| format!("{name} is {dtype:?}, expected floats"))?;
+        Ok((data.chunks_exact(width).map(value).collect(), shape.to_vec()))
     }
 
     /// Rows `ids` of the matrix `{base}.weight` as f32 [ids][cols], read from the file without the rest (an embedding
     /// lookup): stored as floats or compressed-tensors packed (symmetric)
     pub fn rows(&self, base: &str, ids: &[u32]) -> Result<Vec<f32>> {
-        let float = |dtype: Dtype, d: &[u8], i: usize| -> Result<f32> {
-            Ok(match dtype {
-                Dtype::BF16 => f32::from_bits((u16::from_le_bytes([d[2 * i], d[2 * i + 1]]) as u32) << 16),
-                Dtype::F16 => half::f16::from_bits(u16::from_le_bytes([d[2 * i], d[2 * i + 1]])).to_f32(),
-                Dtype::F32 => f32::from_le_bytes(d[4 * i..4 * i + 4].try_into().unwrap()),
-                other => bail!("{base}: {other:?} values"),
-            })
-        };
+        let format = |dtype: Dtype| float_format(dtype).with_context(|| format!("{base}: {dtype:?} values"));
         if !self.packed(base) {
             ensure!(!self.is_quant(base), "{base}: row reads of MLX-quantized matrices are not supported");
             let (dtype, shape, data) = self.raw(&format!("{base}.weight")).with_context(|| format!("tensor {base}.weight"))?;
-            let cols = shape[1];
+            let (cols, (width, value)) = (shape[1], format(dtype)?);
             let mut out = Vec::with_capacity(ids.len() * cols);
             for &r in ids {
                 ensure!((r as usize) < shape[0], "{base}: row {r} of {}", shape[0]);
-                for c in 0..cols {
-                    out.push(float(dtype, data, r as usize * cols + c)?);
-                }
+                out.extend(data[r as usize * cols * width..][..cols * width].chunks_exact(width).map(value));
             }
             return Ok(out);
         }
@@ -283,11 +278,9 @@ impl Checkpoint {
         let (_, qshape, q) = self.raw(&format!("{base}.weight_packed")).context("weight_packed")?;
         let (sdtype, _, sc) = self.raw(&format!("{base}.weight_scale")).context("weight_scale")?;
         let (rows, words) = (qshape[0], qshape[1]);
-        let cols = match self.raw(&format!("{base}.weight_shape")) {
-            Some((Dtype::I64, _, d)) => i64::from_le_bytes(d[8..16].try_into().unwrap()) as usize,
-            _ => bail!("{base}: no weight_shape"),
-        };
+        let cols = self.packed_cols(base, rows)?.with_context(|| format!("{base}: no weight_shape"))?;
         let bits = words * 32 / cols;
+        let (swidth, scale) = format(sdtype)?;
         let (per, mask, group) = (32 / bits, (1u32 << bits) - 1, if group == 0 { cols } else { group });
         let zero = (1u32 << (bits - 1)) as f32;
         let mut out = Vec::with_capacity(ids.len() * cols);
@@ -297,7 +290,7 @@ impl Checkpoint {
             for c in 0..cols {
                 let w = u32::from_le_bytes(q[4 * (r * words + c / per)..][..4].try_into().unwrap());
                 let v = (w >> ((c % per) * bits) & mask) as f32;
-                out.push((v - zero) * float(sdtype, sc, r * (cols / group) + c / group)?);
+                out.push((v - zero) * scale(&sc[(r * (cols / group) + c / group) * swidth..]));
             }
         }
         Ok(out)
@@ -318,7 +311,6 @@ impl Checkpoint {
     }
 
     /// The matrix `{base}.weight` as stored
-    #[cfg_attr(not(has_mlx), allow(dead_code))]
     pub fn matrix(&self, base: &str) -> Result<Matrix> {
         if self.is_quant(base) {
             return Ok(Matrix::Quant(self.quant_matrix(base)?));
@@ -332,7 +324,7 @@ impl Checkpoint {
     pub fn quant_matrix(&self, base: &str) -> Result<Quant> {
         match self.quant.with_context(|| format!("{base} is stored quantized but config.json has no quantization"))? {
             Scheme::Mlx { bits, group } => self.mlx_matrix(base, bits, group),
-            Scheme::Packed { bits, group } => self.packed_matrix(base, bits, group, !self.has_zero_point(base)),
+            Scheme::Packed { bits, group } => self.packed_matrix(base, bits, group),
         }
     }
 
@@ -352,19 +344,20 @@ impl Checkpoint {
         Ok(Quant { bits, group, rows, cols, q, scales, offsets })
     }
 
-    /// compressed-tensors: w = (q - zero) * scale, zero 2^(bits-1) when symmetric (q stored unsigned), else the
-    /// stored zero point
-    fn packed_matrix(&self, base: &str, bits: usize, group: usize, symmetric: bool) -> Result<Quant> {
+    /// The columns `{base}.weight_shape` gives a packed matrix of `rows` rows, if it is stored
+    fn packed_cols(&self, base: &str, rows: usize) -> Result<Option<usize>> {
+        let Some((Dtype::I64, _, d)) = self.raw(&format!("{base}.weight_shape")) else { return Ok(None) };
+        let s: Vec<i64> = d.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+        ensure!(s.len() == 2 && s[0] as usize == rows, "{base}.weight_shape {s:?} for {rows} packed rows");
+        Ok(Some(s[1] as usize))
+    }
+
+    /// compressed-tensors: w = (q - zero) * scale, zero 2^(bits-1) when symmetric (no zero point stored; q stored
+    /// unsigned), else the stored zero point
+    fn packed_matrix(&self, base: &str, bits: usize, group: usize) -> Result<Quant> {
         let (q, shape) = self.words(&format!("{base}.weight_packed"))?;
         let rows = shape[0];
-        let cols = match self.raw(&format!("{base}.weight_shape")) {
-            Some((Dtype::I64, _, d)) => {
-                let s: Vec<i64> = d.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
-                ensure!(s.len() == 2 && s[0] as usize == rows, "{base}.weight_shape {s:?} for {rows} packed rows");
-                s[1] as usize
-            }
-            _ => shape[1] * 32 / bits,
-        };
+        let cols = self.packed_cols(base, rows)?.unwrap_or(shape[1] * 32 / bits);
         // the matrix's own bits (config groups may differ in them)
         let bits = if (shape[1] * 32).is_multiple_of(cols) { shape[1] * 32 / cols } else { bits };
         ensure!([4, 8].contains(&bits), "{base}: {} words per row for {cols} columns", shape[1]);
@@ -374,7 +367,7 @@ impl Checkpoint {
         let groups = cols / group;
         let (scales, s_shape) = self.floats(&format!("{base}.weight_scale"))?;
         ensure!(s_shape.iter().product::<usize>() == rows * groups, "{base}: weight_scale {s_shape:?} for {rows} rows of {groups} groups");
-        let zeros: Vec<f32> = if symmetric {
+        let zeros: Vec<f32> = if !self.has_zero_point(base) {
             vec![(1 << (bits - 1)) as f32; rows * groups]
         } else {
             // packed along the rows (compressed-tensors' packed_dim 0), or along the groups of a row

@@ -25,9 +25,21 @@ extern "C" __global__ void mark_seen(unsigned* seen, const int* mark, const int*
     }
 }
 
-__device__ __forceinline__ unsigned ordered(float v) {
-    unsigned u = __float_as_uint(v);
-    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+// Bitonic sort of cand[0 .. np), np a power of two, 1024 threads: ascending or descending
+template <bool ASC>
+__device__ __forceinline__ void bitonic(unsigned long long* cand, int np, int tid) {
+    for (int size = 2; size <= np; size <<= 1)
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = tid; i < np; i += 1024) {
+                int o = i ^ stride;
+                if (o > i) {
+                    bool up = (i & size) == 0;
+                    unsigned long long a = cand[i], c = cand[o];
+                    if ((ASC ? a > c : a < c) == up) { cand[i] = c; cand[o] = a; }
+                }
+            }
+            __syncthreads();
+        }
 }
 
 // Inclusive prefix sum over the block (1024 threads, one value each)
@@ -120,18 +132,7 @@ __device__ __forceinline__ int top_cands(Val val, int W, int k, unsigned* hist, 
     while (np < cnt) np <<= 1;
     for (int i = cnt + tid; i < np; i += 1024) cand[i] = 0;
     __syncthreads();
-    for (int size = 2; size <= np; size <<= 1)  // bitonic sort, descending
-        for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            for (int i = tid; i < np; i += 1024) {
-                int p = i ^ stride;
-                if (p > i) {
-                    bool desc = (i & size) == 0;
-                    unsigned long long a = cand[i], c = cand[p];
-                    if ((a < c) == desc) { cand[i] = c; cand[p] = a; }
-                }
-            }
-            __syncthreads();
-        }
+    bitonic<false>(cand, np, tid);
     return cnt;
 }
 
@@ -344,18 +345,7 @@ extern "C" __global__ void __launch_bounds__(1024)
     for (int i = keep + tid; i < np; i += 1024) cand[i] = ~0ull;
     if (tid < keep) cand[tid] = ((unsigned long long)(unsigned)x << 32) | __float_as_uint(prob);
     __syncthreads();
-    for (int size = 2; size <= np; size <<= 1)
-        for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            for (int i = tid; i < np; i += 1024) {
-                int o = i ^ stride;
-                if (o > i) {
-                    bool asc = (i & size) == 0;
-                    unsigned long long a = cand[i], c = cand[o];
-                    if ((a > c) == asc) { cand[i] = c; cand[o] = a; }
-                }
-            }
-            __syncthreads();
-        }
+    bitonic<true>(cand, np, tid);
     if (tid < keep) {
         qid[(size_t)q * QCAP + tid] = (int)(cand[tid] >> 32);
         qp[(size_t)q * QCAP + tid] = __uint_as_float((unsigned)cand[tid]);
