@@ -15,9 +15,8 @@
 //! Both responses of a pair go into the same micro-batch when they fit; a pair split over two micro-batches gets the
 //! later half's log-probability from a forward pass first.
 use crate::chat::Chat;
-use crate::cuda::learn::mem_gib;
 use crate::cuda::qwen::train::Trainer;
-use crate::training::{self, Example, Micro, Opts, TrainOpts, MAX_GRAD_NORM, PATIENCE, SEED, WEIGHT_DECAY};
+use crate::training::{self, Dev, Example, Micro, Opts, Run, Step, TrainOpts};
 use anyhow::{Context, Result, bail, ensure};
 use safetensors::SafeTensors;
 use serde_json::{Value as Json, json};
@@ -47,7 +46,7 @@ pub fn is_preference(data: &Path) -> Result<bool> {
 }
 
 /// The pairs of preference rows, at most `max_len` tokens per response (with its prompt); `name` names the file.
-pub fn encode_pairs(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str) -> Result<Vec<Pair>> {
+fn encode_pairs(chat: &Chat, rows: &[(usize, String)], max_len: usize, name: &str) -> Result<Vec<Pair>> {
     let defaults = json!({"enable_thinking": false}).as_object().unwrap().clone();
     let (mut out, mut cut, mut lost, mut same) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (line, text) in rows {
@@ -177,6 +176,19 @@ pub struct Terms {
     pub rejected: f64,
 }
 
+impl Terms {
+    /// As a dev measurement
+    fn dev(&self) -> Dev {
+        Dev {
+            loss: self.loss,
+            log: json!({"dev_loss": self.loss, "dev_dpo": self.dpo, "dev_nll": self.nll, "dev_margin": self.margin,
+                        "dev_accuracy": self.accuracy}),
+            text: format!("loss {:.4} (DPO {:.4}, NLL {:.4}), margin {:+.4}, positive margin {:.1}%", self.loss, self.dpo,
+                          self.nll, self.margin, self.accuracy * 100.0),
+        }
+    }
+}
+
 pub fn terms(po: &PrefOpts, pairs: &[&Pair], lp: &[(f64, f64)], rf: &[(f64, f64)]) -> Terms {
     let mut t = Terms::default();
     for ((p, &l), &r) in pairs.iter().zip(lp).zip(rf) {
@@ -239,141 +251,39 @@ pub fn step_passes(tr: &Trainer, po: &PrefOpts, pairs: &[&Pair], rf: &[(f64, f64
     lp.chunks(2).map(|c| Ok((c[0].context("no log-probability")?, c[1].context("no log-probability")?))).collect()
 }
 
-/// Preference training (see the module's description); the loop, schedule, dev measurements and the kept adapter as
-/// `training::train`.
+/// Preference training (see the module's description), on `training::Run`
 pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOpts, po: PrefOpts) -> Result<()> {
-    let t0 = Instant::now();
-    let (train_path, dev_path) = training::data_paths(data)?;
-    let (out, adapter) = training::out_dirs(data, out)?;
-    let (o, init) = training::with_init(o, to.init.as_deref())?;
-    let chat = Chat::load(model)?;
-    let tname = train_path.display().to_string();
-    let mut rows = training::read_rows(&train_path)?;
-    let (dev_rows, dev_name, held_out) = match &dev_path {
-        Some(d) => (training::read_rows(d)?, d.display().to_string(), false),
-        None => (training::hold_out(&mut rows), tname.clone(), true),
-    };
-    let train_p = encode_pairs(&chat, &rows, to.max_len, &tname)?;
-    let dev_p = if dev_rows.is_empty() { Vec::new() } else { encode_pairs(&chat, &dev_rows, to.max_len, &dev_name)? };
-    fs::create_dir_all(&out).with_context(|| format!("{}", out.display()))?;
-    if held_out && !dev_rows.is_empty() {
-        fs::write(out.join("dev.jsonl"), dev_rows.iter().map(|(_, l)| format!("{l}\n")).collect::<String>())?;
-    }
-    let all_seqs = || train_p.iter().chain(&dev_p).flat_map(|p| [&p.chosen, &p.rejected]);
-    let lmax = all_seqs().map(|e| e.ids.len()).max().context("no pairs")?;
-    let tokens: usize = train_p.iter().map(|p| p.chosen.ids.len() + p.rejected.ids.len()).sum();
-    println!("preference training (RPO: DPO beta {} + {} x NLL of the chosen response): {} pairs, {tokens} tokens, {} dev \
-              pairs; longest response with its prompt {lmax} tokens", po.beta, po.nll, train_p.len(), dev_p.len());
-    if held_out && !dev_p.is_empty() {
-        println!("dev: {} pairs held out of {tname} (the same ones every run), written to {}", dev_p.len(),
-                 out.join("dev.jsonl").display());
-    } else if dev_p.is_empty() {
-        println!("warning: fewer than 100 pairs and no dev.jsonl: no dev set, so no early stopping and no best adapter; \
-                  training all {} epochs", to.epochs);
-    }
-    let mut tr = training::new_trainer(model, o, lmax)?;
-    if let Some(a) = &init {
-        println!("starting from {} ({} LoRA tensors)", to.init.as_ref().unwrap().display(), training::apply_init(&mut tr, &a.tensors)?);
-    }
-    let (free, all) = mem_gib();
-    println!("loaded in {:.1}s, {} LoRA parameters, micro-batches of {} tokens, {free:.1} GiB free of {all:.1}",
-             t0.elapsed().as_secs_f64(), tr.l.n_params, tr.tmax);
+    let run = Run::load(model, data, out, o, &to, "pairs", encode_pairs)?;
+    let (train, dev) = (&run.train, &run.dev);
+    let lmax = train.iter().chain(dev).flat_map(|p| [&p.chosen, &p.rejected]).map(|e| e.ids.len()).max().context("no pairs")?;
+    let tokens = |pairs: &[&Pair]| -> usize { pairs.iter().map(|p| p.chosen.ids.len() + p.rejected.ids.len()).sum() };
+    let train_refs: Vec<&Pair> = train.iter().collect();
+    let dev_refs: Vec<&Pair> = dev.iter().collect();
+    println!("preference training (RPO: DPO beta {} + {} x NLL of the chosen response): {} pairs, {} tokens, {} dev \
+              pairs; longest response with its prompt {lmax} tokens", po.beta, po.nll, train.len(), tokens(&train_refs),
+             dev.len());
+    let mut tr = run.trainer(lmax)?;
 
     // the reference policy: the starting point, its log-probabilities once
     let tr0 = Instant::now();
-    let train_refs: Vec<&Pair> = train_p.iter().collect();
-    let dev_refs: Vec<&Pair> = dev_p.iter().collect();
     let rf_train = logps(&tr, &train_refs)?;
     let rf_dev = logps(&tr, &dev_refs)?;
-    println!("reference log-probabilities of {} responses in {:.1}s ({})", 2 * (train_p.len() + dev_p.len()),
-             tr0.elapsed().as_secs_f64(), if init.is_some() { "the --init-adapter, frozen" } else { "the base model" });
-
-    let steps_per_epoch = train_p.len().div_ceil(to.batch);
-    let total = steps_per_epoch * to.epochs;
-    let eval_every = if dev_p.is_empty() { 0 } else { steps_per_epoch.div_ceil(2) };
-    let mut log = String::new();
-    let log_dev = |log: &mut String, step: usize, t: &Terms| {
-        log.push_str(&format!("{}\n", json!({"step": step, "dev_loss": t.loss, "dev_dpo": t.dpo, "dev_nll": t.nll,
-                                             "dev_margin": t.margin, "dev_accuracy": t.accuracy})));
-    };
-    if eval_every > 0 {
-        println!("up to {} epochs ({total} steps); dev loss every {eval_every} steps, the adapter of the lowest kept, \
-                  stopping after {PATIENCE} without a new low", to.epochs);
-        // at the start the policy is the reference: margin 0
-        let t = terms(&po, &dev_refs, &rf_dev, &rf_dev);
-        log_dev(&mut log, 0, &t);
-        println!("  dev at the start: loss {:.4} (DPO {:.4}, NLL {:.4})", t.loss, t.dpo, t.nll);
-    }
-    let mut rng = SEED;
-    let t1 = Instant::now();
-    let (mut step, mut trained, mut eval_s) = (0, 0, 0.0);
-    let (mut best, mut since): (Option<(Terms, usize)>, usize) = (None, 0);
-    'train: for epoch in 0..to.epochs {
-        for chunk in training::shuffled(train_p.len(), &mut rng).chunks(to.batch) {
-            let ts = Instant::now();
-            let lr = to.lr_at(step, total);
-            let pairs: Vec<&Pair> = chunk.iter().map(|&i| &train_p[i]).collect();
-            let rf: Vec<(f64, f64)> = chunk.iter().map(|&i| rf_train[i]).collect();
-            tr.l.zero_grads()?;
-            let lp = step_passes(&tr, &po, &pairs, &rf, step as u64)?;
-            let t = terms(&po, &pairs, &lp, &rf);
-            let norm = tr.l.optimizer_step(lr, MAX_GRAD_NORM, WEIGHT_DECAY)?;
-            let toks: usize = pairs.iter().map(|p| p.chosen.ids.len() + p.rejected.ids.len()).sum();
-            let dt = ts.elapsed().as_secs_f64();
-            log.push_str(&format!("{}\n", json!({"step": step + 1, "epoch": epoch, "loss": t.loss, "dpo": t.dpo, "nll": t.nll,
-                "margin": t.margin, "accuracy": t.accuracy, "reward_chosen": t.chosen, "reward_rejected": t.rejected,
-                "grad_norm": norm, "lr": lr, "tokens": toks, "seconds": dt})));
-            if total <= 100 || step % 10 == 0 || step + 1 == total {
-                println!("step {:4}/{total}  loss {:.4}  dpo {:.4}  nll {:.4}  margin {:+.4}  acc {:.2}  grad norm {:.3}  lr {:.2e}  \
-                          {:.0} tok/s", step + 1, t.loss, t.dpo, t.nll, t.margin, t.accuracy, norm, lr, toks as f64 / dt);
-            }
-            step += 1;
-            trained += toks;
-            if eval_every > 0 && (step % eval_every == 0 || step == total) {
-                let te = Instant::now();
-                let t = terms(&po, &dev_refs, &logps(&tr, &dev_refs)?, &rf_dev);
-                let new_low = best.is_none_or(|b| t.loss < b.0.loss);
-                if new_low {
-                    training::save_adapter(&tr, &adapter, model)?;
-                    best = Some((t, step));
-                    since = 0;
-                } else {
-                    since += 1;
-                }
-                eval_s += te.elapsed().as_secs_f64();
-                log_dev(&mut log, step, &t);
-                println!("  dev loss {:.4} (DPO {:.4}, NLL {:.4}), margin {:+.4}, positive margin {:.1}%{}", t.loss, t.dpo, t.nll,
-                         t.margin, t.accuracy * 100.0,
-                         if new_low { "  (best, saved)".to_string() } else { format!("  ({since} without a new low)") });
-                if since >= PATIENCE && step < total {
-                    println!("stopping at step {step}/{total}: no new low in {since} measurements");
-                    break 'train;
-                }
-            }
-        }
-    }
-    let train_s = t1.elapsed().as_secs_f64();
-    println!("TRAINED in {train_s:.1}s ({:.0} tok/s), {:.1} GiB free at the end", trained as f64 / (train_s - eval_s), mem_gib().0);
-    let mut summary = json!({"train_seconds": train_s, "steps": step, "max_steps": total, "tokens": trained,
-                             "beta": po.beta, "nll_weight": po.nll});
-    if let Some((t, s)) = best {
-        println!("EVAL best adapter (step {s}): dev loss {:.4} (DPO {:.4}, NLL {:.4}), margin {:+.4}, positive margin {:.1}%",
-                 t.loss, t.dpo, t.nll, t.margin, t.accuracy * 100.0);
-        summary["best_step"] = json!(s);
-        summary["dev_loss"] = json!(t.loss);
-        summary["dev_dpo"] = json!(t.dpo);
-        summary["dev_nll"] = json!(t.nll);
-        summary["dev_margin"] = json!(t.margin);
-        summary["dev_accuracy"] = json!(t.accuracy);
-    } else {
-        training::save_adapter(&tr, &adapter, model)?;
-    }
-    fs::write(out.join("train_log.jsonl"), log)?;
-    fs::write(out.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
-    let name = crate::hub::name(model);
-    println!("adapter in {}, {:.1}s in all\nserve it: qwenny serve {}--adapter={}", adapter.display(), t0.elapsed().as_secs_f64(),
-             if name == crate::hub::DEFAULT_MODEL { String::new() } else { format!("--model={name} ") }, adapter.display());
-    Ok(())
+    println!("reference log-probabilities of {} responses in {:.1}s ({})", 2 * (train.len() + dev.len()),
+             tr0.elapsed().as_secs_f64(), if run.init.is_some() { "the --init-adapter, frozen" } else { "the base model" });
+    // at the start the policy is the reference: margin 0
+    let start = (!dev.is_empty()).then(|| terms(&po, &dev_refs, &rf_dev, &rf_dev).dev());
+    run.fit(&mut tr, &to, json!({"beta": po.beta, "nll_weight": po.nll}), start, |tr, chunk, step| {
+        let pairs: Vec<&Pair> = chunk.iter().map(|&i| &train[i]).collect();
+        let rf: Vec<(f64, f64)> = chunk.iter().map(|&i| rf_train[i]).collect();
+        let lp = step_passes(tr, &po, &pairs, &rf, step as u64)?;
+        let t = terms(&po, &pairs, &lp, &rf);
+        Ok(Step {
+            tokens: tokens(&pairs),
+            log: json!({"loss": t.loss, "dpo": t.dpo, "nll": t.nll, "margin": t.margin, "accuracy": t.accuracy,
+                        "reward_chosen": t.chosen, "reward_rejected": t.rejected}),
+            text: format!("loss {:.4}  dpo {:.4}  nll {:.4}  margin {:+.4}  acc {:.2}", t.loss, t.dpo, t.nll, t.margin, t.accuracy),
+        })
+    }, |tr| Ok(terms(&po, &dev_refs, &logps(tr, &dev_refs)?, &rf_dev).dev()))
 }
 
 /// `qwenny dpocheck`: against tools/make_dpo_reference.py: the pairs' token ids and masks (the rows are in the
