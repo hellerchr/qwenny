@@ -6,15 +6,16 @@ Usage: python make_reference_mtp.py <model dir or HF id> <fjordhaus dev.jsonl> <
 Per prompt i (a ticket with its reply, teacher-forced): ids_i, target_i (the target's argmax at every position),
 mtp_i (the MTP's argmax at positions 0 .. T-2), pos_i and logits_i (MTP logits at some positions), chain_i (the second
 draft: the MTP again on its own output state at q and its first draft, at position q + 1, for q in pos_i)."""
-import copy, json, sys
+import copy, json
 import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3_5 import modeling_qwen3_5 as qm
 from huggingface_hub import snapshot_download
 from pathlib import Path
+from refutil import chunked, cli
 
-model_dir, tests, out = sys.argv[1:4]
+model_dir, tests, out = cli(__doc__)[0]
 tok = AutoTokenizer.from_pretrained(model_dir)
 model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, device_map="auto",
                                              max_memory={0: "9GiB", "cpu": "24GiB"})
@@ -54,7 +55,7 @@ def mtp(x_ids, h, p0):
     y = layer(x, position_embeddings=(cos, sin), attention_mask=mask)
     y = y[0] if isinstance(y, tuple) else y
     hs = fnorm(y[0])
-    return hs, torch.cat([head(hs[c:c + 256].to(head.weight.device)).float().cpu() for c in range(0, n, 256)])
+    return hs, chunked(lambda x: head(x.to(head.weight.device)), hs)
 
 rows = [json.loads(l) for l in open(tests)]
 tensors = {}
@@ -63,7 +64,7 @@ for i, r in enumerate(rows[:2]):
                                   return_dict=True)["input_ids"]
     with torch.no_grad():
         h = lm(input_ids=ids.to(model.device)).last_hidden_state[0].float().cpu()  # after the final norm
-        target = torch.cat([head(h[c:c + 256].to(head.weight.device)).float().cpu() for c in range(0, len(h), 256)]).argmax(-1)
+        target = chunked(lambda x: head(x.to(head.weight.device)), h).argmax(-1)
         T = ids.shape[1]
         hs, logits = mtp(ids[0, 1:], h[:-1], 0)
         draft = logits.argmax(-1)

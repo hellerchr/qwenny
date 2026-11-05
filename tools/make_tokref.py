@@ -1,14 +1,16 @@
 """Prompts of varied conversations rendered and tokenized by Transformers, for `qwenny chatcheck`.
-Usage: ~/.cache/qwenny/venv/bin/python -I tools/make_tokref.py [model dir or HF id] [out.json]
+Usage: ~/.cache/qwenny/venv/bin/python tools/make_tokref.py [model dir or HF id] [out.json]
 (defaults: Qwen/Qwen3.5-4B, tools/tokref-qwen.json)
 Per case: name, messages (OpenAI format, tool call arguments as objects: Transformers' template needs them so), tools,
 kwargs (chat_template_kwargs), text (apply_chat_template, tokenize=False, add_generation_prompt=True) and ids
 (apply_chat_template, tokenize=True)."""
-import json, os, sys
+import json, os
 from transformers import AutoTokenizer
+from refutil import cli
 
-model = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3.5-4B"
-out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokref-qwen.json")
+args, _ = cli(__doc__)
+model = args[0] if args else "Qwen/Qwen3.5-4B"
+out = args[1] if len(args) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokref-qwen.json")
 tok = AutoTokenizer.from_pretrained(model)
 
 U = lambda c: {"role": "user", "content": c}
