@@ -113,17 +113,15 @@ fn seqs<'a>(pairs: &[&'a Pair]) -> Vec<&'a Example> {
 
 /// The summed loss (NLL) of each document of a micro-batch from its rows' losses
 fn doc_sums(mb: &Micro, rows: &[f32]) -> Vec<f64> {
-    mb.docs.iter().map(|&(s0, len)| {
-        mb.rows.iter().zip(rows).filter(|(r, _)| (s0..s0 + len).contains(&(**r as usize))).map(|(_, &l)| l as f64).sum()
-    }).collect()
+    mb.doc_rows.iter().map(|r| training::nll_sum(&rows[r.clone()])).collect()
 }
 
 /// The summed log-probability of each pair's responses (chosen, rejected) under the trainer's adapter: forward passes
 pub fn logps(tr: &Trainer, pairs: &[&Pair]) -> Result<Vec<(f64, f64)>> {
     let mut lp = Vec::new();
-    for mb in training::pack(seqs(pairs).into_iter(), tr.tmax()) {
-        tr.pass(&mb, false, 0.0, 0, 0)?;
-        lp.extend(doc_sums(&mb, &tr.row_losses(mb.rows.len())?).into_iter().map(|s| -s));
+    for mb in training::pack(seqs(pairs).into_iter(), tr.tmax) {
+        let (rows, _) = tr.pass(&mb, false, 0.0, 0, 0)?;
+        lp.extend(doc_sums(&mb, &rows).into_iter().map(|s| -s));
     }
     Ok(lp.chunks(2).map(|c| (c[0], c[1])).collect())
 }
@@ -202,7 +200,7 @@ pub fn terms(po: &PrefOpts, pairs: &[&Pair], lp: &[(f64, f64)], rf: &[(f64, f64)
 /// loss over the pairs to the arena. Returns the policy's log-probabilities (chosen, rejected) of each pair.
 pub fn step_passes(tr: &Trainer, po: &PrefOpts, pairs: &[&Pair], rf: &[(f64, f64)], step: u64) -> Result<Vec<(f64, f64)>> {
     let seqs = seqs(pairs);
-    let (micros, place) = pack_pairs(&seqs, tr.tmax());
+    let (micros, place) = pack_pairs(&seqs, tr.tmax);
     // a pair over two micro-batches: the rejected response's log-probability before the chosen one's backward pass
     let mut lp: Vec<Option<f64>> = vec![None; seqs.len()];
     let mut early: Vec<Option<f64>> = vec![None; seqs.len()];
@@ -210,8 +208,8 @@ pub fn step_passes(tr: &Trainer, po: &PrefOpts, pairs: &[&Pair], rf: &[(f64, f64
     let mut pre: Vec<usize> = split.iter().map(|&i| place[2 * i + 1].0).collect();
     pre.dedup();
     for &m in &pre {
-        tr.pass(&micros[m], false, 0.0, 0, 0)?;
-        let sums = doc_sums(&micros[m], &tr.row_losses(micros[m].rows.len())?);
+        let (rows, _) = tr.pass(&micros[m], false, 0.0, 0, 0)?;
+        let sums = doc_sums(&micros[m], &rows);
         for &i in &split {
             if place[2 * i + 1].0 == m {
                 early[2 * i + 1] = Some(-sums[place[2 * i + 1].1]);
@@ -234,10 +232,7 @@ pub fn step_passes(tr: &Trainer, po: &PrefOpts, pairs: &[&Pair], rf: &[(f64, f64
                 doc_w[place[s].1] = token_weight(po, m_, pairs[i].chosen.loss_tokens(), s % 2 == 0, b) as f32;
             }
             // each loss row's weight: its document's
-            Ok(mb.rows.iter().map(|&r| {
-                let d = mb.docs.iter().position(|&(s0, len)| (s0..s0 + len).contains(&(r as usize))).unwrap();
-                doc_w[d]
-            }).collect())
+            Ok(mb.doc_rows.iter().zip(&doc_w).flat_map(|(r, &w)| std::iter::repeat_n(w, r.len())).collect())
         };
         tr.pass_weighted(mb, step, m, &mut weigh)?;
     }
@@ -282,7 +277,7 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     }
     let (free, all) = mem_gib();
     println!("loaded in {:.1}s, {} LoRA parameters, micro-batches of {} tokens, {free:.1} GiB free of {all:.1}",
-             t0.elapsed().as_secs_f64(), tr.tensors().iter().map(|t| t.1 * t.2).sum::<usize>(), tr.tmax());
+             t0.elapsed().as_secs_f64(), tr.l.n_params, tr.tmax);
 
     // the reference policy: the starting point, its log-probabilities once
     let tr0 = Instant::now();
@@ -319,10 +314,10 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
             let lr = to.lr_at(step, total);
             let pairs: Vec<&Pair> = chunk.iter().map(|&i| &train_p[i]).collect();
             let rf: Vec<(f64, f64)> = chunk.iter().map(|&i| rf_train[i]).collect();
-            tr.zero_grads()?;
+            tr.l.zero_grads()?;
             let lp = step_passes(&tr, &po, &pairs, &rf, step as u64)?;
             let t = terms(&po, &pairs, &lp, &rf);
-            let norm = tr.optimizer_step(lr, MAX_GRAD_NORM, WEIGHT_DECAY)?;
+            let norm = tr.l.optimizer_step(lr, MAX_GRAD_NORM, WEIGHT_DECAY)?;
             let toks: usize = pairs.iter().map(|p| p.chosen.ids.len() + p.rejected.ids.len()).sum();
             let dt = ts.elapsed().as_secs_f64();
             log.push_str(&format!("{}\n", json!({"step": step + 1, "epoch": epoch, "loss": t.loss, "dpo": t.dpo, "nll": t.nll,
@@ -429,7 +424,7 @@ pub fn dpocheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Result
     println!("reference log-probabilities: worst relative error {:.2e}", worst(&rf, &want_rf));
 
     training::apply_init(&mut tr, &named("init.")?)?;
-    tr.zero_grads()?;
+    tr.l.zero_grads()?;
     let lp = step_passes(&tr, &po, &refs, &rf, 0)?;
     let t = terms(&po, &refs, &lp, &rf);
     let g = |k: &str| -> Result<f64> { Ok(training::ref_f32(&r, k)?[0] as f64) };

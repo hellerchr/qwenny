@@ -36,12 +36,15 @@ pub struct Micro {
     /// positions whose next token is in the loss, and that token
     pub rows: Vec<i32>,
     pub targets: Vec<i32>,
+    /// the range of `rows` that is each document's
+    pub doc_rows: Vec<std::ops::Range<usize>>,
 }
 
 impl Micro {
     pub fn push(&mut self, ids: &[u32], mask: &[u8]) {
         let s = self.ids.len();
         let l = ids.len();
+        let first_row = self.rows.len();
         for (i, &id) in ids.iter().enumerate() {
             self.ids.push(id as i32);
             self.pos.push(i as i32);
@@ -54,6 +57,7 @@ impl Micro {
             }
         }
         self.docs.push((s, l));
+        self.doc_rows.push(first_row..self.rows.len());
     }
 
     pub fn tokens(&self) -> usize {
@@ -194,8 +198,8 @@ pub fn f32_bytes(v: &[f32]) -> &[u8] {
 /// adapter_model.safetensors (f32) and adapter_config.json in PEFT's format
 pub fn save_adapter(tr: &Trainer, out: &Path, base: &Path) -> Result<()> {
     fs::create_dir_all(out)?;
-    let params = tr.read_params(false)?;
-    let tensors = tr.tensors();
+    let params = tr.l.read_params(false)?;
+    let tensors = tr.l.tensor_shapes();
     let mut views = Vec::new();
     for (n, r, c) in &tensors {
         views.push((n.clone(), safetensors::tensor::TensorView::new(Dtype::F32, vec![*r, *c], f32_bytes(&params[n]))?));
@@ -205,7 +209,7 @@ pub fn save_adapter(tr: &Trainer, out: &Path, base: &Path) -> Result<()> {
     let mut targets: Vec<&str> = tensors.iter().filter_map(|(n, ..)| n.strip_suffix(".lora_A.weight")?.rsplit('.').next()).collect();
     targets.sort();
     targets.dedup();
-    let o = tr.opts();
+    let o = &tr.l.o;
     let cfg = json!({
         "peft_type": "LORA", "task_type": "CAUSAL_LM", "base_model_name_or_path": crate::hub::name(base),
         "r": o.rank, "lora_alpha": o.alpha, "lora_dropout": o.dropout, "target_modules": targets,
@@ -260,22 +264,24 @@ impl TrainOpts {
     }
 }
 
+/// The sum of per-row losses
+pub fn nll_sum(rows: &[f32]) -> f64 {
+    rows.iter().map(|&l| l as f64).sum()
+}
+
 /// Mean loss and token accuracy over `examples`, HF Trainer's eval_loss (mean of per-batch token means over batches
 /// of 8 in order, weighted by batch size), and the mean of per-example token means (HF's eval_loss with an eval batch
 /// of 1, as ft-kit / Unsloth report it).
-fn evaluate(t: &mut Trainer, examples: &[Example]) -> Result<(f64, f64, f64, f64)> {
+fn evaluate(t: &Trainer, examples: &[Example]) -> Result<(f64, f64, f64, f64)> {
     let (mut sum, mut n, mut correct, mut hf, mut hf_n, mut per_ex) = (0.0, 0, 0, 0.0, 0, 0.0);
     for batch in examples.chunks(8) {
         let (mut bs, mut bn) = (0.0, 0);
-        for mb in pack(batch.iter(), t.tmax()) {
-            let (s, c) = t.pass(&mb, false, 0.0, 0, 0)?;
-            let rows = t.row_losses(mb.rows.len())?;
-            for &(s0, len) in &mb.docs {
-                let doc: Vec<f32> = mb.rows.iter().zip(&rows).filter(|(r, _)| (s0..s0 + len).contains(&(**r as usize)))
-                    .map(|(_, &l)| l).collect();
-                per_ex += doc.iter().map(|&l| l as f64).sum::<f64>() / doc.len().max(1) as f64;
+        for mb in pack(batch.iter(), t.tmax) {
+            let (rows, c) = t.pass(&mb, false, 0.0, 0, 0)?;
+            for r in &mb.doc_rows {
+                per_ex += nll_sum(&rows[r.clone()]) / r.len().max(1) as f64;
             }
-            bs += s;
+            bs += nll_sum(&rows);
             bn += mb.rows.len();
             correct += c;
         }
@@ -356,18 +362,18 @@ pub fn read_init_adapter(dir: &Path) -> Result<InitAdapter> {
 /// Writes `init` (by the trainer's names) over the trainer's LoRA: every tensor of it must be one the trainer has,
 /// with its shape; the trainer's others stay fresh (B = 0, no change to the model). Returns how many were written.
 pub fn apply_init(tr: &mut Trainer, init: &HashMap<String, Vec<f32>>) -> Result<usize> {
-    let shapes: HashMap<String, usize> = tr.tensors().into_iter().map(|(n, r, c)| (n, r * c)).collect();
+    let shapes: HashMap<String, usize> = tr.l.tensor_shapes().into_iter().map(|(n, r, c)| (n, r * c)).collect();
     let foreign: Vec<&String> = init.keys().filter(|n| !shapes.contains_key(*n)).collect();
     ensure!(foreign.is_empty(), "the adapter has {} tensors this model's LoRA does not (e.g. {}): an adapter of another \
              model or of other layers", foreign.len(), foreign[0]);
     for (n, v) in init {
         ensure!(v.len() == shapes[n], "{n}: {} values, this LoRA has {} (another rank?)", v.len(), shapes[n]);
     }
-    let mut params = tr.read_params(false)?;
+    let mut params = tr.l.read_params(false)?;
     for (n, v) in init {
         params.insert(n.clone(), v.clone());
     }
-    tr.write_params(&params)?;
+    tr.l.write_params(&params)?;
     Ok(init.len())
 }
 
@@ -448,7 +454,7 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
     }
     let (free, all) = mem_gib();
     println!("loaded in {:.1}s, {} LoRA parameters, {free:.1} GiB free of {all:.1}", t0.elapsed().as_secs_f64(),
-             tr.tensors().iter().map(|t| t.1 * t.2).sum::<usize>());
+             tr.l.n_params);
 
     let steps_per_epoch = train_ex.len().div_ceil(to.batch);
     let total = steps_per_epoch * to.epochs;
@@ -468,13 +474,13 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
             let ts = Instant::now();
             let lr = to.lr_at(step, total);
             let n_loss: usize = chunk.iter().map(|&i| train_ex[i].loss_tokens()).sum();
-            tr.zero_grads()?;
+            tr.l.zero_grads()?;
             let (mut loss, mut toks) = (0.0, 0);
-            for (mi, mb) in pack(chunk.iter().map(|&i| &train_ex[i]), tr.tmax()).iter().enumerate() {
-                loss += tr.pass(mb, true, 1.0 / n_loss as f32, step as u64, mi)?.0;
+            for (mi, mb) in pack(chunk.iter().map(|&i| &train_ex[i]), tr.tmax).iter().enumerate() {
+                loss += nll_sum(&tr.pass(mb, true, 1.0 / n_loss as f32, step as u64, mi)?.0);
                 toks += mb.tokens();
             }
-            let norm = tr.optimizer_step(lr, MAX_GRAD_NORM, WEIGHT_DECAY)?;
+            let norm = tr.l.optimizer_step(lr, MAX_GRAD_NORM, WEIGHT_DECAY)?;
             let dt = ts.elapsed().as_secs_f64();
             let line = json!({"step": step + 1, "epoch": epoch, "loss": loss / n_loss as f64, "grad_norm": norm, "lr": lr,
                               "tokens": toks, "seconds": dt});
@@ -487,7 +493,7 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
             trained += toks;
             if eval_every > 0 && (step % eval_every == 0 || step == total) {
                 let te = Instant::now();
-                let (l, acc, hf, ex) = evaluate(&mut tr, &dev_ex)?;
+                let (l, acc, hf, ex) = evaluate(&tr, &dev_ex)?;
                 let new_low = best.is_none_or(|b| l < b.0);
                 if new_low {
                     save_adapter(&tr, &adapter, model)?;
@@ -581,30 +587,24 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
     o.layers = ref_i32(&r, "layers").map_or(0, |l| l[0] as usize);
     let mode = if o.f32 { "f32" } else if o.f16 { "f16" } else { "bf16" };
     let mut tr = Trainer::new(model, o, tmax, lmax, 0)?;
-    tr.write_params(&ref_params(&r, "init.")?)?;
-    tr.zero_grads()?;
+    tr.l.write_params(&ref_params(&r, "init.")?)?;
+    tr.l.zero_grads()?;
     let micros = if packed { pack(docs.iter().map(|d| &d.0), tmax) } else { docs.iter().map(|d| pack(std::iter::once(&d.0), tmax).pop().unwrap()).collect() };
     let (mut loss, mut worst_nll) = (0.0, 0f32);
     let mut nll_err = 0f64;
     let mut di = 0;
     for (mi, mb) in micros.iter().enumerate() {
-        loss += tr.pass(mb, true, 1.0 / total as f32, 0, mi)?.0;
-        let ours = tr.row_losses(mb.rows.len())?;
-        let mut k = 0;
-        for &(s0, len) in &mb.docs {
+        let (rows, _) = tr.pass(mb, true, 1.0 / total as f32, 0, mi)?;
+        loss += nll_sum(&rows);
+        for (&(s0, _), doc) in mb.docs.iter().zip(&mb.doc_rows) {
             let reff = &docs[di].1;
-            for (j, &row) in mb.rows.iter().enumerate() {
-                let row = row as usize;
-                if row >= s0 && row < s0 + len {
-                    let d = (ours[j] - reff[row - s0]).abs();
-                    worst_nll = worst_nll.max(d);
-                    nll_err += d as f64;
-                    k += 1;
-                }
+            for j in doc.clone() {
+                let d = (rows[j] - reff[mb.rows[j] as usize - s0]).abs();
+                worst_nll = worst_nll.max(d);
+                nll_err += d as f64;
             }
             di += 1;
         }
-        let _ = k;
     }
     let ref_loss = ref_f32(&r, "loss")?[0] as f64;
     println!("{} documents ({}), {total} loss tokens, {} build", docs.len(), if packed { "packed in one pass" } else { "one pass each" },
@@ -618,7 +618,7 @@ pub fn traincheck(model: &Path, reference: &Path, o: Opts, packed: bool) -> Resu
 /// The LoRA gradients against the reference's "grad." tensors, then one AdamW step (lr 2e-4, clip 1.0) against its
 /// "step1." tensors from its "init." ones (traincheck, dpocheck)
 pub(crate) fn grads_and_step(tr: &mut Trainer, r: &SafeTensors) -> Result<()> {
-    let ours = tr.read_params(true)?;
+    let ours = tr.l.read_params(true)?;
     let reff = ref_params(r, "grad.")?;
     let (mut worst, mut worst_name, mut min_cos) = (0f64, String::new(), 1f64);
     let mut by_kind: HashMap<String, (f64, usize)> = HashMap::new();
@@ -640,9 +640,9 @@ pub(crate) fn grads_and_step(tr: &mut Trainer, r: &SafeTensors) -> Result<()> {
     for (k, (e, n)) in kinds {
         println!("  {k:<18} worst relative error {e:.2e} ({n} tensors)");
     }
-    let norm = tr.optimizer_step(2e-4, 1.0, 0.0)?;
+    let norm = tr.l.optimizer_step(2e-4, 1.0, 0.0)?;
     let ref_norm = ref_f32(r, "grad_norm")?[0];
-    let after = tr.read_params(false)?;
+    let after = tr.l.read_params(false)?;
     let ref_after = ref_params(r, "step1.")?;
     let init = ref_params(r, "init.")?;
     let mut worst_step = 0f64;

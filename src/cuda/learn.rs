@@ -1,6 +1,7 @@
 //! The trainer's (qwen/train.rs) general parts: device buffers, kernel launches, the cuBLAS products, the LoRA arena
 //! (f32 values, gradients, Adam moments and the act copy the products read) with its module groups, LoRA dropout,
 //! clipping and AdamW. Its kernels are in kernels/train_common.cuh, which kernels/qwen_train.cu includes.
+use crate::cuda::core::cfg;
 use crate::training::{Opts, f32_bytes, splitmix};
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, result as blas, sys as bsys};
@@ -172,8 +173,7 @@ impl Learn {
     }
 
     pub fn launch(&self, name: &str, grid: usize, block: usize, args: &[Arg]) -> Result<()> {
-        let cfg = LaunchConfig { grid_dim: (grid as u32, 1, 1), block_dim: (block as u32, 1, 1), shared_mem_bytes: 0 };
-        self.launch_cfg(name, cfg, args)
+        self.launch_cfg(name, cfg((grid, 1, 1), block), args)
     }
 
     pub fn elementwise(&self, name: &str, n: usize, args: &[Arg]) -> Result<()> {
@@ -198,16 +198,8 @@ impl Learn {
     /// Row-major C[m][n] = alpha * op(A) op(B) + beta * C, with op(A) [m][k] (A stored [k][m] if ta) and op(B)
     /// [k][n] (B stored [n][k] if tb); ld* are row strides in elements; A and B act, C f32 if c32 else act.
     #[allow(clippy::too_many_arguments)]
-    pub fn mm(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, b: u64,
-              ldb: usize, beta: f32, c: u64, ldc: usize, c32: bool) -> Result<()> {
-        self.mmb(ta, tb, m, n, k, alpha, a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1, c32)
-    }
-
-    /// `mm` for `count` matrices `s*` elements apart.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mmb(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, sa: usize,
-               b: u64, ldb: usize, sb: usize, beta: f32, c: u64, ldc: usize, sc: usize, count: usize, c32: bool)
-    -> Result<()> {
+    pub fn mm(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, alpha: f32, a: u64, lda: usize, b: u64, ldb: usize,
+              beta: f32, c: u64, ldc: usize, c32: bool) -> Result<()> {
         use bsys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
         let op = |t: bool| if t { CUBLAS_OP_T } else { CUBLAS_OP_N };
         let at = self.act_type();
@@ -222,12 +214,12 @@ impl Learn {
         } else {
             (&alpha as *const f32 as *const c_void, &beta as *const f32 as *const c_void)
         };
-        // column-major: C^T = op(B)^T op(A)^T
+        // column-major: C^T = op(B)^T op(A)^T; a batch of one (strides 0)
         unsafe {
             blas::gemm_strided_batched_ex(
                 *self.blas.handle(), op(tb), op(ta), n as i32, m as i32, k as i32,
-                pa, b as *const c_void, at, ldb as i32, sb as i64, a as *const c_void, at, lda as i32, sa as i64, pb,
-                c as *mut c_void, ct, ldc as i32, sc as i64, count as i32, compute, bsys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                pa, b as *const c_void, at, ldb as i32, 0, a as *const c_void, at, lda as i32, 0, pb,
+                c as *mut c_void, ct, ldc as i32, 0, 1, compute, bsys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )?;
         }
         Ok(())
@@ -283,8 +275,7 @@ impl Learn {
     #[allow(clippy::too_many_arguments)]
     pub fn lora_fwd(&self, g: &Group, x: u64, t: usize, y: u64, ldy: usize, u: u64, train: bool, seed: u64) -> Result<()> {
         let (r, es, ldu) = (self.o.rank, self.es as u64, self.ldu);
-        let xd = self.lora_input(x, t * g.inp, train, seed)?;
-        self.mm(false, true, t, g.mods.len() * r, g.inp, 1.0, xd, g.inp, self.pa(g.a), g.inp, 0.0, u, ldu, false)?;
+        self.lora_u(g, x, t, u, train, seed)?;
         for (i, m) in g.mods.iter().enumerate() {
             self.mm(false, true, t, m.out, r, self.lscale, u + (i * r) as u64 * es, ldu, self.pa(m.b), r, 1.0,
                     y + m.col as u64 * es, ldy, false)?;
