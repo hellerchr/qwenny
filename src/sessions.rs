@@ -75,6 +75,18 @@ pub fn save_image(m: &mut Box<dyn Engine>, slot: u32, len: usize, base: Option<I
     Ok(Image { len, chunks, state: m.save_state(slot).context("saving the recurrent state")? })
 }
 
+/// Settle a dirty slot holding `tokens`: its last token again, so the slot's state ends exactly at the sequence's end
+pub fn settle(m: &mut Box<dyn Engine>, slot: u32, tokens: &[u32], adapter: bool, dirty: &mut bool) -> Result<()> {
+    if *dirty && let Some(&id) = tokens.last() {
+        if m.has_adapter() {
+            m.set_adapter(slot, adapter)?;
+        }
+        m.run(&[Tok { id, slot, pos: tokens.len() as u32 - 1 }], &[]).context("settling the last token")?;
+        *dirty = false;
+    }
+    Ok(())
+}
+
 /// Put an Image into slot `slot` (what it held is gone): its next step continues at `img.len`; false when the device
 /// memory ran out (the slot then holds nothing)
 pub fn load_image(m: &mut Box<dyn Engine>, slot: u32, img: &Image) -> Result<bool> {
@@ -264,58 +276,37 @@ impl Store {
         self.make_room(0, None);
     }
 
-    /// Room in host memory for `extra` more bytes (an image of a request that gives way); whether there is
-    pub fn room_for(&mut self, extra: usize) -> bool {
-        self.make_room(extra, None)
+    /// The least recently used entry that `pred` accepts
+    fn lru(&self, pred: impl Fn(&Entry) -> bool) -> Option<usize> {
+        self.entries.iter().enumerate().filter(|(_, e)| pred(e)).min_by_key(|(_, e)| e.used).map(|(i, _)| i)
     }
 
-    /// Trim until `extra` more bytes fit, sparing the entry `spare`; whether they fit
-    fn make_room(&mut self, extra: usize, spare: Option<u64>) -> bool {
+    /// Trim until `extra` more bytes fit (an image of a request that gives way), sparing the entry `spare`; whether they fit
+    pub fn make_room(&mut self, extra: usize, spare: Option<u64>) -> bool {
         while self.over_by(extra) {
             if let Some(i) = (0..self.running.len()).max_by_key(|&i| self.running[i].1.bytes()) {
                 self.running.swap_remove(i);
                 continue;
             }
-            let others = self.entries.iter_mut().filter(|e| Some(e.id) != spare);
-            if let Some(e) = others.filter(|e| matches!(e.at, Place::Slot(_, Some(_)))).min_by_key(|e| e.used) {
-                if let Place::Slot(_, shadow) = &mut e.at {
+            let spared = |e: &Entry| Some(e.id) == spare;
+            if let Some(i) = self.lru(|e| !spared(e) && matches!(e.at, Place::Slot(_, Some(_)))) {
+                if let Place::Slot(_, shadow) = &mut self.entries[i].at {
                     *shadow = None;
                 }
                 continue;
             }
-            let others = self.entries.iter_mut().filter(|e| Some(e.id) != spare);
-            if let Some(e) = others.filter(|e| !e.held.snaps.is_empty()).min_by_key(|e| e.used) {
+            if let Some(i) = self.lru(|e| !spared(e) && !e.held.snaps.is_empty()) {
                 // the first state (where the first message ends, shared by other conversations) goes last
-                let k = if e.held.snaps.len() > 1 { 1 } else { 0 };
-                e.held.snaps.remove(k);
+                let snaps = &mut self.entries[i].held.snaps;
+                snaps.remove(if snaps.len() > 1 { 1 } else { 0 });
                 continue;
             }
-            let host = self.entries.iter().enumerate()
-                .filter(|(_, e)| Some(e.id) != spare && !e.parked && matches!(e.at, Place::Host(_)))
-                .min_by_key(|(_, e)| e.used);
-            match host {
-                Some((i, _)) => {
-                    eprintln!("cache: host memory full: a session of {} tokens dropped (read again when continued)",
-                              self.entries[i].held.tokens.len());
-                    drop(self.entries.swap_remove(i))
-                }
-                None => return false,
-            }
+            let Some(i) = self.lru(|e| !spared(e) && !e.parked && matches!(e.at, Place::Host(_))) else { return false };
+            eprintln!("cache: host memory full: a session of {} tokens dropped (read again when continued)",
+                      self.entries[i].held.tokens.len());
+            self.entries.swap_remove(i);
         }
         true
-    }
-
-    /// Settle a dirty slot: its last token again, so the slot's state ends exactly at its sequence's end
-    fn settle(m: &mut Box<dyn Engine>, slot: u32, held: &mut Held) -> Result<()> {
-        if held.dirty && !held.tokens.is_empty() {
-            if m.has_adapter() {
-                m.set_adapter(slot, held.adapter)?;
-            }
-            let pos = held.tokens.len() - 1;
-            m.run(&[Tok { id: held.tokens[pos], slot, pos: pos as u32 }], &[]).context("settling the last token")?;
-            held.dirty = false;
-        }
-        Ok(())
     }
 
     /// Whether `prompt` (for the adapter or the base model) continues a cached sequence (takes it over; a copy needs
@@ -327,9 +318,7 @@ impl Store {
     /// Move the least recently used sequence in a slot (other than `keep`) to the host; its slot, if any. `must`: when
     /// host memory has no room for it, the sequence goes (read again when continued); else it stays (None)
     pub fn park_one(&mut self, m: &mut Box<dyn Engine>, keep: Option<u32>, must: bool) -> Result<Option<u32>> {
-        let Some(i) = self.entries.iter().enumerate()
-            .filter(|(_, e)| matches!(e.at, Place::Slot(s, _) if Some(s) != keep))
-            .min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { return Ok(None) };
+        let Some(i) = self.lru(|e| matches!(e.at, Place::Slot(s, _) if Some(s) != keep)) else { return Ok(None) };
         let t = Instant::now();
         let (id, n) = (self.entries[i].id, self.entries[i].held.tokens.len());
         let Place::Slot(_, shadow) = &self.entries[i].at else { unreachable!() };
@@ -348,7 +337,7 @@ impl Store {
             eprintln!("cache: no host memory for slot {slot} ({n} tokens): its sequence is read again when continued");
         }
         let img = match m.can_save() && fits {
-            true => Self::settle(m, slot, &mut e.held).and_then(|_| save_image(m, slot, n, shadow))
+            true => settle(m, slot, &e.held.tokens, e.held.adapter, &mut e.held.dirty).and_then(|_| save_image(m, slot, n, shadow))
                 .map_err(|err| eprintln!("cache: slot {slot} not saved ({err:#}): its sequence is read again when continued"))
                 .ok(),
             false => None,
@@ -390,8 +379,9 @@ impl Store {
         // the outgoing sequence: settled, its state, the whole chunks its shadow holds already
         let Place::Slot(bslot, bshadow) = &mut self.entries[bi].at else { unreachable!() };
         let (bslot, bshadow) = (*bslot, bshadow.take());
-        Self::settle(m, bslot, &mut self.entries[bi].held)?;
-        let nb = self.entries[bi].held.tokens.len();
+        let held = &mut self.entries[bi].held;
+        settle(m, bslot, &held.tokens, held.adapter, &mut held.dirty)?;
+        let nb = held.tokens.len();
         let bstate = m.save_state(bslot)?;
         let mut bchunks = bshadow.map_or_else(Vec::new, |b| b.below(nb).chunks);
         let base = bchunks.last().map_or(0, |c| c.1);
@@ -486,9 +476,7 @@ impl Store {
 
     /// The sequence in a slot (other than `s`, not entry `id`) that swap_in moves out: the least recently used
     fn outgoing(&self, s: u32, id: u64) -> Option<usize> {
-        self.entries.iter().enumerate()
-            .filter(|(_, e)| e.id != id && matches!(e.at, Place::Slot(x, _) if x != s))
-            .min_by_key(|(_, e)| e.used).map(|(i, _)| i)
+        self.lru(|e| e.id != id && matches!(e.at, Place::Slot(x, _) if x != s))
     }
 
     /// Entry `id` (on the host) into a slot: a free one or one an idle sequence leaves; loaded at once when the
@@ -564,16 +552,16 @@ impl Store {
         Ok(Some(s))
     }
 
-    /// A slot for a request: a free one, else the slot of the least recently used sequence (moved to the host)
-    pub fn slot(&mut self, m: &mut Box<dyn Engine>, free: &mut Vec<u32>) -> Result<Option<u32>> {
-        if let Some(s) = free.pop() {
-            return Ok(Some(s));
-        }
-        self.park_one(m, None, true)
-    }
-
     fn find(&self, id: u64) -> Option<usize> {
         self.entries.iter().position(|e| e.id == id)
+    }
+
+    /// The cached sequence that serves `prompt` best (the most tokens shared, one in a slot first; computed with the same
+    /// model): the position it starts at, and whether it copies the prefix (reuse)
+    fn best(&self, prompt: &[u32], adapter: bool) -> Option<(&Entry, usize, bool)> {
+        self.entries.iter().filter(|e| !e.parked && e.held.adapter == adapter)
+            .filter_map(|e| reuse(&e.held, prompt).map(|(at, copy)| (e, at, copy)))
+            .max_by_key(|&(e, at, _)| (at, matches!(e.at, Place::Slot(..))))
     }
 
     /// The request for `prompt`: the sequence it continues (in its slot, or loaded from the host; one computed with
@@ -581,12 +569,10 @@ impl Store {
     /// sequence (the request waits). `running`: the sessions of the running requests (and of those that gave way)
     pub fn take(&mut self, m: &mut Box<dyn Engine>, prompt: &[u32], adapter: bool, free: &mut Vec<u32>, running: usize)
                 -> Result<Option<Resume>> {
-        let best = self.entries.iter().filter(|e| !e.parked && e.held.adapter == adapter)
-            .filter_map(|e| reuse(&e.held, prompt).map(|(at, copy)| (e.id, at, copy, matches!(e.at, Place::Slot(..)))))
-            .max_by_key(|&(_, at, _, in_slot)| (at, in_slot));
-        let Some((id, at, copy, in_slot)) = best else {
+        let Some((e, at, copy)) = self.best(prompt, adapter) else {
             return self.fresh(m, free, running, None);
         };
+        let (id, in_slot) = (e.id, matches!(e.at, Place::Slot(..)));
         if copy {
             return self.share(m, free, running, id, at);
         }
@@ -619,7 +605,7 @@ impl Store {
         // the states the new request keeps: those on the prefix it shares, and where its turn begins
         let mut snaps: Vec<(usize, Vec<u8>)> = e.held.snaps.drain(..).filter(|p| p.0 <= at).collect();
         if at == n && at >= SNAP_FROM {
-            Self::settle(m, slot, &mut e.held)?;
+            settle(m, slot, &e.held.tokens, e.held.adapter, &mut e.held.dirty)?;
             snaps.push((at, m.save_state(slot)?));
         }
         keep_snaps(&mut snaps);
@@ -635,14 +621,18 @@ impl Store {
     fn fresh(&mut self, m: &mut Box<dyn Engine>, free: &mut Vec<u32>, running: usize, spare: Option<u64>)
              -> Result<Option<Resume>> {
         while self.entries.len() + running >= self.max {
-            let Some(i) = self.entries.iter().enumerate().filter(|(_, e)| !e.parked && Some(e.id) != spare)
-                .min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { return Ok(None) };
+            let Some(i) = self.lru(|e| !e.parked && Some(e.id) != spare) else { return Ok(None) };
             if let Place::Slot(s, _) = self.entries.swap_remove(i).at {
                 m.release(s)?;
                 free.push(s);
             }
         }
-        Ok(self.slot(m, free)?.map(|s| {
+        // a free slot, else that of the least recently used sequence (moved to the host)
+        let slot = match free.pop() {
+            Some(s) => Some(s),
+            None => self.park_one(m, None, true)?,
+        };
+        Ok(slot.map(|s| {
             self.reclaim(s);
             (s, 0, Vec::new())
         }))
@@ -694,9 +684,10 @@ impl Store {
 
     /// The slot holding the sequence `prompt` (for the adapter or the base model) would continue, if one does
     pub fn slot_for(&self, prompt: &[u32], adapter: bool) -> Option<u32> {
-        self.entries.iter().filter(|e| !e.parked && e.held.adapter == adapter).filter_map(|e| resume_at(&e.held, prompt).map(|at| (at, &e.at)))
-            .max_by_key(|&(at, p)| (at, matches!(p, Place::Slot(..))))
-            .and_then(|(_, p)| match p { Place::Slot(s, _) => Some(*s), Place::Host(_) => None })
+        match self.best(prompt, adapter)?.0.at {
+            Place::Slot(s, _) => Some(s),
+            Place::Host(_) => None,
+        }
     }
 }
 
