@@ -1,4 +1,4 @@
-// Helpers shared by every kernel file: warp and block reductions, bf16 and f16 conversions.
+// Helpers shared by every kernel file: warp and block reductions, f16 conversions, shared-memory copies.
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -31,12 +31,6 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const __half* p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 
-__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const __half* p) {
-    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-}
-
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
@@ -55,22 +49,9 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
     return t;
 }
 
-__device__ __forceinline__ void bf16x4(uint2 u, float* f) {
-    f[0] = __uint_as_float(u.x << 16); f[1] = __uint_as_float(u.x & 0xffff0000u);
-    f[2] = __uint_as_float(u.y << 16); f[3] = __uint_as_float(u.y & 0xffff0000u);
-}
-
 __device__ __forceinline__ uint32_t pack_half2(float a, float b) {
     __half2 h = __floats2half2_rn(a, b);
     return *(uint32_t*)&h;
-}
-
-template <int N>
-__device__ __forceinline__ void warp_sum_n(float (&v)[N]) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-#pragma unroll
-        for (int i = 0; i < N; i++) v[i] += __shfl_xor_sync(0xffffffff, v[i], o);
 }
 
 __device__ __forceinline__ float warp_max(float v) {
