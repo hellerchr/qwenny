@@ -1,6 +1,6 @@
 #pragma once
 // The general parts of the LoRA training kernels (included by qwen_train.cu; the host side is src/cuda/learn.rs):
-// the activation type of the build, embedding, RMSNorm, SwiGLU, cross-entropy and row copies,
+// the activation type of the build, RMSNorm, SwiGLU, cross-entropy and row copies,
 // LoRA dropout, gradient clipping and AdamW over the LoRA arena. Built with `act` bf16, f32 with -DACT_F32 (checks) or
 // f16 with -DACT_F16. The including file defines H (the hidden size) and FF (the MLP width).
 #include <cuda_fp16.h>
@@ -39,12 +39,7 @@ __device__ __forceinline__ float block_max(float v, float* sh) {
 
 __device__ __forceinline__ size_t gid() { return (size_t)blockIdx.x * blockDim.x + threadIdx.x; }
 
-// ---- embedding and RMSNorm: one block of 256 threads per token ----
-
-extern "C" __global__ void embed(const act* E, const int* ids, float* h) {
-    const act* row = E + (size_t)ids[blockIdx.x] * H;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) h[(size_t)blockIdx.x * H + i] = f(row[i]);
-}
+// ---- RMSNorm: one block of 256 threads per token ----
 
 // y = w * x / rms(x); rs = 1 / rms(x)
 extern "C" __global__ void rms_fwd(const float* x, const float* w, act* y, float* rs, float eps) {
@@ -119,15 +114,10 @@ extern "C" __global__ void swiglu_bwd(act* w13, const act* dmid, int T) {
     w13[t * 2 * FF + FF + j] = to_act(d * a * s);
 }
 
-extern "C" __global__ void scatter_rows(const float* x, const int* rows, float* out) {
+// out[rows[b]] = x[b], scaled by w[b] when w is given (preference training: a weight per loss row)
+extern "C" __global__ void scatter_rows(const float* x, const int* rows, const float* w, float* out) {
     float* dst = out + (size_t)rows[blockIdx.x] * H;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = x[(size_t)blockIdx.x * H + i];
-}
-
-// the same with row blockIdx.x scaled by w[blockIdx.x] (preference training: a weight per loss row)
-extern "C" __global__ void scatter_rows_scaled(const float* x, const int* rows, const float* w, float* out) {
-    float* dst = out + (size_t)rows[blockIdx.x] * H;
-    const float s = w[blockIdx.x];
+    const float s = w ? w[blockIdx.x] : 1.f;
     for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = s * x[(size_t)blockIdx.x * H + i];
 }
 

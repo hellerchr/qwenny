@@ -11,27 +11,29 @@
 //! it and uploaded.
 use super::{Dims, EPS, HD, LK_HEADS, LKD, LVD, NKV, ROT, VOCAB, attn, norm};
 use crate::checkpoint::Checkpoint;
+use crate::cuda::core::cfg;
 use crate::cuda::learn::{Arg::{F, I, P}, Buf, Group, Layout, Learn, Scratch};
 use crate::training::{Micro, Opts, f32_bytes};
 use anyhow::{Context, Result, bail, ensure};
-use cudarc::driver::LaunchConfig;
-use std::{collections::HashMap, fs, path::Path};
+use std::{fs, path::Path};
 
 mod int8;
 
-const PTX_4B: [&str; 3] = [include_str!(concat!(env!("OUT_DIR"), "/qwen4b_train_bf16.ptx")),
-                           include_str!(concat!(env!("OUT_DIR"), "/qwen4b_train_f32.ptx")),
-                           include_str!(concat!(env!("OUT_DIR"), "/qwen4b_train_f16.ptx"))];
-const PTX_9B: [&str; 3] = [include_str!(concat!(env!("OUT_DIR"), "/qwen9b_train_bf16.ptx")),
-                           include_str!(concat!(env!("OUT_DIR"), "/qwen9b_train_f32.ptx")),
-                           include_str!(concat!(env!("OUT_DIR"), "/qwen9b_train_f16.ptx"))];
-const PTX_27B: [&str; 3] = [include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_bf16.ptx")),
-                            include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_f32.ptx")),
-                            include_str!(concat!(env!("OUT_DIR"), "/qwen27b_train_f16.ptx"))];
+/// The PTX of a model size: bf16, f32 and f16 builds (build.rs)
+macro_rules! ptx {
+    ($size:literal) => {
+        [include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_bf16.ptx")),
+         include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_f32.ptx")),
+         include_str!(concat!(env!("OUT_DIR"), "/qwen", $size, "_train_f16.ptx"))]
+    };
+}
 
-const KERNELS: [&str; 23] = [
+const PTX_4B: [&str; 3] = ptx!("4b");
+const PTX_9B: [&str; 3] = ptx!("9b");
+const PTX_27B: [&str; 3] = ptx!("27b");
+
+const KERNELS: [&str; 22] = [
     "dequant", "rms_fwd", "add_rms", "rms_bwd_pre", "rms_bwd_final", "swiglu_fwd", "swiglu_bwd", "scatter_rows",
-    "scatter_rows_scaled",
     "cross_entropy", "dn_conv", "dn_rule", "dn_rule_bwd", "dn_norm", "dn_norm_bwd", "dn_conv_bwd", "dn_conv_in_bwd",
     "at_prep", "at_prep_bwd", "at_softmax", "at_softmax_bwd", "at_gate", "at_gate_bwd",
 ];
@@ -95,9 +97,10 @@ struct Layer {
 }
 
 pub struct Trainer {
-    l: Learn,
+    pub l: Learn,
     d: Dims,
-    tmax: usize,
+    /// most tokens of a micro-batch
+    pub tmax: usize,
     lmax: usize,
     /// the checkpoint: the embedding is read from it per micro-batch
     w: Checkpoint,
@@ -168,14 +171,10 @@ pub struct Trainer {
     row_w: Buf,
 }
 
-fn cfg3(grid: (usize, usize, usize), block: usize) -> LaunchConfig {
-    LaunchConfig { grid_dim: (grid.0 as u32, grid.1 as u32, grid.2 as u32), block_dim: (block as u32, 1, 1), shared_mem_bytes: 0 }
-}
-
 impl Trainer {
     /// `tmax`: most tokens of a micro-batch, `lmax`: the longest document.
     pub fn new(dir: &Path, o: Opts, tmax: usize, lmax: usize, seed: u64) -> Result<Self> {
-        ensure!(!(o.f32 && o.f16), "--f32 and --fast16 exclude each other");
+        ensure!(!(o.f32 && o.f16), "f32 and f16 exclude each other");
         ensure!(o.rank <= 16, "rank above 16 does not fit the U columns");
         let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
         let tc = config.get("text_config").unwrap_or(&config);
@@ -194,7 +193,7 @@ impl Trainer {
         // DeltaNet's in-projection columns: [in_proj_qkv; in_proj_z; in_proj_b; in_proj_a] (DELTA_IN of the training
         // kernels; the inference engine runs in_proj_b/a as a product of their own)
         let delta_in = d.delta_in() + 2 * d.lv_heads;
-        // 16-bit checkpoints too large for the GPU (Qwen3.5-9B) are held as int8 (rows.rs)
+        // 16-bit checkpoints too large for the GPU (Qwen3.5-9B) are held as int8 (int8.rs)
         let types = tc["layer_types"].as_array().context("layer_types")?;
         let layer_params: usize = types.iter().map(|t| d.h * (3 * d.ff + d.mix() + match t.as_str() {
             Some("linear_attention") => delta_in,
@@ -205,6 +204,13 @@ impl Trainer {
         // for the f32 build or rounded for f16 (consecutive dense matrices in one part)
         let mat = |names: &[String]| -> Result<Weight> {
             let (mut parts, mut dense, mut dense_rows, mut rows, mut cols) = (Vec::new(), Vec::new(), 0, 0, 0);
+            // the consecutive dense matrices so far as one part
+            let flush = |parts: &mut Vec<Part>, dense: &mut Vec<u8>, dense_rows: &mut usize| -> Result<()> {
+                if *dense_rows > 0 {
+                    parts.push(Part::Dense { w: upload(&std::mem::take(dense))?, rows: std::mem::take(dense_rows) });
+                }
+                Ok(())
+            };
             for n in names {
                 let base = n.strip_suffix(".weight").context("a .weight")?;
                 let quant = if w.is_quant(base) {
@@ -214,9 +220,7 @@ impl Trainer {
                     None
                 };
                 if let Some((q, zp)) = quant {
-                    if dense_rows > 0 {
-                        parts.push(Part::Dense { w: upload(&std::mem::take(&mut dense))?, rows: std::mem::take(&mut dense_rows) });
-                    }
+                    flush(&mut parts, &mut dense, &mut dense_rows)?;
                     let words = q.cols * q.bits / 32;
                     parts.push(Part::Quant { q: upload(&q.q.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?,
                                              sc: upload(f32_bytes(&q.scales))?, zp: upload(&zp)?, rows: q.rows, words,
@@ -227,9 +231,7 @@ impl Trainer {
                 }
                 let (b, shape) = w.bf16(n)?;
                 if q8 {
-                    if dense_rows > 0 {
-                        parts.push(Part::Dense { w: upload(&std::mem::take(&mut dense))?, rows: std::mem::take(&mut dense_rows) });
-                    }
+                    flush(&mut parts, &mut dense, &mut dense_rows)?;
                     let (q, sc, zp) = int8::quantize(&b, shape[1]);
                     parts.push(Part::Quant { q: upload(&q)?, sc: upload(f32_bytes(&sc))?, zp: upload(&zp)?, rows: shape[0],
                                              words: shape[1] / 4, group: int8::GROUP, bits: 8 });
@@ -248,9 +250,7 @@ impl Trainer {
                 rows += shape[0];
                 cols = shape[1];
             }
-            if dense_rows > 0 {
-                parts.push(Part::Dense { w: upload(&dense)?, rows: dense_rows });
-            }
+            flush(&mut parts, &mut dense, &mut dense_rows)?;
             Ok(Weight { parts, rows, cols })
         };
         let vec = |v: Vec<f32>| upload(f32_bytes(&v));
@@ -467,12 +467,12 @@ impl Trainer {
         let (l, d) = (&self.l, &self.d);
         let m = |i: usize| self.meta[i].p;
         let f = |i: usize| ly.f[i].as_ref().unwrap().p;
-        l.launch_cfg("dn_conv", cfg3((d.lqkv() / 128, t.div_ceil(4), 1), 128),
+        l.launch_cfg("dn_conv", cfg((d.lqkv() / 128, t.div_ceil(4), 1), 128),
                      &[P(self.p.p), P(f(0)), P(f(1)), P(f(2)), P(m(2)), P(self.cv.p), P(self.gb.p), I(t as i32)])?;
-        l.launch_cfg("dn_rule", cfg3((NSLICE, d.lv_heads, docs), 128),
+        l.launch_cfg("dn_rule", cfg((NSLICE, d.lv_heads, docs), 128),
                      &[P(self.cv.p), P(self.gb.p), P(self.o.p), P(if ck { self.ck.p } else { 0 }), P(self.docs[0].p),
                        P(self.docs[1].p), P(self.docs[2].p)])?;
-        l.launch_cfg("dn_norm", cfg3((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32), &[P(self.o.p), P(self.p.p), P(f(3)), P(self.y.p), F(EPS)])
+        l.launch_cfg("dn_norm", cfg((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32), &[P(self.o.p), P(self.p.p), P(f(3)), P(self.y.p), F(EPS)])
     }
 
     /// dy (the mixer output's gradient) -> dp
@@ -480,13 +480,13 @@ impl Trainer {
         let (l, d) = (&self.l, &self.d);
         let m = |i: usize| self.meta[i].p;
         let f = |i: usize| ly.f[i].as_ref().unwrap().p;
-        l.launch_cfg("dn_norm_bwd", cfg3((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32), &[P(self.dy.p), P(self.o.p), P(self.p.p), P(f(3)), P(self.dp.p), F(EPS)])?;
+        l.launch_cfg("dn_norm_bwd", cfg((t, d.lv_heads / NORM_HEADS, 1), NORM_HEADS * 32), &[P(self.dy.p), P(self.o.p), P(self.p.p), P(f(3)), P(self.dp.p), F(EPS)])?;
         l.zero(self.dqk.p, t * 2 * LK_HEADS * LKD * 4)?;
         l.zero(self.dgb.p, t * 2 * d.lv_heads * 4)?;
-        l.launch_cfg("dn_rule_bwd", cfg3((NSLICE, d.lv_heads, docs), 128),
+        l.launch_cfg("dn_rule_bwd", cfg((NSLICE, d.lv_heads, docs), 128),
                      &[P(self.cv.p), P(self.gb.p), P(self.o.p), P(self.ck.p), P(self.docs[0].p), P(self.docs[1].p),
                        P(self.docs[2].p), P(self.dqk.p), P(self.dvv.p), P(self.dgb.p)])?;
-        l.launch_cfg("dn_conv_bwd", cfg3((d.lqkv() / 128, t.div_ceil(4), 1), 128),
+        l.launch_cfg("dn_conv_bwd", cfg((d.lqkv() / 128, t.div_ceil(4), 1), 128),
                      &[P(self.p.p), P(f(0)), P(f(1)), P(f(2)), P(m(2)), P(self.dqk.p), P(self.dvv.p), P(self.dgb.p),
                        P(self.gb.p), P(self.cv.p), P(self.dp.p), I(t as i32)])?;
         l.elementwise("dn_conv_in_bwd", t * d.lqkv(), &[P(self.cv.p), P(f(0)), P(m(3)), P(self.dp.p), I(t as i32)])
@@ -618,19 +618,20 @@ impl Trainer {
     }
 
     /// Forward over the micro-batch; with `train` (dropout on) also the backward pass, adding the gradients of
-    /// `scale` * (summed loss) to the arena. Returns (summed loss, correct argmax) over the micro-batch's loss rows.
-    pub fn pass(&self, mb: &Micro, train: bool, scale: f32, step: u64, micro: usize) -> Result<(f64, usize)> {
-        let (loss, correct) = self.run(mb, train, scale, None, step, micro)?;
-        Ok((loss.iter().map(|&x| x as f64).sum(), correct))
+    /// `scale` * (summed loss) to the arena. Returns the loss (NLL) of every loss row and how many of them the model's
+    /// argmax gets right.
+    pub fn pass(&self, mb: &Micro, train: bool, scale: f32, step: u64, micro: usize) -> Result<(Vec<f32>, usize)> {
+        self.run(mb, train, scale, None, step, micro)
     }
 
     /// A training pass with a weight per loss row that depends on the losses (preference training): after the
     /// forward pass `weigh` gets the loss (NLL) of every loss row and returns their weights w; the gradients of
-    /// sum_i w_i * loss_i are added to the arena. Returns the rows' losses. The output layer's backward runs once
-    /// with weight 1 and its rows are scaled afterwards (the rest of the backward pass is linear in them).
+    /// sum_i w_i * loss_i are added to the arena. The output layer's backward runs once with weight 1 and its rows are
+    /// scaled afterwards (the rest of the backward pass is linear in them).
     pub fn pass_weighted(&self, mb: &Micro, step: u64, micro: usize, weigh: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>>)
-        -> Result<Vec<f32>> {
-        Ok(self.run(mb, true, 1.0, Some(weigh), step, micro)?.0)
+        -> Result<()> {
+        self.run(mb, true, 1.0, Some(weigh), step, micro)?;
+        Ok(())
     }
 
     fn run(&self, mb: &Micro, train: bool, scale: f32, weigh: Option<&mut dyn FnMut(&[f32]) -> Result<Vec<f32>>>, step: u64,
@@ -689,13 +690,11 @@ impl Trainer {
             None => None,
         };
         if na > 0 {
-            match &weights {
-                None => l.launch("scatter_rows", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.dh.p)])?,
-                Some(w) => {
-                    l.htod(self.row_w.p, w)?;
-                    l.launch("scatter_rows_scaled", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(self.row_w.p), P(self.dh.p)])?;
-                }
+            if let Some(w) = &weights {
+                l.htod(self.row_w.p, w)?;
             }
+            let w = if weights.is_some() { self.row_w.p } else { 0 };
+            l.launch("scatter_rows", na, 256, &[P(l.tmp32.p), P(self.rows.p), P(w), P(self.dh.p)])?;
         }
         let n = self.layers.len();
         l.launch("rms_bwd_final", t, 256, &[P(self.hs(n)), P(self.rs_fin.p), P(self.final_norm.p), P(self.dh.p)])?;
@@ -706,45 +705,5 @@ impl Trainer {
             l.s.synchronize()?; // the weights' host copy outlives their upload
         }
         Ok((loss, correct))
-    }
-}
-
-/// What the training loop (crate::training) asks of the trainer besides `pass`
-impl Trainer {
-    /// Most tokens of a micro-batch
-    pub fn tmax(&self) -> usize {
-        self.tmax
-    }
-
-    pub fn opts(&self) -> &Opts {
-        &self.l.o
-    }
-
-    /// LoRA tensors: PEFT name, rows, columns
-    pub fn tensors(&self) -> Vec<(String, usize, usize)> {
-        self.l.tensor_shapes()
-    }
-
-    /// Loss per loss row of the last pass
-    pub fn row_losses(&self, n: usize) -> Result<Vec<f32>> {
-        self.l.dtoh(self.loss_row.p, n)
-    }
-
-    pub fn zero_grads(&mut self) -> Result<()> {
-        self.l.zero_grads()
-    }
-
-    /// clip_grad_norm_(max_norm) and one AdamW step; the gradient norm before clipping (NaN: step skipped)
-    pub fn optimizer_step(&mut self, lr: f32, max_norm: f32, wd: f32) -> Result<f32> {
-        self.l.optimizer_step(lr, max_norm, wd)
-    }
-
-    /// The LoRA tensors by PEFT name (their gradients with `grads`)
-    pub fn read_params(&self, grads: bool) -> Result<HashMap<String, Vec<f32>>> {
-        self.l.read_params(grads)
-    }
-
-    pub fn write_params(&mut self, values: &HashMap<String, Vec<f32>>) -> Result<()> {
-        self.l.write_params(values)
     }
 }
