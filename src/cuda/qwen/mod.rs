@@ -24,16 +24,10 @@ use std::{collections::HashSet, fs, path::Path, sync::Arc};
 /// Device memory left to other allocations (CUDA graphs, the driver) when the per-slot caches take the rest
 const PAGE_RESERVE: usize = 512 << 20;
 
-/// QWENNY_CACHE_MEM=<GiB>: device memory the slots' caches take at most (a GPU shared with other work). Unset: all
-/// that is free when the model is loaded, less PAGE_RESERVE.
-fn cache_mem_cap() -> Result<Option<usize>> {
-    match std::env::var("QWENNY_CACHE_MEM") {
-        Ok(v) => match v.parse::<f64>() {
-            Ok(g) if g > 0.0 => Ok(Some((g * 1073741824.0) as usize)),
-            _ => bail!("QWENNY_CACHE_MEM={v}: GiB of device memory, e.g. 4"),
-        },
-        Err(_) => Ok(None),
-    }
+/// --cache-mem=<GiB>: device memory the slots' caches take at most (a GPU shared with other work). Unset: all that is
+/// free when the model is loaded, less PAGE_RESERVE.
+fn cache_mem_cap() -> Option<usize> {
+    crate::CACHE_MEM_GIB.get().map(|&gib| (gib * 1073741824.0) as usize)
 }
 
 /// Full attention: key/value heads, head dim and rotary dims of a head; Gated DeltaNet: key heads, key and value head
@@ -327,11 +321,11 @@ impl Stack {
         Ok((x, w))
     }
 
-    /// Give the per-slot caches what device memory is free now, less PAGE_RESERVE (at most QWENNY_CACHE_MEM)
+    /// Give the per-slot caches what device memory is free now, less PAGE_RESERVE (at most --cache-mem)
     fn set_budget(&self) -> Result<()> {
         self.s.synchronize()?;
         let (free, _) = cudarc::driver::result::mem_get_info()?;
-        let room = free.saturating_sub(PAGE_RESERVE).min(cache_mem_cap()?.unwrap_or(usize::MAX));
+        let room = free.saturating_sub(PAGE_RESERVE).min(cache_mem_cap().unwrap_or(usize::MAX));
         self.pool.set_budget(room / self.pool.page() + self.pool.usage().0);
         Ok(())
     }

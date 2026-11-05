@@ -9,17 +9,17 @@ names, as `qwenny train` saves) when it is not there, else loaded from it (one a
 (make_train_reference.py), e.g. RedHatAI/Qwen3.5-4B-quantized.w4a16 into Qwen/Qwen3.5-4B's architecture.
 Per prompt i (those of make_reference.py): ids_i, pos_i, and with the adapter logits_i (at pos_i), argmax_i (every
 position), gen_i (32 greedy tokens); without it the same as base_logits_i, base_argmax_i, base_gen_i."""
-import json, os, sys
+import json, os
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from make_train_reference import TARGETS, dequantized
+from refutil import chunked, cli, positions, prompts
 
-opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--"))
-model_dir, tests, out, adapter = [a for a in sys.argv[1:] if not a.startswith("--")]
+args, opts = cli(__doc__)
+model_dir, tests, out, adapter = args
 weights = opts.get("weights")
 tok = AutoTokenizer.from_pretrained(model_dir)
 # in host memory first (weights and the adapter are set there: offloaded parameters are not real tensors), then
@@ -79,14 +79,6 @@ dmap = infer_auto_device_map(inner, max_memory={0: "9GiB", "cpu": "40GiB"},
                              no_split_module_classes=[type(inner.model.layers[0]).__name__])
 dispatch_model(inner, dmap)
 
-rows = [json.loads(l) for l in open(tests)]
-ticket = [m for m in rows[0]["messages"] if m["role"] != "assistant"]
-many = "\n\n".join(m["content"] for r in rows[:12] for m in r["messages"] if m["role"] == "user")
-prompts = [
-    [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}],
-    ticket,
-    [{"role": "user", "content": "Summarize these customer tickets in one line each.\n\n" + many}],
-]
 tensors = {}
 dev = "cuda"
 
@@ -96,17 +88,16 @@ def run(ids):
     with torch.no_grad():
         hidden = inner.model(input_ids=ids).last_hidden_state[0]
         head = inner.get_output_embeddings()
-        logits = torch.cat([head(hidden[c:c + 256].to(head.weight.device)).float().cpu()
-                            for c in range(0, hidden.shape[0], 256)])
+        logits = chunked(lambda x: head(x.to(head.weight.device)), hidden)
         gen = model.generate(input_ids=ids, max_new_tokens=32, do_sample=False, repetition_penalty=1.0)[0, ids.shape[1]:]
     return logits, gen.int().cpu()
 
 
-for i, msgs in enumerate(prompts):
+for i, msgs in enumerate(prompts(tests)):
     ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_tensors="pt",
                                   return_dict=True)["input_ids"].to(dev)
     n = ids.shape[1]
-    pos = sorted({*range(0, n, 7 if n < 1000 else 31), n - 1})
+    pos = positions(n)
     tensors |= {f"ids_{i}": ids[0].int().cpu(), f"pos_{i}": torch.tensor(pos, dtype=torch.int32)}
     for prefix, on in [("", True), ("base_", False)]:
         if on:

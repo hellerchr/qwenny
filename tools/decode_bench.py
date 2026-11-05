@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-"""Single-stream decode speed through a running server: 8 prompts (code, prose, math, structured output, a long quote),
-fixed seeds, tokens per second after the first streamed token (prefill excluded), per prompt and the geometric mean.
-Start a fresh server per run when comparing builds: the draft head learns as it serves.
+"""Decode speed through a running server, on 8 prompts (code, prose, math, structured output, a long quote) with fixed
+seeds. Start a fresh server per run when comparing builds: the draft head learns as it serves.
 
-usage: decode_bench.py [url] [extra request JSON] [tokens]
+One stream (default): each prompt streamed, tokens per second from the first streamed token to the end of the reply
+(prefill excluded; client wall clock, time.perf_counter), per prompt and the geometric mean.
+--streams=1,4,8,16: concurrent replies, one run per count: all their tokens divided by the wall time from sending the
+requests to the last reply (prefill included).
+
+usage: decode_bench.py [url] [extra request JSON] [tokens] [--streams=N,N,...]
   decode_bench.py http://127.0.0.1:18023                       # the model's default sampling, thinking on
-  decode_bench.py http://127.0.0.1:18023 '{"temperature": 0}'  # greedy"""
-import json, math, os, sys, time, urllib.request
+  decode_bench.py http://127.0.0.1:18023 '{"temperature": 0}'  # greedy
+  decode_bench.py http://127.0.0.1:18023 '{"chat_template_kwargs": {"enable_thinking": false}}' 400 --streams=1,4,8,16"""
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import time
 
-url = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18023") + "/v1/chat/completions"
-extra = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
-n_tok = int(sys.argv[3]) if len(sys.argv) > 3 else 800
+from qwenny_client import Client
+
 doc = open(os.path.join(os.path.dirname(__file__), "..", "src", "sessions.rs")).read()[:12000]
 PROMPTS = {
     "code": "Write a complete Python implementation of a red-black tree with insert, delete and search, "
@@ -38,24 +47,46 @@ def has_output(chunk):
     )
 
 
-def run(prompt, seed):
-    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": n_tok, "stream": True, "ignore_eos": True,
-            "seed": seed, "stream_options": {"include_usage": True}, **extra}
-    req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+def request(prompt, seed, tokens, extra):
+    return {"messages": [{"role": "user", "content": prompt}], "max_tokens": tokens, "ignore_eos": True, "seed": seed,
+            **extra}
+
+
+def stream_speed(client, prompt, seed, tokens, extra):
     first, usage = None, None
-    for line in urllib.request.urlopen(req, timeout=900):
-        line = line.decode().strip()
-        if not line.startswith("data: ") or line == "data: [DONE]":
-            continue
-        chunk = json.loads(line[6:])
-        if chunk.get("usage"):
-            usage = chunk["usage"]
+    for chunk in client.events(**request(prompt, seed, tokens, extra)):
+        usage = chunk.get("usage") or usage
         if first is None and has_output(chunk):
-            first = time.time()
-    return (usage["completion_tokens"] - 1) / (time.time() - first)
+            first = time.perf_counter()
+    return (usage["completion_tokens"] - 1) / (time.perf_counter() - first)
 
 
-run("hi", 0)  # warm-up
-res = {name: run(p, i + 1) for i, (name, p) in enumerate(PROMPTS.items())}
-geo = math.exp(sum(map(math.log, res.values())) / len(res))
-print(" | ".join(f"{k} {v:.1f}" for k, v in res.items()), f"| geomean {geo:.1f} tok/s")
+def concurrent_speed(client, streams, tokens, extra):
+    prompts = list(PROMPTS.values())
+    start = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(streams) as pool:
+        replies = list(pool.map(lambda i: client.chat(**request(prompts[i % len(prompts)], i, tokens, extra)),
+                                range(streams)))
+    return sum(r["usage"]["completion_tokens"] for r in replies) / (time.perf_counter() - start)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("url", nargs="?", default="http://127.0.0.1:18023")
+    p.add_argument("extra", nargs="?", default="{}", help="more fields of the request, as JSON")
+    p.add_argument("tokens", nargs="?", type=int, default=800)
+    p.add_argument("--streams", help="concurrent replies to measure, e.g. 1,4,8,16 (default: one stream per prompt)")
+    a = p.parse_args()
+    client, extra = Client(url=a.url), json.loads(a.extra)
+    stream_speed(client, "hi", 0, a.tokens, extra)  # warm-up
+    if a.streams:
+        speeds = {n: concurrent_speed(client, n, a.tokens, extra) for n in map(int, a.streams.split(","))}
+        print(" | ".join(f"{n} streams: {v:.1f} tok/s" for n, v in speeds.items()))
+    else:
+        res = {name: stream_speed(client, prompt, i + 1, a.tokens, extra) for i, (name, prompt) in enumerate(PROMPTS.items())}
+        geo = math.exp(sum(map(math.log, res.values())) / len(res))
+        print(" | ".join(f"{k} {v:.1f}" for k, v in res.items()), f"| geomean {geo:.1f} tok/s")
+
+
+if __name__ == "__main__":
+    main()

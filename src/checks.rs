@@ -5,6 +5,10 @@ use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use std::{path::Path, time::Instant};
 
+fn read(path: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("reading {path}"))
+}
+
 fn ints(st: &SafeTensors, name: &str) -> Result<Vec<u32>> {
     Ok(st.tensor(name)?.data().chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap()) as u32).collect())
 }
@@ -13,20 +17,86 @@ fn floats(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     Ok(st.tensor(name)?.data().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
+/// The prompts of a reference: those with an `ids_<p>` tensor
+fn prompts<'a>(r: &'a SafeTensors<'a>) -> impl Iterator<Item = usize> + 'a {
+    (0..).take_while(|p| r.tensor(&format!("ids_{p}")).is_ok())
+}
+
+/// The largest of `a` and `b`; a NaN wins, so that it fails a limit
+fn worse(a: f32, b: f32) -> f32 {
+    if b.is_nan() || b > a { b } else { a }
+}
+
+fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0., worse)
+}
+
+/// The index of the largest value (the first of equals)
+fn argmax(l: &[f32]) -> u32 {
+    l.iter().enumerate().fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0 as u32
+}
+
+/// The tokens `ids[from..to]` at their own positions in `slot`
+fn toks(ids: &[u32], from: usize, to: usize, slot: u32) -> Vec<Tok> {
+    (from..to).map(|i| Tok { id: ids[i], slot, pos: i as u32 }).collect()
+}
+
+/// `ids[from..to]` through `slot` in steps of 64 tokens; the logits of the last token
+fn feed(m: &mut dyn Engine, ids: &[u32], from: usize, to: usize, slot: u32) -> Result<Vec<f32>> {
+    for c in (from..to).step_by(64) {
+        let step = toks(ids, c, (c + 64).min(to), slot);
+        m.run(&step, &[step.len() - 1])?;
+    }
+    m.logits()
+}
+
+/// The words of a bit set over the vocabulary with `tokens` in it (what `set_outputs` takes)
+fn bitset(vocab: usize, tokens: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut words = vec![0u32; vocab / 32];
+    tokens.into_iter().for_each(|t| words[t as usize / 32] |= 1 << (t % 32));
+    words
+}
+
+/// The seconds `f` takes on the engine, the device synchronized before and after
+fn timed(m: &mut dyn Engine, f: impl FnOnce(&mut dyn Engine) -> Result<()>) -> Result<f64> {
+    m.sync()?;
+    let t = Instant::now();
+    f(m)?;
+    m.sync()?;
+    Ok(t.elapsed().as_secs_f64())
+}
+
+/// The worst (largest) of `values`, which the check passes only when it is below `limit`; there must be some
+fn below(what: &str, values: impl IntoIterator<Item = f32>, limit: f32) -> Result<f32> {
+    let worst = values.into_iter().reduce(worse).context(format!("{what}: nothing was compared"))?;
+    ensure!(worst < limit, "{what}: {worst} is not below the limit {limit}");
+    Ok(worst)
+}
+
+/// A safetensors file from (name, type, shape, little-endian bytes)
+fn write_tensors(path: &Path, tensors: &[(String, Dtype, Vec<usize>, Vec<u8>)]) -> Result<()> {
+    let views: Vec<_> = tensors.iter()
+        .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
+        .collect::<Result<_>>()?;
+    Ok(safetensors::serialize_to_file(views, None, path)?)
+}
+
 /// Feed each reference prompt in chunks, compare logits and argmax at every position, then decode greedily.
 /// --write=<file>: also write this engine's logits, argmax and greedy tokens as a reference of the same prompts and
-/// positions (the MLX area compares MLX with CUDA through one)
+/// positions (the MLX area compares MLX with CUDA through one; no --limit then). Else it fails when the mean |diff| of
+/// a prompt is not below --limit.
 pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()> {
-    let bytes = std::fs::read(reference)?;
+    let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
+    let write: Option<String> = opts.opt("write")?;
+    let limit = if write.is_some() { None } else { Some(opts.limit()?) };
     let mut m = opts.load(dir)?;
     let (chunk, vocab) = (chunk.clamp(1, m.max_out()), m.vocab());
-    let write = opts.values.iter().find(|(k, _)| k == "write").map(|(_, v)| v.clone());
     // name, shape, little-endian bytes (i32 or f32)
     let mut out: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
     let le_i32 = |v: &[u32]| v.iter().flat_map(|&x| (x as i32).to_le_bytes()).collect::<Vec<u8>>();
-    let mut p = 0;
-    while r.tensor(&format!("ids_{p}")).is_ok() {
+    let mut means = Vec::new();
+    for p in prompts(&r) {
         let ids = ints(&r, &format!("ids_{p}"))?;
         // a reference with the top-k log-probabilities at every position (tools/make_reference_vllm.py) instead of
         // full logits at some: compared with our log-softmax on those tokens
@@ -45,14 +115,12 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
         let mut worst = (0, 0, 0f32, 0f32);
         let mut next = 0;
         let (mut our_argmax, mut our_logits) = (Vec::new(), Vec::new());
-        for (c, ids_c) in ids.chunks(chunk).enumerate() {
-            let start = c * chunk;
-            let toks: Vec<Tok> =
-                ids_c.iter().enumerate().map(|(j, &id)| Tok { id, slot: 0, pos: (start + j) as u32 }).collect();
-            m.run(&toks, &(0..toks.len()).collect::<Vec<_>>())?;
+        for start in (0..ids.len()).step_by(chunk) {
+            let step = toks(&ids, start, (start + chunk).min(ids.len()), 0);
+            m.run(&step, &(0..step.len()).collect::<Vec<_>>())?;
             let am = m.argmax()?;
             let lg = m.logits()?;
-            for j in 0..toks.len() {
+            for j in 0..step.len() {
                 let at = start + j;
                 agree += (am[j] == ref_argmax[at]) as usize;
                 let ours = &lg[j * vocab..(j + 1) * vocab];
@@ -87,7 +155,7 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
                     compared += 1;
                 }
             }
-            next = am[toks.len() - 1];
+            next = am[step.len() - 1];
         }
         let mut generated = Vec::new();
         for g in 0..ref_gen.len() {
@@ -105,9 +173,11 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
             out.push((format!("argmax_{p}"), Dtype::I32, vec![our_argmax.len()], le_i32(&our_argmax)));
             out.push((format!("gen_{p}"), Dtype::I32, vec![generated.len()], le_i32(&generated)));
         }
+        let mean = sum_diff / (compared * if topk { k } else { vocab }) as f64;
+        means.push(mean as f32);
         println!(
             "prompt {p}: {} tokens, argmax agrees at {agree}/{}, {} at {compared} positions: max |diff| {max_diff:.4} \
-             (position {}, token {}: {:.3} vs. {:.3}), mean {:.5}; greedy matches the first {gen_agree}/{} tokens",
+             (position {}, token {}: {:.3} vs. {:.3}), mean {mean:.5}; greedy matches the first {gen_agree}/{} tokens",
             ids.len(),
             ids.len(),
             if topk { format!("log-probabilities of the top {k}") } else { "logits".into() },
@@ -115,17 +185,16 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
             worst.1,
             worst.2,
             worst.3,
-            sum_diff / (compared * if topk { k } else { vocab }) as f64,
             ref_gen.len()
         );
-        p += 1;
     }
     if let Some(path) = write {
-        let views: Vec<_> = out.iter()
-            .map(|(n, d, sh, b)| Ok((n.clone(), safetensors::tensor::TensorView::new(*d, sh.clone(), b)?)))
-            .collect::<Result<_>>()?;
-        safetensors::serialize_to_file(views, None, Path::new(&path))?;
+        write_tensors(Path::new(&path), &out)?;
         println!("wrote {path}");
+    }
+    if let Some(limit) = limit {
+        let worst = below("check: mean |diff| per prompt", means, limit)?;
+        println!("mean |logit diff| at most {worst:.5} per prompt (< {limit})");
     }
     Ok(())
 }
@@ -134,7 +203,7 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
 /// after each the MTP over the chunk's positions (each with the next token): its argmax at every position and its logits
 /// at the reference's positions; then the second draft (the MTP on its own state and first draft) at 24 positions.
 pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
-    let bytes = std::fs::read(reference)?;
+    let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     let mut m = opts.load(dir)?;
     ensure!(m.has_draft(), "{dir}: no draft layer (MTP)");
@@ -145,8 +214,7 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
         let (mut am, mut lg) = (Vec::new(), Vec::new());
         for c0 in (0..end).step_by(64) {
             let c1 = (c0 + 64).min(end);
-            let toks: Vec<Tok> = (c0..c1).map(|q| Tok { id: ids[q], slot: 0, pos: q as u32 }).collect();
-            m.run(&toks, &[])?;
+            m.run(&toks(ids, c0, c1, 0), &[])?;
             let next: Vec<Tok> = (c0..c1).filter(|&q| q + 1 < ids.len()).map(|q| Tok { id: ids[q + 1], slot: 0, pos: q as u32 }).collect();
             let rows: Vec<usize> = (0..next.len()).collect();
             let d = m.draft(&next, &rows, &rows, 1, &[])?;
@@ -158,8 +226,7 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
         }
         Ok((am, lg))
     };
-    let mut p = 0;
-    while r.tensor(&format!("ids_{p}")).is_ok() {
+    for p in prompts(&r) {
         let ids = ints(&r, &format!("ids_{p}"))?;
         let (target, want, pos, ref_lg, chain) = (ints(&r, &format!("target_{p}"))?, ints(&r, &format!("mtp_{p}"))?,
             ints(&r, &format!("pos_{p}"))?, floats(&r, &format!("logits_{p}"))?, ints(&r, &format!("chain_{p}"))?);
@@ -186,7 +253,6 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
                   next argmax at {:.1} %), logits at {} positions: max |diff| {max_diff:.4}, mean {:.5}; second draft \
                   agrees at {chain_agree}/{}", am.len(), am.len(), 100.0 * accept as f64 / am.len() as f64, pos.len(),
                  sum / (pos.len() * vocab) as f64, chain.len());
-        p += 1;
     }
     Ok(())
 }
@@ -195,23 +261,19 @@ pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
 #[cfg(has_cuda)]
 const DRAFT: u32 = 0x100;
 
-#[cfg(not(has_cuda))]
-pub fn layercheck(_opts: &Opts, _dir: &str, _reference: &str, _layer: usize) -> Result<()> {
-    anyhow::bail!("layercheck: CUDA backend only so far")
-}
-
 /// One layer's mixer (in_proj, mixer, out_proj) on the reference's mixer inputs, compared with its outputs, fed in
 /// several ways: (a) the prompt as MAX_TOK-token chunks then the last 4 tokens as single-token decode steps, in slot
 /// 0; (b) chunks of 5 tokens (short segments) in slot 1; (c) two sequences per step, chunks of 64, in slots 2 and 3;
 /// (d) a 3-token step in slot 0 while slot 1 decodes, after both had their prompts; (e) speculative decoding with
-/// rejected drafts in slot 1.
+/// rejected drafts in slot 1. Fails when the largest |diff| of a way is not below --limit.
 #[cfg(has_cuda)]
 pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Result<()> {
-    let bytes = std::fs::read(reference)?;
+    let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
+    let limit = opts.limit()?;
     let mut m = crate::cuda::qwen::LayerCheck::load(Path::new(dir), layer, opts.int8)?;
-    let mut p = 0;
-    while r.tensor(&format!("ids_{p}")).is_ok() {
+    let mut worsts = Vec::new();
+    for p in prompts(&r) {
         let n = ints(&r, &format!("ids_{p}"))?.len();
         let xn = floats(&r, &format!("xn_{p}_{layer}")).with_context(|| format!("reference has no xn_{p}_{layer}"))?;
         let want = floats(&r, &format!("mix_{p}_{layer}"))?;
@@ -262,7 +324,7 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
                 for ((i, t), _) in toks.iter().enumerate().zip(drafts).filter(|(_, draft)| !draft) {
                     for (g, w) in got[i * h..][..h].iter().zip(&want[t.pos as usize * h..][..h]) {
                         let d = (g - w).abs();
-                        worst = worst.max(d);
+                        worst = worse(worst, d);
                         sum += d as f64;
                         cnt += 1;
                     }
@@ -270,9 +332,11 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
             }
             println!("prompt {p} ({n} tokens), layer {layer}, {name}: max |diff| {worst:.4} (output max {scale:.2}), \
                       mean {:.5}", sum / cnt.max(1) as f64);
+            worsts.push(worst);
         }
-        p += 1;
     }
+    let worst = below(&format!("layercheck {layer}: max |diff|"), worsts.iter().copied(), limit)?;
+    println!("layer {layer}: max |diff| {worst:.4} (< {limit}) in {} ways of feeding it", worsts.len());
     Ok(())
 }
 
@@ -280,7 +344,7 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
 /// the base model's requests (the adapter loaded), then for the adapter's.
 pub fn bench(opts: &Opts, dir: &str, n: usize) -> Result<()> {
     let slots = opts.get("slots", 1)?;
-    let mut m = opts.load_at_adapter(dir, opts.get("ctx", 4096)?, slots)?;
+    let mut m = opts.load_at(dir, opts.opt("ctx")?.unwrap_or(opts.get("pos", 0usize)? + 4096), slots)?;
     for adapter in if m.has_adapter() { vec![false, true] } else { vec![false] } {
         if m.has_adapter() {
             println!("-- {} requests (an adapter loaded)", if adapter { "adapter" } else { "base model" });
@@ -291,22 +355,26 @@ pub fn bench(opts: &Opts, dir: &str, n: usize) -> Result<()> {
                 m.set_adapter(s, adapter)?;
             }
         }
-        bench_steps(opts, &mut m, n)?;
+        bench_steps(opts, m.as_mut(), n)?;
     }
     Ok(())
 }
 
-fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
-    // --pos=P: decode after a P-token context (fed as one-token steps), not after 8 tokens
-    let p0 = opts.get("pos", 0u32)?;
-    let t = Instant::now();
-    for c in (0..p0).step_by(m.max_tok()) {
-        let toks: Vec<Tok> = (c..p0.min(c + m.max_tok() as u32)).map(|i| Tok { id: 1000 + i % 1000, slot: 0, pos: i }).collect();
-        m.run(&toks, &[])?;
+/// `len` tokens (`id` of a position) from position 0 of `slot` in steps of the largest size; the last row's logits
+/// when `last`
+fn fill(m: &mut dyn Engine, slot: u32, len: usize, id: impl Fn(usize) -> u32, last: bool) -> Result<()> {
+    for c in (0..len).step_by(m.max_tok()) {
+        let step: Vec<Tok> = (c..len.min(c + m.max_tok())).map(|j| Tok { id: id(j), slot, pos: j as u32 }).collect();
+        m.run(&step, &[step.len() - 1][..last as usize])?;
     }
+    Ok(())
+}
+
+fn bench_steps(opts: &Opts, m: &mut dyn Engine, n: usize) -> Result<()> {
+    // --pos=P: decode after a P-token context (fed in steps), not after 8 tokens
+    let p0 = opts.get("pos", 0u32)?;
     if p0 > 0 {
-        m.sync()?;
-        let dt = t.elapsed().as_secs_f64();
+        let dt = timed(m, |m| fill(m, 0, p0 as usize, |i| 1000 + i as u32 % 1000, false))?;
         println!("context of {p0}: {:.0} tok/s ({dt:.1} s)", p0 as f64 / dt);
     }
     let prompt: Vec<Tok> = (0..8).map(|i| Tok { id: 1000 + i, slot: 0, pos: p0 + i }).collect();
@@ -314,13 +382,12 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
     for warm in 0..8 {
         m.run(&[Tok { id: 42, slot: 0, pos: p0 + 8 + warm }], &[0])?;
     }
-    m.sync()?;
-    let t = Instant::now();
-    for i in 0..n {
-        m.run(&[Tok { id: 42, slot: 0, pos: p0 + 16 + i as u32 }], &[0])?;
-    }
-    m.sync()?;
-    let dt = t.elapsed().as_secs_f64();
+    let dt = timed(m, |m| {
+        for i in 0..n {
+            m.run(&[Tok { id: 42, slot: 0, pos: p0 + 16 + i as u32 }], &[0])?;
+        }
+        Ok(())
+    })?;
     println!("decode: {n} tokens in {dt:.3}s = {:.1} tok/s ({:.3} ms/token)", n as f64 / dt, dt * 1e3 / n as f64);
     // as the server does it: wait for each token and feed it back
     let (t, mut launch, mut next) = (Instant::now(), 0f64, 42);
@@ -333,44 +400,41 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
     let dt = t.elapsed().as_secs_f64();
     println!("round trip: {:.1} tok/s ({:.3} ms/token, {:.3} ms of it in step())", n as f64 / dt, dt * 1e3 / n as f64,
              launch * 1e3 / n as f64);
-    let t = Instant::now();
-    for i in 0..n {
-        m.run(&[Tok { id: next, slot: 0, pos: p0 + (16 + 2 * n + i) as u32 }], &[0])?;
-        let _ = m.argmax()?;
-        let _ = m.logits_row(0)?;
-    }
-    let dt = t.elapsed().as_secs_f64();
+    let dt = timed(m, |m| {
+        for i in 0..n {
+            m.run(&[Tok { id: next, slot: 0, pos: p0 + (16 + 2 * n + i) as u32 }], &[0])?;
+            let _ = m.argmax()?;
+            let _ = m.logits_row(0)?;
+        }
+        Ok(())
+    })?;
     println!("with logits: {:.1} tok/s ({:.3} ms/token)", n as f64 / dt, dt * 1e3 / n as f64);
     // speculative decoding's steps: the last token and k drafts of one sequence, every row's logits (each run continues
     // where the last one ended: engines that roll back only inside a step refuse an earlier restart)
     let mut p = p0 + (16 + 3 * n) as u32;
+    let drafts = |p: u32, k: usize| (0..=k as u32).map(|j| Tok { id: 42, slot: 0, pos: p + j }).collect::<Vec<_>>();
     for k in [2usize, 4] {
-        let rows: Vec<usize> = (0..=k).collect();
-        m.sync()?;
-        let t = Instant::now();
-        for _ in 0..n / 2 {
-            let toks: Vec<Tok> = (0..=k as u32).map(|j| Tok { id: 42, slot: 0, pos: p + j }).collect();
-            m.run(&toks, &rows)?;
-            p += k as u32 + 1;
-        }
-        m.sync()?;
-        let dt = t.elapsed().as_secs_f64();
+        let dt = timed(m, |m| {
+            for _ in 0..n / 2 {
+                m.run(&drafts(p, k), &(0..=k).collect::<Vec<_>>())?;
+                p += k as u32 + 1;
+            }
+            Ok(())
+        })?;
         println!("steps of 1 + {k} drafts: {:.3} ms/step", dt * 1e3 / (n / 2) as f64);
     }
     // a round of speculative decoding with the model's draft layer: the target over the last token and its drafts, every
     // row's logits, the drafter on the last token
     if m.has_draft() {
         let k = m.draft_tokens();
-        let rows: Vec<usize> = (0..=k).collect();
-        m.sync()?;
-        let t = Instant::now();
-        for _ in 0..n / 2 {
-            let toks: Vec<Tok> = (0..=k as u32).map(|j| Tok { id: 42, slot: 0, pos: p + j }).collect();
-            m.run(&toks, &rows)?;
-            let _ = m.draft(&[Tok { id: 42, slot: 0, pos: p }], &[0], &[0], k, &[])?;
-            p += 1;
-        }
-        let dt = t.elapsed().as_secs_f64();
+        let dt = timed(m, |m| {
+            for _ in 0..n / 2 {
+                m.run(&drafts(p, k), &(0..=k).collect::<Vec<_>>())?;
+                let _ = m.draft(&[Tok { id: 42, slot: 0, pos: p }], &[0], &[0], k, &[])?;
+                p += 1;
+            }
+            Ok(())
+        })?;
         println!("rounds of 1 + {k} drafts with the draft layer: {:.3} ms/round", dt * 1e3 / (n / 2) as f64);
     }
     // batched decode: one token for each of `slots` sequences per step
@@ -381,46 +445,28 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
         let rows: Vec<usize> = (0..b).collect();
         // every slot holds a sequence of p0 + 16 tokens first (not timed)
         for s in 0..b as u32 {
-            let mut at = 0;
-            while at < p0 as usize + 16 {
-                let to = (at + m.max_tok()).min(p0 as usize + 16);
-                m.run(&(at..to).map(|q| Tok { id: 42, slot: s, pos: q as u32 }).collect::<Vec<_>>(), &[])?;
-                at = to;
-            }
+            fill(m, s, p0 as usize + 16, |_| 42, false)?;
         }
         let at = |i: usize| -> Vec<Tok> { (0..b as u32).map(|s| Tok { id: 42, slot: s, pos: p0 + 16 + i as u32 }).collect() };
         m.run(&at(0), &rows)?;
-        m.sync()?;
-        let t = Instant::now();
-        for i in 1..=n / 4 {
-            m.run(&at(i), &rows)?;
-        }
-        m.sync()?;
-        let dt = t.elapsed().as_secs_f64();
+        let dt = timed(m, |m| {
+            for i in 1..=n / 4 {
+                m.run(&at(i), &rows)?;
+            }
+            Ok(())
+        })?;
         println!("decode x{b}: {:.1} tok/s ({:.3} ms/step)", (n / 4 * b) as f64 / dt, dt * 1e3 / (n / 4) as f64);
     }
     // prompt: chunks of m.max_tok() tokens in a fresh slot
     let slot = m.slots() as u32 - 1;
     for len in [m.max_tok(), 2048] {
-        m.sync()?;
-        let t = Instant::now();
-        for c in (0..len).step_by(m.max_tok()) {
-            let toks: Vec<Tok> = (c..len.min(c + m.max_tok())).map(|j| Tok { id: 1000 + j as u32 % 1000, slot, pos: j as u32 }).collect();
-            m.run(&toks, &[toks.len() - 1])?;
-        }
-        m.sync()?;
-        let dt = t.elapsed().as_secs_f64();
+        let dt = timed(m, |m| fill(m, slot, len, |j| 1000 + j as u32 % 1000, true))?;
         println!("prompt of {len}: {:.0} tok/s ({:.1} ms)", len as f64 / dt, dt * 1e3);
     }
     Ok(())
 }
 
 /// capture: residual-stream activations for representation engineering (contrastive activation steering).
-#[cfg(not(has_cuda))]
-pub fn capture(_opts: &Opts, _dir: &str, _prompts: &str, _out: &str) -> Result<()> {
-    anyhow::bail!("capture: CUDA backend only so far")
-}
-
 /// For each prompt in `prompts` (JSONL, one `{"group": "...", "text": "..."}` per line) render it as a single user
 /// turn with the serving chat template (enable_thinking false, generation prompt appended), run one ungraphed forward,
 /// and store the last K positions' raw residual rows at every layer (K from --last, default 4). Writes a safetensors
@@ -521,10 +567,11 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render the reference prompts with the chat template and compare the token ids with Transformers'.
+/// Render the reference prompts with the chat template and compare the token ids with Transformers': fails when one
+/// differs.
 pub fn tokcheck(dir: &str, reference: &str, tests: &str) -> Result<()> {
     let chat = chat::Chat::load(Path::new(dir))?;
-    let bytes = std::fs::read(reference)?;
+    let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     let ticket: serde_json::Value = serde_json::from_str(std::fs::read_to_string(tests)?.lines().next().unwrap_or(""))?;
     let ticket_msgs: Vec<_> = ticket["messages"].as_array().unwrap().iter().filter(|m| m["role"] != "assistant").cloned().collect();
@@ -533,16 +580,20 @@ pub fn tokcheck(dir: &str, reference: &str, tests: &str) -> Result<()> {
         serde_json::Value::Array(ticket_msgs),
     ];
     let kwargs = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
+    let mut differ = 0;
     for (i, msgs) in prompts.iter().enumerate() {
         let ours = chat.encode(&chat.render(msgs, None, &kwargs)?)?;
         let theirs = ints(&r, &format!("ids_{i}"))?;
         let same = ours == theirs;
         println!("prompt {i}: {} tokens (reference {}): {}", ours.len(), theirs.len(), if same { "identical" } else { "DIFFERENT" });
         if !same {
+            differ += 1;
             let at = ours.iter().zip(&theirs).position(|(a, b)| a != b).unwrap_or(ours.len().min(theirs.len()));
             println!("  first difference at {at}: ours {:?} reference {:?}", &ours[at..(at + 5).min(ours.len())], &theirs[at..(at + 5).min(theirs.len())]);
         }
     }
+    ensure!(differ == 0, "tokcheck: the prompt tokens of {differ} of {} prompts differ", prompts.len());
+    println!("{} prompts: tokens identical to Transformers'", prompts.len());
     Ok(())
 }
 
@@ -551,21 +602,17 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     let mut m = opts.load_at(dir, 4096, 2)?;
     // two sequences with different histories; repeated tokens so the penalty matters
     let hist: [Vec<u32>; 2] = [(0..60).map(|i| 1000 + (i * 7) % 23).collect(), (0..40).map(|i| 5000 + (i * 13) % 37).collect()];
-    let mut toks = Vec::new();
-    for (s, h) in hist.iter().enumerate() {
-        toks.extend(h.iter().enumerate().map(|(p, &id)| Tok { id, slot: s as u32, pos: p as u32 }));
-    }
-    let rows = [hist[0].len() - 1, toks.len() - 1];
+    let both: Vec<Tok> = hist.iter().enumerate().flat_map(|(s, h)| toks(h, 0, h.len(), s as u32)).collect();
+    let rows = [hist[0].len() - 1, both.len() - 1];
     // the presence penalty's set: the last 20 tokens of each history count as generated
     let gened: Vec<std::collections::HashSet<u32>> = hist.iter().map(|h| h[h.len() - 20..].iter().copied().collect()).collect();
     for (s, g) in gened.iter().enumerate() {
-        let mut words = vec![0u32; m.vocab() / 32];
-        g.iter().for_each(|&t| words[t as usize / 32] |= 1 << (t % 32));
+        let words = bitset(m.vocab(), g.iter().copied());
         m.set_outputs(s as u32, &words)?;
     }
     // every other draw from a step of each sequence's last token alone (its rows read the penalties' sets only; the
     // whole histories' steps count their tokens after the first as the step's drafts)
-    let last: Vec<Tok> = hist.iter().enumerate().map(|(s, h)| Tok { id: *h.last().unwrap(), slot: s as u32, pos: (h.len() - 1) as u32 }).collect();
+    let last: Vec<Tok> = hist.iter().enumerate().flat_map(|(s, h)| toks(h, h.len() - 1, h.len(), s as u32)).collect();
     let (mut same, mut total) = (0, 0);
     let mut rng = sample::Rng::new(7);
     for &(temp, k, p, rep, pres) in &[(0.0, 50, 1.0, 1.1, 0.0), (0.1, 50, 1.0, 1.1, 0.0), (0.7, 20, 0.8, 1.0, 0.0), (1.0, 0, 0.95, 1.1, 0.0),
@@ -575,7 +622,7 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
         for it in 0..50 {
             let whole = it % 2 == 0;
             let rowp: Vec<[f32; 8]> = (0..2).map(|_| params.row(&mut rng, None)).collect();
-            if whole { m.run(&toks, &rows)? } else { m.run(&last, &[0, 1])? }
+            if whole { m.run(&both, &rows)? } else { m.run(&last, &[0, 1])? }
             let gpu = m.sample(&rowp)?;
             for j in 0..2 {
                 let lg = m.logits_row(j)?;
@@ -588,6 +635,7 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
         }
         println!("temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: {same}/{total} draws agree so far");
     }
+    let mut disagree = total - same;
     // sampled drafts (the draft layer's): drawn on the GPU from its distribution q under the row's sampling, then
     // accepted with min(1, p / q) or resampled from max(0, p - q): the GPU's tokens must be the host reference's
     // (sample::sample_row_q, whose output follows p: the unit test) for the q the GPU kept, draw for draw
@@ -600,8 +648,7 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
                                           presence_penalty: pres, seed: 0 };
             for it in 0..20 {
                 let next = 3000 + it as u32;
-                let seq: Vec<Tok> = h.iter().enumerate().map(|(p, &id)| Tok { id, slot: 0, pos: p as u32 }).collect();
-                m.run(&seq, &[n - 1])?;
+                m.run(&toks(h, 0, n, 0), &[n - 1])?;
                 let ds = DraftSampling { row: params.draft_row(true), u: (0..3).map(|_| rng.next_f32()).collect() };
                 let d = m.draft(&[Tok { id: next, slot: 0, pos: (n - 1) as u32 }], &[n - 1], &[0], 3, &[Some(ds)])?;
                 ensure!(d[0].len() == 3, "sampled drafts: {d:?}");
@@ -614,11 +661,8 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
                     if j < 3 { sample::mark_sampled(&mut r); }
                     r
                 }).collect();
-                m.set_outputs(0, &{
-                    let mut w = vec![0u32; m.vocab() / 32];
-                    gened[0].iter().for_each(|&t| w[t as usize / 32] |= 1 << (t % 32));
-                    w
-                })?;
+                let words = bitset(m.vocab(), gened[0].iter().copied());
+                m.set_outputs(0, &words)?;
                 let gpu = m.sample(&rowp)?;
                 // the step marks all its tokens seen (run: no marks), its drafts included
                 let seen: std::collections::HashSet<u32> =
@@ -646,12 +690,14 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
             println!("sampled drafts at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: \
                       {same}/{total} draws agree so far ({acc} drafts accepted)");
         }
+        disagree += total - same;
     } else {
         println!("no draft layer: no sampled drafts to check");
     }
     // with a draft: the accept-or-resample result must follow the same distribution as plain sampling
-    m.run(&toks, &rows)?;
+    m.run(&both, &rows)?;
     let lg = m.logits_row(0)?;
+    let mut max_tv = 0f64;
     for &(temp, k, p, rep, pres) in &[(1.0, 1024, 1.0, 1.0, 0.0), (0.8, 20, 0.9, 1.1, 0.0), (1.5, 50, 1.0, 1.3, 0.0), (1.0, 20, 0.95, 1.0, 1.5)] {
         let params = sample::Params { temperature: temp, top_k: k, top_p: p, repetition_penalty: rep, presence_penalty: pres, seed: 0 };
         // target: the host reference's distribution, estimated with many draws
@@ -684,21 +730,24 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
             }
             let keys: std::collections::HashSet<u32> = want.keys().chain(got.keys()).copied().collect();
             let tv: f64 = keys.iter().map(|t| (want.get(t).copied().unwrap_or(0.0) - got.get(t).copied().unwrap_or(0.0)).abs()).sum::<f64>() / 2.0;
+            max_tv = max_tv.max(tv);
             let pd = d.map_or(0.0, |d| want.get(&d).copied().unwrap_or(0.0));
             println!("draft {d:?} at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: total variation {tv:.3} over {} draws (p(draft) {pd:.3})", draws / 2);
         }
     }
+    ensure!(disagree == 0, "samplecheck: {disagree} draws differ from the host reference");
+    println!("every draw agrees with the host reference; max total variation of the accept-or-resample result {max_tv:.3}");
     Ok(())
 }
 
-/// Greedy decoding one token per step vs. steps that feed drafts (some right, then a wrong one): the same tokens.
+/// Greedy decoding one token per step vs. steps that feed drafts (some right, then a wrong one): the same tokens, or
+/// it fails.
 pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
     let mut m = opts.load_at(dir, 4096, 2)?;
     let prompt: Vec<u32> = (0..300).map(|i| 1000 + (i * 7919) % 5000).collect();
     // greedy tokens in `slot` with `k` drafts per step: the first `good` of them from `reference`, then wrong ones
     let run = |m: &mut dyn Engine, slot: u32, k: usize, reference: &[u32]| -> Result<Vec<u32>> {
-        let toks: Vec<Tok> = prompt.iter().enumerate().map(|(i, &id)| Tok { id, slot, pos: i as u32 }).collect();
-        m.run(&toks, &[toks.len() - 1])?;
+        m.run(&toks(&prompt, 0, prompt.len(), slot), &[prompt.len() - 1])?;
         let mut out = vec![m.argmax()?[0]];
         let mut step = 0;
         while out.len() < 120 {
@@ -721,78 +770,71 @@ pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
         Ok(out)
     };
     let reference = run(&mut *m, 0, 0, &[])?;
+    let mut wrong = Vec::new();
     for k in [1, 2, 3, 4, 7] {
         let got = run(&mut *m, 1, k, &reference)?;
         let same = got.iter().zip(&reference).take_while(|(a, b)| a == b).count();
         println!("drafts of {k}: first {same}/{} tokens as one token per step", reference.len());
+        if same != reference.len() {
+            wrong.push(k);
+        }
     }
+    ensure!(wrong.is_empty(), "speccheck: drafts of {wrong:?} give other tokens than one token per step");
+    println!("drafts of 1, 2, 3, 4 and 7 give the same {} tokens as one token per step", reference.len());
     Ok(())
 }
 
 /// The session cache under device pressure (sessions::Store): sequences a and b finish in slots, a moves to the host,
 /// c takes the device's room, a comes back while b moves out chunk by chunk (Store::swap_in), then b comes back: both
-/// continue with exactly the logits they have when they never leave a slot
+/// continue with exactly the logits they have when they never leave a slot, or it fails
 pub fn swapcheck(opts: &Opts, dir: &str) -> Result<()> {
     let len: usize = opts.get("len", 131072)?;
     ensure!(len % 64 == 0, "--len: a multiple of 64");
     let tail = 256;
     let mut m = opts.load_at(dir, len + 1024, 3)?;
-    let feed = |m: &mut Box<dyn Engine>, ids: &[u32], from: usize, to: usize, slot: u32| -> Result<Vec<f32>> {
-        for c in (from..to).step_by(64) {
-            let toks: Vec<Tok> = (c..(c + 64).min(to)).map(|i| Tok { id: ids[i], slot, pos: i as u32 }).collect();
-            m.run(&toks, &[toks.len() - 1])?;
-        }
-        m.logits()
-    };
     let seq = |k: usize| -> Vec<u32> { (0..len + tail).map(|i| 1000 + ((i * 7919 + k * 104729) % 20000) as u32).collect() };
     let (a, b, c) = (seq(1), seq(2), seq(3));
     let held = |ids: &[u32]| sessions::Held { tokens: ids[..len].to_vec(), adapter: false, dirty: false, snaps: Vec::new() };
     // each alone in a slot: its prompt, then its tail
     let mut refs = Vec::new();
     for ids in [&a, &b] {
-        feed(&mut m, ids, 0, len, 0)?;
-        refs.push(feed(&mut m, ids, len, len + tail, 0)?);
+        feed(m.as_mut(), ids, 0, len, 0)?;
+        refs.push(feed(m.as_mut(), ids, len, len + tail, 0)?);
         m.release(0)?;
     }
     let mut st = sessions::Store::new(&m, None)?;
-    feed(&mut m, &a, 0, len, 0)?;
+    feed(m.as_mut(), &a, 0, len, 0)?;
     st.put(0, held(&a));
-    feed(&mut m, &b, 0, len, 1)?;
+    feed(m.as_mut(), &b, 0, len, 1)?;
     st.put(1, held(&b));
     // a to the host, c in its slot: then the device holds b and c, and not a third
     ensure!(st.park_one(&mut m, None, true)? == Some(0), "a not moved to the host");
-    feed(&mut m, &c, 0, len, 0)?;
+    feed(m.as_mut(), &c, 0, len, 0)?;
     st.put(0, held(&c));
     let mut free = vec![2];
     let mut all = true;
     for (name, ids, r) in [("a", &a, &refs[0]), ("b", &b, &refs[1])] {
         let (slot, at, _) = st.take(&mut m, &ids[..len + tail], false, &mut free, 0)?.context("not taken")?;
         ensure!(at == len, "{name} resumes at {at}, not {len}");
-        let l = feed(&mut m, ids, len, len + tail, slot)?;
-        let d = l.iter().zip(r).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let l = feed(m.as_mut(), ids, len, len + tail, slot)?;
+        let d = max_diff(&l, r);
         println!("{name} back in slot {slot} after {len} positions: max |logit diff| {d} vs. never leaving a slot");
         all &= d == 0.0;
         m.release(slot)?;
         free.push(slot);
     }
-    println!("{}", if all { "sequences continue identically after moving between slots and host memory" } else { "MISMATCH" });
+    ensure!(all, "swapcheck: MISMATCH, the sequences do not continue identically after moving between slots and host memory");
+    println!("sequences continue identically after moving between slots and host memory");
     Ok(())
 }
 
 /// A slot saved and put into another slot continues as if it had never left: slot 0 runs a prompt in chunks of 64
 /// and then decodes; slot 1 runs its first half, is saved, then overwritten by another sequence, and the image goes
 /// into slot 2, which runs the rest and half the decode; saved again, slot 1 decodes the rest. The logits after the
-/// prompt and the tokens decoded must be identical (the same steps, the same state).
+/// prompt and the tokens decoded must be identical (the same steps, the same state), or it fails.
 pub fn cachecheck(opts: &Opts, dir: &str) -> Result<()> {
     let mut m = opts.load_at(dir, 32768, 3)?;
     let v = m.vocab();
-    let feed = |m: &mut Box<dyn Engine>, ids: &[u32], from: usize, to: usize, slot: u32| -> Result<Vec<f32>> {
-        for c in (from..to).step_by(64) {
-            let toks: Vec<Tok> = (c..(c + 64).min(to)).map(|i| Tok { id: ids[i], slot, pos: i as u32 }).collect();
-            m.run(&toks, &[toks.len() - 1])?;
-        }
-        m.logits()
-    };
     let decode = |m: &mut Box<dyn Engine>, first: u32, pos: usize, n: usize, slot: u32| -> Result<Vec<u32>> {
         let mut out = vec![first];
         for i in 0..n {
@@ -801,26 +843,25 @@ pub fn cachecheck(opts: &Opts, dir: &str) -> Result<()> {
         }
         Ok(out)
     };
-    let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0 as u32;
     let mut all = true;
     // 20,000: the second image reuses the first's whole chunk of 8,192 positions (sessions::CHUNK)
     for len in [1500usize, 4000, 20000] {
         let ids: Vec<u32> = (0..len).map(|i| 1000 + ((i * 7919) % 20000) as u32).collect();
         let cut = len / 2 / 64 * 64;
-        let la = feed(&mut m, &ids, 0, len, 0)?;
+        let la = feed(m.as_mut(), &ids, 0, len, 0)?;
         let ta = decode(&mut m, argmax(&la), len, 12, 0)?;
         m.release(0)?;
-        feed(&mut m, &ids, 0, cut, 1)?;
+        feed(m.as_mut(), &ids, 0, cut, 1)?;
         let t = std::time::Instant::now();
         let img = sessions::save_image(&mut m, 1, cut, None)?;
         let save_ms = t.elapsed().as_secs_f64() * 1e3;
         m.release(1)?;
         let junk: Vec<u32> = (0..700).map(|i| 3000 + ((i * 104729) % 30000) as u32).collect();
-        feed(&mut m, &junk, 0, junk.len(), 1)?;
+        feed(m.as_mut(), &junk, 0, junk.len(), 1)?;
         let t = std::time::Instant::now();
         ensure!(sessions::load_image(&mut m, 2, &img)?, "no device memory to load the slot");
         let load_ms = t.elapsed().as_secs_f64() * 1e3;
-        let lb = feed(&mut m, &ids, cut, len, 2)?;
+        let lb = feed(m.as_mut(), &ids, cut, len, 2)?;
         let mut tb = decode(&mut m, argmax(&lb), len, 6, 2)?;
         // saved again on top of the first image (its whole chunks reused, as the session cache does)
         let img2 = sessions::save_image(&mut m, 2, len + 6, Some(img))?;
@@ -828,33 +869,37 @@ pub fn cachecheck(opts: &Opts, dir: &str) -> Result<()> {
         ensure!(sessions::load_image(&mut m, 1, &img2)?, "no device memory to load the slot");
         tb.extend(decode(&mut m, *tb.last().unwrap(), len + 6, 6, 1)?.into_iter().skip(1));
         m.release(1)?;
-        let l2 = feed(&mut m, &ids, 0, len, 1)?;
+        let l2 = feed(m.as_mut(), &ids, 0, len, 1)?;
         m.release(1)?;
-        let base = la.iter().zip(&l2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let base = max_diff(&la, &l2);
         println!("context {len}: the same prompt again in another slot (after): max |logit diff| {base}");
-        let maxd = la.iter().zip(&lb).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let maxd = max_diff(&la, &lb);
         let same = ta.iter().zip(&tb).filter(|(a, b)| a == b).count();
         all &= maxd == 0.0 && same == ta.len();
         println!("context {len}, saved at {cut}: max |logit diff| {maxd} over {v} logits; decoded tokens identical at \
                   {same}/{}; image {:.1} MB, save {save_ms:.0} ms, load {load_ms:.0} ms", ta.len(), img2.bytes() as f64 / 1e6);
     }
-    println!("{}", if all { "slots continue identically after save and load" } else { "MISMATCH" });
+    ensure!(all, "cachecheck: MISMATCH, the slots do not continue identically after save and load");
+    println!("slots continue identically after save and load");
     Ok(())
 }
 
 /// A long sequence fed as prompt chunks (tile attention) vs. one token per step (decode attention): logits of the
-/// last 64 positions should agree up to rounding.
+/// last 64 positions should agree up to rounding: it fails when the largest |logit diff| is not below --limit (an
+/// argmax may flip where two logits nearly tie: the 4B has one at 1,500 tokens, 0.026 apart).
 pub fn longcheck(opts: &Opts, dir: &str) -> Result<()> {
+    let limit = opts.limit()?;
     let mut m = opts.load_at(dir, 8192, 2)?;
+    let (mut diffs, mut agrees) = (Vec::new(), Vec::new());
     for len in [600usize, 1500, 4000] {
         let ids: Vec<u32> = (0..len).map(|i| 1000 + ((i * 7919) % 20000) as u32).collect();
         let tail = len - 64;
         // slot 0: chunks of up to 64 tokens with all logits of the tail
         let mut a = Vec::new();
         for c in (0..len).step_by(64) {
-            let toks: Vec<Tok> = (c..(c + 64).min(len)).map(|i| Tok { id: ids[i], slot: 0, pos: i as u32 }).collect();
-            let rows: Vec<usize> = (0..toks.len()).filter(|j| c + j >= tail).collect();
-            m.run(&toks, &rows)?;
+            let step = toks(&ids, c, (c + 64).min(len), 0);
+            let rows: Vec<usize> = (0..step.len()).filter(|j| c + j >= tail).collect();
+            m.run(&step, &rows)?;
             if !rows.is_empty() { a.extend(m.logits()?); }
         }
         // slot 1: one token per step
@@ -867,12 +912,15 @@ pub fn longcheck(opts: &Opts, dir: &str) -> Result<()> {
         for r in 0..64 {
             let v = m.vocab();
             let (x, y) = (&a[r * v..(r + 1) * v], &b[r * v..(r + 1) * v]);
-            let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0;
-            agree += (am(x) == am(y)) as usize;
-            maxd = maxd.max(x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0., f32::max));
+            agree += (argmax(x) == argmax(y)) as usize;
+            maxd = worse(maxd, max_diff(x, y));
         }
         println!("context {len}: argmax agrees at {agree}/64 positions, max |logit diff| {maxd:.3}");
+        diffs.push(maxd);
+        agrees.push(format!("{agree}/64"));
     }
+    let worst = below("longcheck: max |logit diff|", diffs, limit)?;
+    println!("max |logit diff| {worst:.3} (< {limit}) at every context length, argmax agrees at {}", agrees.join(" "));
     Ok(())
 }
 
@@ -881,12 +929,14 @@ pub fn longcheck(opts: &Opts, dir: &str) -> Result<()> {
 /// then 6 decode steps of 4 tokens each (the reference's greedy tokens fed back, as accepted drafts). Four runs: both
 /// slots on the base model, both on the adapter, and the two mixed ones. Every row of a mixed run must be identical
 /// to the same row of the run with both slots on its slot's model (the other model in the step changes nothing),
-/// and the logits at the reference's positions are compared with Transformers + PEFT (adapter) or Transformers (base).
+/// and the logits at the reference's positions are compared with Transformers + PEFT (adapter) or Transformers (base):
+/// it fails when a row of a mixed run differs, or a mean |logit diff| is not below --limit.
 pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
-    let bytes = std::fs::read(reference)?;
+    let limit = opts.limit()?;
+    let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     ensure!(opts.path("adapter").is_some(), "adaptercheck: --adapter=<dir> (the reference's adapter)");
-    let mut m = opts.load_at_adapter(dir, 8192, 2)?;
+    let mut m = opts.load_at(dir, 8192, 2)?;
     let (vocab, max_tok, max_out) = (m.vocab(), m.max_tok(), m.max_out());
     // per slot: the prompt, its reference positions, and per model (base, adapter) its logits there and greedy tokens
     let prompts = [1, 2];
@@ -947,7 +997,7 @@ pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
     };
     let names = ["base", "adapter"];
     let uniform = [run(&mut m, [false, false])?, run(&mut m, [true, true])?];
-    let (mut same, mut rows, mut worst) = (0usize, 0usize, 0f32);
+    let (mut same, mut rows, mut worst, mut means) = (0usize, 0usize, 0f32, Vec::new());
     for models in [[false, true], [true, false]] {
         let got = run(&mut m, models)?;
         // per slot: the sum of |diff| over the reference's logits, values compared; argmax vs. its greedy tokens
@@ -958,10 +1008,10 @@ pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
                 let row = &lg[j * vocab..(j + 1) * vocab];
                 let (uw, ul) = &uniform[a][k];
                 let ui = uw.iter().position(|&w| w == (s, q)).context("a row missing in the uniform run")?;
-                let d = row.iter().zip(&ul[ui * vocab..(ui + 1) * vocab]).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let d = max_diff(row, &ul[ui * vocab..(ui + 1) * vocab]);
                 same += (d == 0.0) as usize;
                 rows += 1;
-                worst = worst.max(d);
+                worst = worse(worst, d);
                 let (rl, greedy) = &refs[s][a];
                 if let Some(i) = pos[s].iter().position(|&p| p as usize == q) {
                     for (x, y) in row.iter().zip(&rl[i * vocab..(i + 1) * vocab]) {
@@ -970,18 +1020,22 @@ pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
                     cnt[s] += vocab;
                 }
                 if q + 1 >= ids[s].len() && q + 1 - ids[s].len() < greedy.len() {
-                    let am = row.iter().enumerate().fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0;
-                    agree[s] += (am as u32 == greedy[q + 1 - ids[s].len()]) as usize;
+                    agree[s] += (argmax(row) == greedy[q + 1 - ids[s].len()]) as usize;
                     dec[s] += 1;
                 }
             }
         }
         for s in 0..2 {
-            println!("mixed run, slot {s} ({}, prompt {}): mean |logit diff| {:.5} vs. the reference at {} positions; \
+            let mean = sum[s] / cnt[s].max(1) as f64;
+            means.push(mean as f32);
+            println!("mixed run, slot {s} ({}, prompt {}): mean |logit diff| {mean:.5} vs. the reference at {} positions; \
                       greedy agrees with the reference's at {}/{} decode positions", names[models[s] as usize],
-                     prompts[s], sum[s] / cnt[s].max(1) as f64, cnt[s] / vocab, agree[s], dec[s]);
+                     prompts[s], cnt[s] / vocab, agree[s], dec[s]);
         }
     }
     println!("mixed steps: {same}/{rows} logit rows identical to the steps with one model (max |diff| {worst})");
+    ensure!(same == rows, "adaptercheck: only {same}/{rows} rows of the mixed steps are identical to the steps with one model");
+    let worst = below("adaptercheck: mean |logit diff|", means, limit)?;
+    println!("mixed base + adapter steps: {rows} rows identical to one-model steps, mean |logit diff| at most {worst:.5} (< {limit})");
     Ok(())
 }

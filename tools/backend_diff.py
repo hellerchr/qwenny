@@ -14,15 +14,9 @@ import argparse
 import concurrent.futures
 import difflib
 import json
-import os
 from pathlib import Path
-import socket
-import subprocess
-import sys
-import tempfile
-import time
-import urllib.error
-import urllib.request
+
+from qwenny_client import server
 
 
 def canonical(response):
@@ -33,55 +27,6 @@ def canonical(response):
         "reasoning_content": message.get("reasoning_content") or "",
         "tool_calls": message.get("tool_calls") or [],
         "finish_reason": choice.get("finish_reason"),
-    }
-
-
-def post(port, body):
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=900) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(f"HTTP {error.code}: {error.read().decode(errors='replace')}") from error
-
-
-def streamed(port, body):
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=json.dumps({**body, "stream": True}, ensure_ascii=False).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    content, reasoning, finish = [], [], None
-    tools = {}
-    with urllib.request.urlopen(req, timeout=900) as response:
-        for raw in response:
-            if not raw.startswith(b"data:"):
-                continue
-            data = raw[5:].strip()
-            if data == b"[DONE]":
-                break
-            event = json.loads(data)
-            choice = event["choices"][0]
-            delta = choice.get("delta") or {}
-            content.append(delta.get("content") or "")
-            reasoning.append(delta.get("reasoning_content") or "")
-            finish = choice.get("finish_reason") or finish
-            for part in delta.get("tool_calls") or []:
-                index = part.get("index", 0)
-                tool = tools.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                tool["id"] += part.get("id") or ""
-                function = part.get("function") or {}
-                tool["function"]["name"] += function.get("name") or ""
-                tool["function"]["arguments"] += function.get("arguments") or ""
-    return {
-        "content": "".join(content),
-        "reasoning_content": "".join(reasoning),
-        "tool_calls": [tools[i] for i in sorted(tools)],
-        "finish_reason": finish,
     }
 
 
@@ -125,29 +70,27 @@ def cases():
     ]
 
 
-def run_suite(port):
+def run_suite(client):
     results = {}
     first = None
     for name, body in cases():
-        results[name] = canonical(post(port, body))
+        results[name] = canonical(client.chat(**body))
         if name == "greedy":
             first = results[name]
         print(f"  {name}: {len(results[name]['content'].encode())} content bytes", flush=True)
 
     # Reassembled streaming bytes, independent of the number of engine steps and SSE chunks.
-    results["streaming"] = streamed(port, {
-        "messages": [{"role": "user", "content": "Give a two-paragraph answer about tides, with a short title."}],
-        "max_tokens": 72, "temperature": 0.9, "top_p": 0.95, "top_k": 20, "seed": 1618,
-    })
+    results["streaming"] = canonical(client.stream(
+        messages=[{"role": "user", "content": "Give a two-paragraph answer about tides, with a short title."}],
+        max_tokens=72, temperature=0.9, top_p=0.95, top_k=20, seed=1618))
 
     assistant = {"role": "assistant", "content": first["content"]}
     if first["reasoning_content"]:
         assistant["reasoning_content"] = first["reasoning_content"]
-    results["continuation"] = canonical(post(port, {
-        "messages": [{"role": "user", "content": "Explain in three sentences why the sky is blue."}, assistant,
-                     {"role": "user", "content": "Now give one simple analogy for a child."}],
-        "max_tokens": 64, "temperature": 0, "seed": 14,
-    }))
+    results["continuation"] = canonical(client.chat(
+        messages=[{"role": "user", "content": "Explain in three sentences why the sky is blue."}, assistant,
+                  {"role": "user", "content": "Now give one simple analogy for a child."}],
+        max_tokens=64, temperature=0, seed=14))
 
     def concurrent_body(i):
         return {
@@ -156,59 +99,10 @@ def run_suite(port):
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        replies = list(pool.map(lambda i: canonical(post(port, concurrent_body(i))), range(4)))
+        replies = list(pool.map(lambda i: canonical(client.chat(**concurrent_body(i))), range(4)))
     for i, reply in enumerate(replies):
         results[f"concurrent-{i}"] = reply
     return results
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def serve(binary, model, backend, bf16, directory, spec=0):
-    port = free_port()
-    log_path = Path(directory) / f"{backend}.log"
-    log = open(log_path, "wb")
-    command = [binary, "serve", f"--backend={backend}", f"--model={model}", "--host=127.0.0.1",
-               f"--port={port}", "--ctx=4096", "--slots=4", f"--drafts={spec}", f"--db={directory}/{backend}.db"]
-    if bf16:
-        command.append("--bf16")
-    env = os.environ.copy()
-    env.setdefault("QWENNY_CACHE_MEM", "4")
-    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
-    try:
-        deadline = time.monotonic() + 600
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise RuntimeError(f"{backend} server exited with {process.returncode}; see {log_path}")
-            try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
-                    if response.read() == b"ok":
-                        break
-            except (urllib.error.URLError, TimeoutError):
-                time.sleep(0.25)
-        else:
-            raise TimeoutError(f"{backend} server did not load in 600 seconds; see {log_path}")
-        return process, port, log, log_path
-    except Exception:
-        process.kill()
-        process.wait()
-        log.close()
-        raise
-
-
-def stop(server):
-    process, _, log, _ = server
-    process.terminate()
-    try:
-        process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    log.close()
 
 
 def encoded(value):
@@ -220,18 +114,15 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--bin", default="target/release/qwenny")
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--cache-mem", type=float, default=4, help="GiB of device memory for the slots caches")
     args = parser.parse_args()
     binary = str(Path(args.bin).resolve())
-    with tempfile.TemporaryDirectory(prefix="qwenny-backend-diff-") as directory:
-        results = {}
-        for backend in ("cuda", "mlx"):
-            print(f"== {backend}", flush=True)
-            server = serve(binary, args.model, backend, args.bf16, directory)
-            try:
-                results[backend] = run_suite(server[1])
-            finally:
-                stop(server)
-            Path(directory, f"{backend}.json").write_text(json.dumps(results[backend], ensure_ascii=False, indent=2))
+    results = {}
+    for backend in ("cuda", "mlx"):
+        print(f"== {backend}", flush=True)
+        flags = [f"--backend={backend}", "--ctx=4096", "--slots=4", "--drafts=0", f"--cache-mem={args.cache_mem}"]
+        with server(binary, args.model, *flags, *(["--bf16"] if args.bf16 else [])) as client:
+            results[backend] = run_suite(client)
 
     bad = []
     for name in results["cuda"]:

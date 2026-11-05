@@ -101,7 +101,7 @@ struct Seq {
     spec: SpecStats,
 }
 
-/// Per request, with QWENNY_SPEC_STATS set, on the server's log: tokens per step and acceptance per draft position
+/// Per request, with --stats, on the server's log: tokens per step and acceptance per draft position
 #[derive(Default)]
 struct SpecStats {
     tokens: usize,
@@ -280,7 +280,7 @@ struct Step {
 
 fn engine(m: Box<dyn Engine>, store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize, mtp: usize) {
     let free = (0..m.slots() as u32).rev().collect();
-    let mut e = Sched { m, store, chat, spec, mtp, spec_stats: std::env::var_os("QWENNY_SPEC_STATS").is_some(), free,
+    let mut e = Sched { m, store, chat, spec, mtp, spec_stats: crate::SPEC_STATS.load(std::sync::atomic::Ordering::Relaxed), free,
                         waiting: VecDeque::new(), active: Vec::new(), parked: VecDeque::new(), held: VecDeque::new(), born: 0 };
     loop {
         if e.active.is_empty() && e.waiting.is_empty() && e.parked.is_empty() && e.held.is_empty() {
@@ -1090,7 +1090,6 @@ pub struct ServeOpts {
     /// decision presets (a JSON array of {"name", "question", "options", ...})
     pub presets: Json,
     /// serve the web page (chat and decisions) and its artifacts too, not only the API
-    pub ui: bool,
     /// where the page's password and the API keys are kept (auth.rs)
     pub db: std::path::PathBuf,
     /// no --ctx: the engine is loaded at the model's native context and lowered to what one session can hold
@@ -1301,7 +1300,7 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     if let AdapterUse::Named(a) = &opts.adapter {
         names.push(a.clone());
     }
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/decisions", post(crate::decide::decisions))
         .route("/v1/decisions/presets", get(|State(app): State<Arc<App>>| async move { AxJson(app.presets.clone()) }))
@@ -1318,25 +1317,21 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
         .route("/auth/keys", post(auth_new_key))
         .route("/auth/keys/{id}", axum::routing::delete(auth_revoke))
         .route("/auth/password", post(auth_password))
-        .route("/auth/password-remove", post(auth_password_remove));
-    if opts.ui {
-        router = router
-            .route("/", get(|| async { Html(include_str!("ui.html")) }))
-            .route("/login", get(|| async { Html(include_str!("login.html")) }))
-            .route("/v1/artifacts", post(put_artifact))
-            .route("/artifacts/{id}", get(get_artifact));
-    }
+        .route("/auth/password-remove", post(auth_password_remove))
+        .route("/", get(|| async { Html(include_str!("ui.html")) }))
+        .route("/login", get(|| async { Html(include_str!("login.html")) }))
+        .route("/v1/artifacts", post(put_artifact))
+        .route("/artifacts/{id}", get(get_artifact));
     let router = router.layer(axum::middleware::from_fn_with_state(app.clone(), gate)).with_state(app);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await?;
-        println!("serving {}{} on http://{}:{} (context {max_ctx}{}{})", opts.name,
+        println!("serving {}{} on http://{}:{} (context {max_ctx}, web page at /{})", opts.name,
                  match &opts.adapter {
                      AdapterUse::None => String::new(),
                      AdapterUse::Named(a) => format!(" and its adapter {a}"),
                      AdapterUse::Always => " (adapter applied)".to_string(),
                  }, opts.host, opts.port,
-                 if opts.ui { ", web page at /" } else { "" },
                  if auth.require_key()? { ", the API requires a key" } else { "" });
         axum::serve(listener, router).await?;
         Ok::<_, anyhow::Error>(())

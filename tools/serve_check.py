@@ -2,7 +2,7 @@
 """A real server end to end, as a client sees it: starts `qwenny serve` on a model, sends requests over HTTP and checks
 the replies. Prints OK or FAIL per case and exits 1 if any failed. Standard library only.
 
-  python3 -I tools/serve_check.py --model=Qwen/Qwen3.5-4B --bin=target/release/qwenny --slots=4 --ctx=32768 --bf16
+  python3 tools/serve_check.py --model=Qwen/Qwen3.5-4B --bin=target/release/qwenny --slots=4 --ctx=32768 --bf16
 
 Greedy requests are compared with each other: streamed against not, alone against concurrent, a continued conversation
 against the same one from a cold prompt. The questions are ones any working model answers, so a wrong answer means the
@@ -12,57 +12,10 @@ output is wrong, not that the model is weak.
 import argparse
 import concurrent.futures
 import json
-import socket
-import subprocess
-import tempfile
 import time
 import urllib.error
-import urllib.request
-from pathlib import Path
 
-
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class Client:
-    def __init__(self, port):
-        self.base = f"http://127.0.0.1:{port}"
-
-    def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=30) as r:
-            return r.read().decode()
-
-    def _post(self, body):
-        data = json.dumps(body).encode()
-        headers = {"Content-Type": "application/json"}
-        return urllib.request.Request(self.base + "/v1/chat/completions", data=data, headers=headers)
-
-    def chat(self, **body):
-        with urllib.request.urlopen(self._post(body), timeout=1800) as r:
-            return json.load(r)
-
-    def stream(self, **body):
-        """The events of a streamed reply, reassembled as a reply's message and finish reason"""
-        message, finish, usage = {"content": "", "reasoning_content": ""}, None, None
-        with urllib.request.urlopen(self._post({**body, "stream": True, "stream_options": {"include_usage": True}}),
-                                    timeout=1800) as r:
-            for line in r:
-                line = line.decode().strip()
-                if not line.startswith("data: ") or line == "data: [DONE]":
-                    continue
-                event = json.loads(line[6:])
-                usage = event.get("usage") or usage
-                for choice in event["choices"]:
-                    delta = choice["delta"]
-                    message["content"] += delta.get("content") or ""
-                    message["reasoning_content"] += delta.get("reasoning_content") or ""
-                    if delta.get("tool_calls"):
-                        message["tool_calls"] = delta["tool_calls"]
-                    finish = choice.get("finish_reason") or finish
-        return {"choices": [{"message": message, "finish_reason": finish}], "usage": usage}
+from qwenny_client import server
 
 
 def user(text):
@@ -211,32 +164,15 @@ def main():
     p.add_argument("--bf16", action="store_true")
     a = p.parse_args()
 
+    cases = [thinking_answers, thinking_off_answers, low_effort_answers, stream_matches, seed_repeats, length_limit,
+             stop_string, tool_call, conversation_continues, lambda c: concurrent_matches(c, a.slots), long_prompt,
+             too_long_is_refused]
     failed = 0
-    port = free_port()
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = [a.bin, "serve", f"--model={a.model}", f"--port={port}", "--host=127.0.0.1", f"--slots={a.slots}",
-               f"--ctx={a.ctx}", "--ui", f"--db={Path(tmp) / 'auth.db'}"] + (["--bf16"] if a.bf16 else [])
-        log = open(Path(tmp) / "server.log", "w+")
-        server = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-        try:
-            c = Client(port)
-            for _ in range(900):
-                try:
-                    if c.get("/health").strip() == "ok":
-                        break
-                except OSError:
-                    pass
-                if server.poll() is not None:
-                    raise RuntimeError(f"the server exited: {server.returncode}")
-                time.sleep(1)
-            else:
-                raise RuntimeError("the server did not come up")
+    try:
+        with server(a.bin, a.model, f"--slots={a.slots}", f"--ctx={a.ctx}", *(["--bf16"] if a.bf16 else [])) as c:
             c.get("/")  # the web page
             model = json.loads(c.get("/v1/models"))["data"][0]["id"]
             print(f"OK    server up, model {model!r}", flush=True)
-            cases = [thinking_answers, thinking_off_answers, low_effort_answers, stream_matches, seed_repeats, length_limit,
-                     stop_string, tool_call, conversation_continues, lambda c: concurrent_matches(c, a.slots), long_prompt,
-                     too_long_is_refused]
             for case in cases:
                 name = getattr(case, "__name__", "?")
                 name = "concurrent_matches" if name == "<lambda>" else name
@@ -246,15 +182,10 @@ def main():
                 except Exception as e:  # a case's failure is reported; the others still run
                     failed += 1
                     print(f"FAIL  {name}: {type(e).__name__}: {str(e)[:600]}", flush=True)
-            expect(server.poll() is None, "the server died")
-        except (RuntimeError, AssertionError, OSError) as e:
-            failed += 1
-            log.seek(0)
-            print(f"FAIL  {e}\n{log.read()[-2000:]}", flush=True)
-        finally:
-            server.terminate()
-            server.wait()
-    print(f"{failed} failed" if failed else "all cases OK")
+    except (RuntimeError, OSError) as e:
+        failed += 1
+        print(f"FAIL  {e}", flush=True)
+    print(f"{failed} of {len(cases)} cases failed" if failed else f"all {len(cases)} cases OK")
     raise SystemExit(1 if failed else 0)
 
 
