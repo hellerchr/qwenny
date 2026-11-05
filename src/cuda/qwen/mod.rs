@@ -19,10 +19,10 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, PushKernelArg};
 use deltanet::DeltaNet;
 use draft::DraftHead;
 use crate::cuda::vmm::{HostMapped, Pool};
+use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
 /// Device memory left to other allocations (CUDA graphs, the driver) when the per-slot caches take the rest
 const PAGE_RESERVE: usize = 512 << 20;
-use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
 /// QWENNY_CACHE_MEM=<GiB>: device memory the slots' caches take at most (a GPU shared with other work). Unset: all
 /// that is free when the model is loaded, less PAGE_RESERVE.
@@ -177,39 +177,30 @@ impl Layer {
             max_ctx: usize, int8: bool, adapter: Lora) -> Result<Self> {
         let names = |a: &str, ns: &[&str]| ns.iter().map(|n| format!("{p}.{a}.{n}.weight")).collect::<Vec<_>>();
         let mat = |a: &str, ns: &[&str], silu: bool| Mat::stack(s, w, &names(a, ns), silu, int8);
-        let in_ba = match kind {
-            "linear_attention" => Some(mat("linear_attn", &["in_proj_b", "in_proj_a"], false)?),
-            _ => None,
-        };
-        let (mixer, in_proj, out_proj, rows) = match kind {
-            "linear_attention" => (
-                Mixer::Delta(DeltaNet::new(s, pool, w, d, &format!("{p}.linear_attn"), slots)?),
-                mat("linear_attn", &["in_proj_qkv", "in_proj_z"], false)?,
-                mat("linear_attn", &["out_proj"], false)?,
-                d.delta_in(),
-            ),
-            "full_attention" => (
-                Mixer::Attn(Attn::new(s, pool, w, &format!("{p}.self_attn"), slots, max_ctx)?),
-                mat("self_attn", &["q_proj", "k_proj", "v_proj"], false)?,
-                mat("self_attn", &["o_proj"], false)?,
-                d.attn_in(),
-            ),
+        // per kind: the mixer's tensors, its in-projection with each module's rows, DeltaNet's [in_proj_b; in_proj_a], its
+        // out-projection
+        let (lv, kv) = (d.lv_heads * LVD, NKV * HD);
+        let (a, inp, inp_rows, ba, out): (&str, &[&str], Vec<usize>, &[&str], &str) = match kind {
+            "linear_attention" => ("linear_attn", &["in_proj_qkv", "in_proj_z"], vec![d.lqkv(), lv], &["in_proj_b", "in_proj_a"], "out_proj"),
+            "full_attention" => ("self_attn", &["q_proj", "k_proj", "v_proj"], vec![d.q_rows(), kv, kv], &[], "o_proj"),
             other => bail!("{p}: unknown type {other:?}"),
         };
-        ensure!(in_proj.tiles * 16 == rows && out_proj.cols == d.mix(), "{p}: in-projection of {} rows", in_proj.tiles * 16);
+        let in_ba = if ba.is_empty() { None } else { Some(mat(a, ba, false)?) };
+        let mixer = match kind {
+            "linear_attention" => Mixer::Delta(DeltaNet::new(s, pool, w, d, &format!("{p}.{a}"), slots)?),
+            _ => Mixer::Attn(Attn::new(s, pool, w, &format!("{p}.{a}"), slots, max_ctx)?),
+        };
+        let in_proj = mat(a, inp, false)?;
+        let out_proj = mat(a, &[out], false)?;
+        ensure!(in_proj.tiles * 16 == inp_rows.iter().sum::<usize>() && out_proj.cols == d.mix(),
+                "{p}: in-projection of {} rows", in_proj.tiles * 16);
         let fl = |n: &str| -> Result<CudaSlice<f32>> { Ok(s.clone_htod(&norm(w, &format!("{p}.{n}.weight"))?)?) };
         // the adapter's A and B of the layer's products, in their row order
         let lora = match adapter {
             Some((ad, used)) => {
                 let st = |a: &str, ns: &[&str], rows: &[usize], silu: bool| lora::Stacked { names: names(a, ns), rows: rows.to_vec(), silu };
-                let (lv, kv) = (d.lv_heads, NKV * HD);
-                let (inp, ba, out) = match kind {
-                    "linear_attention" => (st("linear_attn", &["in_proj_qkv", "in_proj_z"], &[d.lqkv(), lv * LVD], false),
-                                           Some(st("linear_attn", &["in_proj_b", "in_proj_a"], &[lv, lv], false)),
-                                           st("linear_attn", &["out_proj"], &[d.h], false)),
-                    _ => (st("self_attn", &["q_proj", "k_proj", "v_proj"], &[d.q_rows(), kv, kv], false), None,
-                          st("self_attn", &["o_proj"], &[d.h], false)),
-                };
+                let ba = (!ba.is_empty()).then(|| st(a, ba, &[d.lv_heads, d.lv_heads], false));
+                let (inp, out) = (st(a, inp, &inp_rows, false), st(a, &[out], &[d.h], false));
                 let stacks: Vec<lora::Stacked> = std::iter::once(inp).chain(ba).collect();
                 let inp = lora::load(s, ad, &stacks, d.h, used)?.map(|(a, mut b)| {
                     let ba = if b.len() > 1 { b.pop().flatten() } else { None };
@@ -327,7 +318,7 @@ impl Stack {
             mid: zh(MAX_TOK * d.ff)?,
             lpart: z(core::part_len(layers.iter().filter_map(|l| l.lora.as_ref()).flat_map(|l| l.mats())).max(1))?,
             attn: attn::Scratch::new(&s, &d)?,
-            cv: z(if d.lv_heads > 0 { MAX_TOK * deltanet::cv_width(&d) } else { 1 })?,
+            cv: z(MAX_TOK * deltanet::cv_width(&d))?,
         };
         let st = Step::new(&s, &m, slots, max_ctx, VOCAB, attn::segments(d.nh / NKV))?;
         let x = Stack { mm: Gemm::load(&s, &m, d.h)?, lk: lora::Kernels::load(&m)?, scales: z(slots)?, k, st, d,
@@ -393,6 +384,14 @@ impl Stack {
     /// Layer `l`'s LoRA if the step has adapter tokens
     fn lora<'a>(&self, l: &'a Layer) -> Option<&'a lora::LayerLora> {
         l.lora.as_ref().filter(|_| self.st.lora)
+    }
+
+    /// Layer `l` on xn: the mixer and the MLP with their residuals, then xn = w_next * h / rms(h)
+    fn layer(&self, l: &Layer, w_next: &CudaSlice<f32>) -> Result<()> {
+        let sp = self.mix(l)?;
+        self.add_rmsnorm(sp, &l.post_norm)?;
+        let sp = self.mlp(l)?;
+        self.add_rmsnorm(sp, w_next)
     }
 
     /// xa = A x into `lpart`, then y += s B xa (lora.rs); returns xa's split
@@ -537,16 +536,8 @@ impl Model {
     /// none at first).
     pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>)
     -> Result<Self> {
-        Self::load_only(dir, max_ctx, slots, int8, adapter, None)
-    }
-
-    /// Like `load`, but passes `only` to `Stack::load` (`Some(i)`: load just transformer layer `i`; `None`: all the
-    /// layers). For the abliteration cross-check that a truncated forward matches the full model at a depth; the
-    /// capture subcommand loads at full depth (`None`) so one forward yields every layer's tap.
-    pub fn load_only(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>,
-                     only: Option<usize>) -> Result<Self> {
         let mut used = HashSet::new();
-        let (x, w) = Stack::load(dir, max_ctx, slots, int8, only, adapter.map(|a| (a, &mut used)))?;
+        let (x, w) = Stack::load(dir, max_ctx, slots, int8, None, adapter.map(|a| (a, &mut used)))?;
         let e = format!("{ROOT}.embed_tokens.weight");
         let head = if w.has("lm_head.weight") { "lm_head.weight".to_string() } else { e.clone() };
         let mtp = match w.has("mtp.fc.weight") {
@@ -589,8 +580,8 @@ impl Model {
         Ok(model)
     }
 
-    /// The kernels of one step over the uploaded tokens.
-    fn launch_step(&self) -> Result<()> {
+    /// The kernels of one step over the uploaded tokens; `tap` after each layer (capture_forward; a step's: nothing)
+    fn launch_step(&self, mut tap: impl FnMut() -> Result<()>) -> Result<()> {
         let x = &self.x;
         let (s, k, b, st) = (&x.s, &x.k, &x.b, &x.st);
         let (eps, nk) = (EPS, st.n_out as i32);
@@ -601,10 +592,8 @@ impl Model {
                 .launch(cfg((st.n, 1, 1), 256))?;
         }
         for (i, l) in x.layers.iter().enumerate() {
-            let sp = x.mix(l)?;
-            x.add_rmsnorm(sp, &l.post_norm)?;
-            let sp = x.mlp(l)?;
-            x.add_rmsnorm(sp, x.layers.get(i + 1).map_or(&self.final_norm, |l| &l.input_norm))?;
+            x.layer(l, x.layers.get(i + 1).map_or(&self.final_norm, |l| &l.input_norm))?;
+            tap()?;
         }
         if st.n_out > 0 {
             x.gemm(&self.lm_head, &b.xn, &st.logits, Epi::Argmax)?;
@@ -630,25 +619,14 @@ impl Model {
         self.map_step(toks)?;
         self.x.st.upload(&self.x.s, toks, &[], None)?;
         // match step(): adapter on iff a token's slot has it enabled (so the mechanistic check can capture WITH the adapter)
-        self.x.st.lora = self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]));
-        let (x, h) = (&self.x, self.x.d.h);
-        let (s, kern, b, st) = (&x.s, &x.k, &x.b, &x.st);
-        let (eps, n) = (EPS, st.n);
+        self.x.st.lora = self.uses_adapter(toks);
+        let (x, h, n) = (&self.x, self.x.d.h, self.x.st.n);
         ensure!(k >= 1 && k < n, "last={k} suffix rows of a {n}-token prompt (need 1 <= k < n, never position 0)");
-        st.mark_seen(s)?;
-        unsafe {
-            self.embed.launch(s, kern, &st.ids, &b.h, &st.keys, st.n_out as i32, st.n)?;
-            s.launch_builder(&kern.rmsnorm).arg(&b.h).arg(&x.layers[0].input_norm).arg(&b.xn).arg(&eps)
-                .launch(cfg((st.n, 1, 1), 256))?;
-        }
         let mut caps: Vec<f32> = Vec::with_capacity(x.layers.len() * k * h);
-        for (i, l) in x.layers.iter().enumerate() {
-            let sp = x.mix(l)?;
-            x.add_rmsnorm(sp, &l.post_norm)?;
-            let sp = x.mlp(l)?;
-            x.add_rmsnorm(sp, x.layers.get(i + 1).map_or(&self.final_norm, |l| &l.input_norm))?;
-            caps.extend_from_slice(&s.clone_dtoh(&b.h.slice((n - k) * h..n * h))?);
-        }
+        self.launch_step(|| {
+            caps.extend_from_slice(&x.s.clone_dtoh(&x.b.h.slice((n - k) * h..n * h))?);
+            Ok(())
+        })?;
         Ok(caps)
     }
 
@@ -672,21 +650,31 @@ impl Model {
             s.launch_builder(&k.rmsnorm).arg(&b.h).arg(&m.layer.input_norm).arg(&b.xn).arg(&eps)
                 .launch(cfg((st.n, 1, 1), 256))?;
         }
-        let l = &m.layer;
-        let sp = x.mix(l)?;
-        x.add_rmsnorm(sp, &l.post_norm)?;
-        let sp = x.mlp(l)?;
-        x.add_rmsnorm(sp, &m.norm)?;
+        x.layer(&m.layer, &m.norm)?;
         if st.n_out > 0 {
             x.gemm(m.head.as_ref().map_or(&self.lm_head, |h| &h.mat), &b.xn, &st.logits, Epi::Argmax)?;
         }
         Ok(())
     }
 
+    /// The model's layers and the MTP's
+    fn all_layers(&self) -> impl Iterator<Item = &Layer> {
+        self.x.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer))
+    }
+
+    /// The per-slot caches of all_layers
+    fn all_mixers(&mut self) -> impl Iterator<Item = &mut Mixer> {
+        self.x.mixers(self.mtp.as_mut().map(|m| &mut m.layer))
+    }
+
+    /// Whether a token of `toks` is in a slot that uses the adapter
+    fn uses_adapter(&self, toks: &[Tok]) -> bool {
+        self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]))
+    }
+
     /// Bytes of KV cache per position of a slot (keys, values and their scales, every attention layer)
     fn kv_bytes_per_token(&self) -> usize {
-        let attn = self.x.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)).filter(|l| matches!(l.mixer, Mixer::Attn(_)));
-        attn.count() * NKV * (2 * HD + 8)
+        self.all_layers().filter(|l| matches!(l.mixer, Mixer::Attn(_))).count() * NKV * (2 * HD + 8)
     }
 
     /// Map the per-slot memory a step over `toks` writes (in the MTP's layer too)
@@ -813,7 +801,7 @@ impl Engine for Model {
         let mut data = crate::sessions::host_buf(self.image_bytes(0));
         data.clear();
         let mut at = None;
-        for mx in self.x.mixers(None) {
+        for mx in self.all_mixers() {
             if let Mixer::Delta(d) = mx {
                 let p = d.save(&s, slot, &mut data)?;
                 ensure!(at.is_none_or(|a| a == p), "slot {slot}: DeltaNet layers at {at:?} and {p}");
@@ -829,7 +817,7 @@ impl Engine for Model {
     fn load_state(&mut self, slot: u32, data: &[u8], pos: usize) -> Result<bool> {
         let (s, slot) = (self.x.s.clone(), slot as usize);
         let mut o = data;
-        for mx in self.x.mixers(None) {
+        for mx in self.all_mixers() {
             if let Mixer::Delta(d) = mx {
                 let n = d.saved_bytes();
                 ensure!(o.len() >= n, "slot {slot}: a state of {} bytes", data.len());
@@ -847,12 +835,10 @@ impl Engine for Model {
 
     fn save_kv(&mut self, slot: u32, from: usize, to: usize) -> Result<Vec<u8>> {
         self.x.s.synchronize()?;
-        let mut attn: Vec<&Attn> = Vec::new();
-        for l in self.x.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
-            if let Mixer::Attn(a) = &l.mixer {
-                attn.push(a);
-            }
-        }
+        let attn: Vec<&Attn> = self.all_layers().filter_map(|l| match &l.mixer {
+            Mixer::Attn(a) => Some(a),
+            Mixer::Delta(_) => None,
+        }).collect();
         // one allocation (no copy as it would grow), each layer's part copied into it
         let n = attn.first().map_or(0, |a| a.saved_bytes(from, to));
         let mut data = crate::sessions::host_buf(attn.len() * n);
@@ -864,7 +850,7 @@ impl Engine for Model {
 
     fn load_kv(&mut self, slot: u32, from: usize, to: usize, data: &[u8]) -> Result<bool> {
         let mut o = data;
-        for mx in self.x.mixers(self.mtp.as_mut().map(|m| &mut m.layer)) {
+        for mx in self.all_mixers() {
             if let Mixer::Attn(a) = mx {
                 match a.load(slot as usize, from, to, o)? {
                     Some(n) => o = &o[n..],
@@ -877,15 +863,14 @@ impl Engine for Model {
     }
 
     fn image_bytes(&self, len: usize) -> usize {
-        let layers = self.x.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer));
-        layers.map(|l| match &l.mixer {
+        self.all_layers().map(|l| match &l.mixer {
             Mixer::Attn(a) => a.saved_bytes(0, len),
             Mixer::Delta(d) => d.saved_bytes(),
         }).sum::<usize>() + self.x.st.vocab / 8
     }
 
     fn truncate(&mut self, slot: u32, from: usize) -> Result<()> {
-        for mx in self.x.mixers(self.mtp.as_mut().map(|m| &mut m.layer)) {
+        for mx in self.all_mixers() {
             if let Mixer::Attn(a) = mx {
                 a.unmap(slot as usize, from)?;
             }
@@ -894,14 +879,14 @@ impl Engine for Model {
     }
 
     fn slot_bytes(&self, len: usize) -> usize {
-        self.x.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)).map(|l| match &l.mixer {
+        self.all_layers().map(|l| match &l.mixer {
             Mixer::Attn(a) => a.slot_bytes(len),
             Mixer::Delta(d) => d.slot_bytes(),
         }).sum::<usize>()
     }
 
     fn release(&mut self, slot: u32) -> Result<()> {
-        for mx in self.x.mixers(self.mtp.as_mut().map(|m| &mut m.layer)) {
+        for mx in self.all_mixers() {
             match mx {
                 Mixer::Attn(a) => a.unmap(slot as usize, 0)?,
                 Mixer::Delta(d) => d.unmap(slot as usize)?,
@@ -949,9 +934,9 @@ impl Engine for Model {
             }
         }
         self.x.st.upload(&self.x.s, toks, out, marks)?;
-        self.x.st.lora = self.adapter.as_ref().is_some_and(|(on, _)| toks.iter().any(|t| on[t.slot as usize]));
+        self.x.st.lora = self.uses_adapter(toks);
         let key = ((self.x.st.shape(), Attn::graph_key(&self.x.k.attn, &self.x.st), self.x.st.lora), None);
-        self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_step())
+        self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_step(|| Ok(())))
     }
 
     fn logits(&self) -> Result<Vec<f32>> {
