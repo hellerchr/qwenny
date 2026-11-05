@@ -150,6 +150,12 @@ fn resume_at(held: &Held, prompt: &[u32]) -> Option<usize> {
     held.snaps.iter().map(|p| p.0).filter(|&p| p > 0 && p <= m && prompt.len() > p).max()
 }
 
+/// Where a request chosen to resume at `at` can still resume: making room may have trimmed that saved state, then the
+/// latest one left on the prompt's prefix. None: none left, it starts over.
+fn still_resumable(held: &Held, prompt: &[u32], at: usize) -> Option<usize> {
+    if at == held.tokens.len() || held.snaps.iter().any(|p| p.0 == at) { Some(at) } else { resume_at(held, prompt) }
+}
+
 /// How `prompt` can use `held`: the position it starts at, and whether it takes `held` over or copies its prefix.
 /// The next turn (at its end) and an edited or regenerated last turn (at its latest saved state) take it over; a
 /// prompt that shares only an earlier part (another conversation with the same system prompt and tools: a state
@@ -598,6 +604,11 @@ impl Store {
         let mut e = self.entries.swap_remove(self.find(id).unwrap());
         let Place::Slot(slot, shadow) = e.at else { unreachable!() };
         let n = e.held.tokens.len();
+        let Some(at) = still_resumable(&e.held, prompt, at) else {
+            m.release(slot)?;
+            self.reclaim(slot);
+            return Ok(Some((slot, 0, Vec::new())));
+        };
         if at < n {
             let state = &e.held.snaps.iter().find(|p| p.0 == at).unwrap().1;
             ensure!(m.load_state(slot, state, at)?, "no device memory for slot {slot}'s state");
@@ -649,7 +660,8 @@ impl Store {
         let e = &mut self.entries[i];
         e.used = used;
         let snaps: Vec<(usize, Vec<u8>)> = e.held.snaps.iter().filter(|p| p.0 <= at).cloned().collect();
-        let state = &snaps.iter().find(|p| p.0 == at).expect("a saved state at the shared end").1;
+        // and making room may have trimmed the state
+        let Some((_, state)) = snaps.iter().find(|p| p.0 == at) else { return Ok(Some((s, 0, Vec::new()))) };
         let copied = match &e.at {
             Place::Slot(src, _) => {
                 let mut ok = true;
@@ -709,6 +721,17 @@ mod tests {
         assert_eq!(resume_at(&h, &[1, 2, 3, 4, 9]), Some(4));  // the latest state on the shared prefix
         assert_eq!(resume_at(&h, &[1, 2, 3, 9]), Some(2));
         assert_eq!(resume_at(&h, &[1, 2, 3, 4]), Some(2));  // a state must leave a token to read
+    }
+
+    #[test]
+    fn a_trimmed_saved_state_falls_back() {
+        let snaps = |at: &[usize]| at.iter().map(|&p| (p, vec![])).collect::<Vec<_>>();
+        let h = |at: &[usize]| Held { tokens: (1..=10).collect(), adapter: false, dirty: false, snaps: snaps(at) };
+        let edited = [1, 2, 3, 4, 5, 6, 7, 99];
+        assert_eq!(still_resumable(&h(&[3, 7]), &edited, 7), Some(7));  // still there
+        assert_eq!(still_resumable(&h(&[3]), &edited, 7), Some(3));  // trimmed: the one before it
+        assert_eq!(still_resumable(&h(&[]), &edited, 7), None);  // none left: it starts over
+        assert_eq!(still_resumable(&h(&[]), &(1..=12).collect::<Vec<_>>(), 10), Some(10));  // the end needs no state
     }
 
     #[test]

@@ -19,6 +19,22 @@ pub struct Chat {
     ends: Vec<u32>,
 }
 
+/// A float as Python's repr writes it: the shortest digits that round-trip, fixed from 1e-4 up to 1e16, else an exponent
+/// of at least two digits. Rust and serde_json write 1e-5 and 1e16 where Python writes 1e-05 and 1e+16.
+fn py_float(x: f64) -> String {
+    if !x.is_finite() {
+        return if x.is_nan() { "NaN".into() } else if x > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let sci = format!("{x:e}");
+    let (mantissa, exp) = sci.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    if (-4..16).contains(&exp) {
+        let fixed = format!("{x}");
+        return if fixed.contains('.') { fixed } else { fixed + ".0" };
+    }
+    format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+}
+
 /// JSON like Python's `json.dumps(v, ensure_ascii=False)`, which HF's `tojson` uses: ", " and ": " separators,
 /// insertion order, no HTML escaping.
 fn py_json(v: &Json, out: &mut String) {
@@ -45,6 +61,7 @@ fn py_json(v: &Json, out: &mut String) {
             }
             out.push('}');
         }
+        Json::Number(n) if n.is_f64() => out.push_str(&py_float(n.as_f64().unwrap())),
         other => out.push_str(&serde_json::to_string(other).unwrap()),
     }
 }
@@ -141,6 +158,7 @@ impl Chat {
             match v.kind() {
                 ValueKind::None => "None".into(),
                 ValueKind::Bool => if v.is_true() { "True" } else { "False" }.into(),
+                ValueKind::Number if !v.is_integer() => f64::try_from(v).map_or_else(|_| String::new(), py_float),
                 _ => v.to_string(),
             }
         });
@@ -286,7 +304,7 @@ const PARAM_START: &str = "<parameter=";
 const PARAM_END: &str = "</parameter>";
 
 /// Length of the longest suffix of `s` that is a proper prefix of `tag`.
-fn partial_tag(s: &str, tag: &str) -> usize {
+pub(crate) fn partial_tag(s: &str, tag: &str) -> usize {
     (1..tag.len().min(s.len() + 1)).rev().find(|&n| s.is_char_boundary(s.len() - n) && tag.starts_with(&s[s.len() - n..])).unwrap_or(0)
 }
 
@@ -514,12 +532,24 @@ pub mod test_models {
     pub const QWEN: &str = "Qwen/Qwen3.5-4B";
 
     pub fn dir(id: &str) -> Option<std::path::PathBuf> {
-        crate::hub::cached(id).filter(|d| d.join("chat_template.jinja").exists())
+        let d = crate::hub::cached(id).filter(|d| d.join("chat_template.jinja").exists());
+        if d.is_none() {
+            eprintln!("SKIPPED: {id} is not in the Hugging Face cache, this test checks nothing");
+        }
+        d
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn floats_as_python_writes_them() {
+        for (x, want) in [(1.0, "1.0"), (0.5, "0.5"), (1e-5, "1e-05"), (1.5e-7, "1.5e-07"), (0.0001, "0.0001"), (1e15, "1000000000000000.0"),
+                          (1e16, "1e+16"), (1.5e300, "1.5e+300"), (-2.5e-10, "-2.5e-10"), (0.0, "0.0")] {
+            assert_eq!(super::py_float(x), want);
+        }
+    }
+
     use super::*;
 
     /// Feed `text` in pieces of `n` characters; the reasoning, the content and the calls.

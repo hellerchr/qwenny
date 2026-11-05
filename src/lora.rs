@@ -186,10 +186,12 @@ impl Adapter {
     }
 
     /// Fold the adapter into weight `name` (bf16 [rows][cols], rows = len / cols) if it targets it.
-    pub fn apply(&self, name: &str, w: &mut [u16]) -> bool {
-        let Some((a, b, r)) = self.pairs.get(name) else { return false };
+    pub fn apply(&self, name: &str, w: &mut [u16]) -> Result<bool> {
+        let Some((a, b, r)) = self.pairs.get(name) else { return Ok(false) };
         let r = *r;
         let cols = a.len() / r;
+        ensure!(a.len() % r == 0 && b.len() % r == 0 && (b.len() / r) * cols == w.len(),
+                "{name}: the adapter's shape does not fit the model: is it for another one?");
         let scale = self.scale;
         let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
         let per = (w.len() / cols).div_ceil(threads) * cols;
@@ -214,7 +216,7 @@ impl Adapter {
                 });
             }
         });
-        true
+        Ok(true)
     }
 }
 
@@ -389,7 +391,7 @@ pub fn merge(base: &Path, adapter: &Path, out: &Path) -> Result<()> {
         let mut bytes = t.data().to_vec();
         if t.dtype() == Dtype::BF16 {
             let mut w: Vec<u16> = bytes.as_chunks().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
-            if ad.apply(&name, &mut w) {
+            if ad.apply(&name, &mut w)? {
                 merged += 1;
                 bytes = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             }

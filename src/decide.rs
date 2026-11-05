@@ -275,7 +275,7 @@ fn send_decision(app: &App, item: Item, asked: Asked, adapter: bool) -> Result<(
     }
     let (tx, rx) = unbounded_channel();
     let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
-    let job = Job { prompt: item.ids, params, max_tokens: 1, stop: vec![], ignore_eos: false, decide: Some(item.cands), adapter,
+    let job = Job { prompt: item.ids, params, max_tokens: 1, stop: vec![], progress: None, ignore_eos: false, decide: Some(item.cands), adapter,
                     tx };
     app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
     Ok((asked, rx))
@@ -302,7 +302,7 @@ async fn think(app: &App, prompt: Vec<u32>, budget: usize, adapter: bool) -> Res
     let (tx, mut rx) = unbounded_channel();
     let params = Params { temperature: 0.0, top_p: 1.0, top_k: 1, repetition_penalty: 1.0, presence_penalty: 0.0, seed: 1 };
     let max_tokens = budget.min(app.max_ctx.saturating_sub(prompt.len() + 64)).max(1);
-    let job = Job { prompt, params, max_tokens, stop: vec!["</think>".into()], ignore_eos: false, decide: None, adapter, tx };
+    let job = Job { prompt, params, max_tokens, stop: vec!["</think>".into()], progress: None, ignore_eos: false, decide: None, adapter, tx };
     app.jobs.send(job).map_err(|_| "engine stopped".to_string())?;
     let mut thought = String::new();
     while let Some(m) = rx.recv().await {

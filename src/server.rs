@@ -39,7 +39,20 @@ pub struct Job {
     pub decide: Option<Vec<u32>>,
     /// run with the LoRA adapter (App::model), else the base model
     pub adapter: bool,
+    /// what a request that restarts has already generated and sent; `prompt` then holds it too
+    pub progress: Option<Box<Progress>>,
     pub tx: UnboundedSender<Msg>,
+}
+
+/// The output state of a request that gave way without room for its image in host memory
+pub struct Progress {
+    generated: Vec<u32>,
+    outs: Vec<u32>,
+    text: String,
+    pending: String,
+    from: usize,
+    read: usize,
+    rng: Rng,
 }
 
 pub enum Msg {
@@ -62,6 +75,8 @@ struct Seq {
     history: Vec<u32>,
     /// decoded text sent so far
     text: String,
+    /// decoded text held back: its end may be the start of a stop string
+    pending: String,
     /// incremental decoding: `text` ends with the text of generated[from..read] (from: the start of the window
     /// before the last one sent, a character boundary; read: the tokens sent)
     from: usize,
@@ -164,10 +179,19 @@ fn chain_draft(h: &[u32], nmin: usize, k: usize) -> &[u32] {
 }
 
 impl Seq {
+    /// The reply ended without completing a stop string: the text held back is the reply's
+    fn flush(&mut self) {
+        if !self.pending.is_empty() {
+            let _ = self.job.tx.send(Msg::Text(self.pending.clone()));
+            self.text.push_str(&std::mem::take(&mut self.pending));
+        }
+    }
+
     /// Append a sampled token, send the new text, and decide whether the request is done.
     fn accept(&mut self, tok: u32, chat: &Chat, max_ctx: usize) {
         if chat.is_eos(tok) && !self.job.ignore_eos {
             self.finish = Some("stop");
+            self.flush();
             return;
         }
         self.generated.push(tok);
@@ -180,9 +204,9 @@ impl Seq {
         let (prev, cur) = (chat.decode(&self.generated[self.from..self.read]), chat.decode(&self.generated[self.from..]));
         // an incomplete UTF-8 sequence decodes to U+FFFD: wait for the next token
         if !cur.ends_with('\u{FFFD}') && cur.len() > prev.len() && cur.starts_with(&prev) {
-            let full = format!("{}{}", self.text, &cur[prev.len()..]);
+            let full = format!("{}{}{}", self.text, self.pending, &cur[prev.len()..]);
             (self.from, self.read) = (self.read, self.generated.len());
-            let mut end = full.len();
+            let (mut end, mut hold) = (full.len(), 0);
             for s in &self.job.stop {
                 // back to a character boundary: the stop string may start inside a multi-byte character
                 let mut from = self.text.len().saturating_sub(s.len());
@@ -193,6 +217,13 @@ impl Seq {
                     end = end.min(from + i);
                     self.finish = Some("stop");
                 }
+                hold = hold.max(crate::chat::partial_tag(&full[self.text.len()..], s));
+            }
+            if self.finish.is_none() {
+                end -= hold;
+                self.pending = full[end..].to_string();
+            } else {
+                self.pending.clear();
             }
             if end > self.text.len() {
                 let _ = self.job.tx.send(Msg::Text(full[self.text.len()..end].to_string()));
@@ -203,6 +234,7 @@ impl Seq {
             && (self.generated.len() >= self.job.max_tokens || self.history.len() + 1 >= max_ctx)
         {
             self.finish = Some("length");
+            self.flush();
         }
     }
 }
@@ -364,8 +396,12 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 snap_at.dedup();
                 snap_at.retain(|&p| p > at);
             }
+            let mut job = job;
             let outs = vec![0u32; if job.params.presence_penalty != 0.0 { m.vocab() / 32 } else { 0 }];
-            active.push(Seq { job, slot, fed: at, generated: Vec::new(), outs, history, text: String::new(), from: 0, read: 0,
+            let p = job.progress.take().map_or(Progress { generated: Vec::new(), outs, text: String::new(), pending: String::new(),
+                                                          from: 0, read: 0, rng }, |p| *p);
+            let Progress { generated, outs, text, pending, from, read, rng } = p;
+            active.push(Seq { job, slot, fed: at, generated, outs, history, text, pending, from, read,
                               rng, finish: None, marked: at, drafts: Vec::new(), sampled: false, chain: false, valid: at, spec: SpecStats::default(),
                               dirty: false, snaps, snap_at, born });
         }
@@ -501,6 +537,14 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                                       seq.job.prompt.len(), seq.valid);
                             let _ = m.release(seq.slot);
                             free.push(seq.slot);
+                            // it reads its history again and goes on from there: what it sent stays sent
+                            if !seq.generated.is_empty() {
+                                seq.job.prompt = std::mem::take(&mut seq.history);
+                                seq.job.progress = Some(Box::new(Progress {
+                                    generated: seq.generated, outs: seq.outs, text: seq.text, pending: seq.pending,
+                                    from: seq.from, read: seq.read, rng: seq.rng,
+                                }));
+                            }
                             held.push_back(seq.job);
                             continue;
                         }
@@ -832,7 +876,7 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
     };
     let (tx, rx) = unbounded_channel();
     Ok(Prepared {
-        job: Job { prompt, params, max_tokens, stop, ignore_eos: body.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
+        job: Job { prompt, params, max_tokens, stop, progress: None, ignore_eos: body.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
                    decide: None, adapter, tx },
         model,
         rx,
@@ -1115,7 +1159,11 @@ async fn auth_require_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap,
     if let Some(r) = need_login(&app, &h) {
         return r;
     }
-    match app.auth.set_require_key(b["on"].as_bool().unwrap_or(false)) {
+    let on = b["on"].as_bool().unwrap_or(false);
+    if on && !app.auth.has_password().unwrap_or(false) {
+        return bad_request("set a password first: without one, anyone who can open this page can make a key".into());
+    }
+    match app.auth.set_require_key(on) {
         Ok(()) => AxJson(json!({"ok": true})).into_response(),
         Err(e) => db_error(e),
     }
@@ -1421,6 +1469,18 @@ mod tests {
     }
 
     /// Qwen replies through the whole server path (prompt, parser, end tokens, response), with a scripted engine.
+    #[test]
+    fn stop_strings_never_leak() {
+        let Some(dir) = test_models::dir(test_models::QWEN) else { return };
+        let ask = |stop: &str| json!({"messages": [{"role": "user", "content": "Hi"}], "stop": [stop],
+                                      "chat_template_kwargs": {"enable_thinking": false}});
+        let content = |r: String| serde_json::from_str::<Json>(&r).unwrap()["choices"][0]["message"]["content"].clone();
+        // a stop string over several tokens: none of it reaches the client
+        assert_eq!(content(serve_once(&dir, "Hello there.\n\nUser: more", 248046, ask("\n\nUser:"))), "Hello there.");
+        // its start, without the rest: the reply's own text
+        assert_eq!(content(serve_once(&dir, "Hello there.\n\nUs", 248046, ask("\n\nUser:"))), "Hello there.\n\nUs");
+    }
+
     #[test]
     fn qwen_replies() {
         let Some(dir) = test_models::dir(test_models::QWEN) else { return };
