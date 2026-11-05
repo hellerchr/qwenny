@@ -56,6 +56,12 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+// Order-preserving map of a float to an unsigned int
+__device__ __forceinline__ unsigned ordered(float v) {
+    unsigned u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
 // Sum of the `splits` partial products [split][n][ld] at row t, column c
 __device__ __forceinline__ float part_sum(const float* p, int splits, int n, int ld, int t, int c) {
     float v = 0.f;

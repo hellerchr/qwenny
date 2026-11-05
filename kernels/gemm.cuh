@@ -68,12 +68,9 @@ __device__ __forceinline__ uint4 ld_stream(const uint4* a, unsigned long long po
 }
 
 
-// Order-preserving map of a float to an unsigned int; key = (ordered value, ~index): atomicMax picks the largest
-// logit and, among equal ones, the lowest index.
+// key = (ordered value, ~index): atomicMax picks the largest logit and, among equal ones, the lowest index.
 __device__ __forceinline__ unsigned long long argmax_key(float v, int i) {
-    uint32_t b = __float_as_uint(v);
-    b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
-    return ((unsigned long long)b << 32) | (0xffffffffu - (uint32_t)i);
+    return ((unsigned long long)ordered(v) << 32) | (0xffffffffu - (uint32_t)i);
 }
 
 // Matrix product epilogue: acc holds rows g, g + 8 of the warp's tile (c0, c1: row g, tokens 2 t4 and 2 t4 + 1 of
