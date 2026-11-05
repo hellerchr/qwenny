@@ -50,15 +50,10 @@ impl Pool {
     pub fn fill(&self) -> Result<()> {
         let mut p = self.inner.lock().unwrap();
         while p.made < p.budget {
-            let mut h = 0;
-            let r = unsafe { sys::cuMemCreate(&mut h, self.page, &prop(self.dev), 0) };
-            if r == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
-                p.budget = p.made;
-                break;
+            match self.create(&mut p)? {
+                Some(h) => p.free.push(h),
+                None => break,
             }
-            check(r, "cuMemCreate")?;
-            p.made += 1;
-            p.free.push(h);
         }
         Ok(())
     }
@@ -97,6 +92,11 @@ impl Pool {
         if p.made >= p.budget {
             return Ok(None);
         }
+        self.create(&mut p)
+    }
+
+    /// A new page; none when the device has no more, which lowers the budget to the pages made
+    fn create(&self, p: &mut Pages) -> Result<Option<CUmemGenericAllocationHandle>> {
         let mut h = 0;
         let r = unsafe { sys::cuMemCreate(&mut h, self.page, &prop(self.dev), 0) };
         if r == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {

@@ -396,9 +396,9 @@ impl Stack {
 
     /// xa = A x into `lpart`, then y += s B xa (lora.rs); returns xa's split
     fn lora_add(&self, a: &lora::LoraA, b: Option<&lora::LoraB>, x: &CudaSlice<u16>, y: &CudaSlice<f32>) -> Result<usize> {
-        let xs = a.run(&self.mm, &self.s, &self.st, x, &self.b.lpart)?;
+        let xs = self.gemm(&a.a, x, &self.b.lpart, Epi::Plain)?;
         if let Some(b) = b {
-            a.add(&self.lk, &self.s, &self.st, &self.scales, &self.b.lpart, xs, b, y)?;
+            a.add(self, xs, b, y)?;
         }
         Ok(xs)
     }
@@ -419,7 +419,7 @@ impl Stack {
             Mixer::Delta(d) => {
                 let bsp = self.gemm(l.in_ba.as_ref().context("DeltaNet layer without in_proj_b/a")?, &b.xn, &b.ba, Epi::Plain)?;
                 if let Some((a, _, Some(bb))) = inp {
-                    a.add(&self.lk, &self.s, &self.st, &self.scales, &b.lpart, xs, bb, &b.ba)?;
+                    a.add(self, xs, bb, &b.ba)?;
                 }
                 d.run(&c, sp, bsp)?
             }
@@ -441,8 +441,8 @@ impl Stack {
         match lo.and_then(|x| x.gate_up.as_ref()) {
             Some((a, bg)) => {
                 self.mm.run_split(&self.s, &self.st, &l.gate_up, &b.xn, &b.part, Epi::Plain, true)?;
-                let xs = a.run(&self.mm, &self.s, &self.st, &b.xn, &b.lpart)?;
-                a.silu(&self.lk, &self.s, &self.st, &self.scales, &b.lpart, xs, bg, &b.part, &b.mid)?;
+                let xs = self.gemm(&a.a, &b.xn, &b.lpart, Epi::Plain)?;
+                a.silu(self, xs, bg, &b.part, &b.mid)?;
             }
             None => {
                 self.gemm(&l.gate_up, &b.xn, &b.mid, Epi::Silu)?;

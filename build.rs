@@ -34,16 +34,10 @@ fn main() {
     }
     println!("cargo:rustc-cfg=has_cuda");
     println!("cargo:rerun-if-changed=kernels");
-    ptx("kernels/qwen.cu", "qwen4b.ptx", &[]);
-    ptx("kernels/qwen.cu", "qwen27b.ptx", &["-DQWEN_27B"]);
-    ptx("kernels/qwen.cu", "qwen9b.ptx", &["-DQWEN_9B"]);
-    ptx("kernels/qwen_train.cu", "qwen4b_train_bf16.ptx", &[]);
-    ptx("kernels/qwen_train.cu", "qwen4b_train_f32.ptx", &["-DACT_F32"]);
-    ptx("kernels/qwen_train.cu", "qwen4b_train_f16.ptx", &["-DACT_F16"]);
-    ptx("kernels/qwen_train.cu", "qwen27b_train_bf16.ptx", &["-DQWEN_27B"]);
-    ptx("kernels/qwen_train.cu", "qwen27b_train_f32.ptx", &["-DQWEN_27B", "-DACT_F32"]);
-    ptx("kernels/qwen_train.cu", "qwen27b_train_f16.ptx", &["-DQWEN_27B", "-DACT_F16"]);
-    ptx("kernels/qwen_train.cu", "qwen9b_train_bf16.ptx", &["-DQWEN_9B"]);
-    ptx("kernels/qwen_train.cu", "qwen9b_train_f32.ptx", &["-DQWEN_9B", "-DACT_F32"]);
-    ptx("kernels/qwen_train.cu", "qwen9b_train_f16.ptx", &["-DQWEN_9B", "-DACT_F16"]);
+    for (size, model) in [("4b", &[][..]), ("27b", &["-DQWEN_27B"]), ("9b", &["-DQWEN_9B"])] {
+        ptx("kernels/qwen.cu", &format!("qwen{size}.ptx"), model);
+        for (act, activations) in [("bf16", &[][..]), ("f32", &["-DACT_F32"]), ("f16", &["-DACT_F16"])] {
+            ptx("kernels/qwen_train.cu", &format!("qwen{size}_train_{act}.ptx"), &[model, activations].concat());
+        }
+    }
 }
