@@ -11,8 +11,9 @@ pub const DEFAULT_MODEL: &str = "Qwen/Qwen3.5-4B";
 const NEEDED: [&str; 3] = ["config.json", "tokenizer.json", "tokenizer_config.json"];
 
 /// A local model directory as given, or the directory of a Hugging Face id (`Qwen/Qwen3.5-4B`) in the cache,
-/// downloaded first when missing (every file but `assets/`, all of one commit). Either must be a model the engine runs
-/// (`engine::check_model`).
+/// downloaded first when missing (the repository's top-level files but GGUF ones, all of one commit: a model repository
+/// may also hold other variants in folders and GGUF builds, tens of GB the engine does not read). Either must be a model the engine runs
+/// (`engine::Family`).
 pub fn resolve(model: &str) -> Result<PathBuf> {
     resolve_files(model, &NEEDED, true)
 }
@@ -32,7 +33,7 @@ fn resolve_files(model: &str, needed: &[&str], target_arch: bool) -> Result<Path
     ensure!(dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists(),
             "{} has no model.safetensors(.index.json): not a model directory", dir.display());
     if target_arch {
-        crate::engine::check_model(&dir)?;
+        crate::engine::Family::of_dir(&dir)?;
     }
     Ok(dir)
 }
@@ -47,6 +48,11 @@ fn cached_files(id: &str, needed: &[&str]) -> Option<PathBuf> {
     let repo = Cache::from_env().model(id.to_string());
     let paths: Option<Vec<PathBuf>> = needed.iter().map(|f| repo.get(f)).collect();
     paths.and_then(|p| p[0].parent().map(Path::to_path_buf)).filter(|d| needed.iter().all(|f| d.join(f).exists()))
+}
+
+/// Whether the engine has a use for a repository's file: the top level, not GGUF
+fn engine_reads(file: &str) -> bool {
+    !file.contains('/') && !file.ends_with(".gguf")
 }
 
 fn download(id: &str, needed: &[&str]) -> Result<PathBuf> {
@@ -67,7 +73,7 @@ fn download(id: &str, needed: &[&str]) -> Result<PathBuf> {
     };
     // every file of one commit, so that they land in one snapshot directory
     let repo = api.repo(Repo::with_revision(id.to_string(), RepoType::Model, info.sha.clone()));
-    let files: Vec<&str> = info.siblings.iter().map(|s| s.rfilename.as_str()).filter(|f| !f.starts_with("assets/")).collect();
+    let files: Vec<&str> = info.siblings.iter().map(|s| s.rfilename.as_str()).filter(|f| engine_reads(f)).collect();
     for f in needed {
         ensure!(files.contains(&f), "{id} has no {f}: not a model this engine can load");
     }
@@ -92,5 +98,20 @@ pub fn name(dir: &Path) -> String {
     match repo.and_then(|n| n.strip_prefix("models--")) {
         Some(id) if dir.parent().and_then(Path::file_name).is_some_and(|n| n == "snapshots") => id.replacen("--", "/", 1),
         _ => dir.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::engine_reads;
+
+    #[test]
+    fn downloads_the_top_level_without_gguf() {
+        for f in ["config.json", "model-balanced.safetensors", "model.safetensors.index.json", "mtp_draft_vocab_ids.pt"] {
+            assert!(engine_reads(f), "{f}");
+        }
+        for f in ["TwIL-8B-F16-verbose.gguf", "verbose/model-verbose.safetensors", "assets/logo.png"] {
+            assert!(!engine_reads(f), "{f}");
+        }
     }
 }

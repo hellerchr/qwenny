@@ -257,7 +257,9 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
                 let src: Vec<usize> = step.iter().flat_map(|&(slot, s, c)| (s..s + c).map(move |q| if slot & DRAFT != 0 { (q * 7 + 3) % n } else { q })).collect();
                 let x: Vec<f32> = src.iter().flat_map(|&q| xn[q * h..][..h].iter().copied()).collect();
                 let got = m.run(&toks, &x)?;
-                for (i, t) in toks.iter().enumerate().filter(|(i, t)| src[*i] == t.pos as usize) {
+                // not the drafts: one whose input happens to be its own position's still follows other drafts
+                let drafts = step.iter().flat_map(|&(slot, _, c)| std::iter::repeat_n(slot & DRAFT != 0, c));
+                for ((i, t), _) in toks.iter().enumerate().zip(drafts).filter(|(_, draft)| !draft) {
                     for (g, w) in got[i * h..][..h].iter().zip(&want[t.pos as usize * h..][..h]) {
                         let d = (g - w).abs();
                         worst = worst.max(d);
@@ -354,6 +356,22 @@ fn bench_steps(opts: &Opts, m: &mut Box<dyn Engine>, n: usize) -> Result<()> {
         m.sync()?;
         let dt = t.elapsed().as_secs_f64();
         println!("steps of 1 + {k} drafts: {:.3} ms/step", dt * 1e3 / (n / 2) as f64);
+    }
+    // a round of speculative decoding with the model's draft layer: the target over the last token and its drafts, every
+    // row's logits, the drafter on the last token
+    if m.has_draft() {
+        let k = m.draft_tokens();
+        let rows: Vec<usize> = (0..=k).collect();
+        m.sync()?;
+        let t = Instant::now();
+        for _ in 0..n / 2 {
+            let toks: Vec<Tok> = (0..=k as u32).map(|j| Tok { id: 42, slot: 0, pos: p + j }).collect();
+            m.run(&toks, &rows)?;
+            let _ = m.draft(&[Tok { id: 42, slot: 0, pos: p }], &[0], &[0], k, &[])?;
+            p += 1;
+        }
+        let dt = t.elapsed().as_secs_f64();
+        println!("rounds of 1 + {k} drafts with the draft layer: {:.3} ms/round", dt * 1e3 / (n / 2) as f64);
     }
     // batched decode: one token for each of `slots` sequences per step
     for b in [4, 8, 12, 16] {
@@ -595,7 +613,7 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     // sampled drafts (the draft layer's): drawn on the GPU from its distribution q under the row's sampling, then
     // accepted with min(1, p / q) or resampled from max(0, p - q): the GPU's tokens must be the host reference's
     // (sample::sample_row_q, whose output follows p: the unit test) for the q the GPU kept, draw for draw
-    if m.has_draft() {
+    if m.has_draft() && m.samples_drafts() {
         let h = &hist[0];
         let n = h.len();
         let (mut same, mut total, mut acc) = (0, 0, 0);
@@ -650,6 +668,8 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
             println!("sampled drafts at temperature {temp} top_k {k} top_p {p} penalty {rep} presence {pres}: \
                       {same}/{total} draws agree so far ({acc} drafts accepted)");
         }
+    } else {
+        println!("no draft layer: no sampled drafts to check");
     }
     // with a draft: the accept-or-resample result must follow the same distribution as plain sampling
     m.run(&toks, &rows)?;
@@ -727,6 +747,41 @@ pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
         let got = run(&mut *m, 1, k, &reference)?;
         let same = got.iter().zip(&reference).take_while(|(a, b)| a == b).count();
         println!("drafts of {k}: first {same}/{} tokens as one token per step", reference.len());
+    }
+    Ok(())
+}
+
+/// A DFlash2 drafter (--dflash2) vs. tools/make_dflash2_reference.py: the same target tokens, teacher-forced in chunks, then the
+/// selector's seven drafts after each anchor the reference names. The target is int8 or 16-bit here, float32 there: near-ties
+/// differ, a wrong computation differs nearly everywhere.
+pub fn dflash2check(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
+    ensure!(crate::engine::drafter().is_some(), "dflash2check: give the drafter with --dflash2=<dir>");
+    let bytes = std::fs::read(reference)?;
+    let r = SafeTensors::deserialize(&bytes)?;
+    let mut m = opts.load_at(dir, 8192, 1)?;
+    let mut p = 0;
+    while r.tensor(&format!("ids_{p}")).is_ok() {
+        let ids = ints(&r, &format!("ids_{p}"))?;
+        let anchors = ints(&r, &format!("anchors_{p}"))?;
+        let path = ints(&r, &format!("path_{p}"))?;
+        let (mut first, mut all, mut total, mut at) = (0, 0, 0, 0usize);
+        m.release(0)?;
+        for (b, &a) in anchors.iter().enumerate() {
+            let a = a as usize;
+            // the target over the positions up to the anchor's predecessor; the drafter takes them in as `draft` does
+            let toks: Vec<Tok> = (at..a).map(|q| Tok { id: ids[q], slot: 0, pos: q as u32 }).collect();
+            m.run(&toks, &[])?;
+            let dt: Vec<Tok> = (at..a).map(|q| Tok { id: ids[q + 1], slot: 0, pos: q as u32 }).collect();
+            let rows: Vec<usize> = (0..dt.len()).collect();
+            let d = m.draft(&dt, &rows, &[dt.len() - 1], 7, &[])?;
+            at = a;
+            let want = &path[b * 7..(b + 1) * 7];
+            first += (d[0][0] == want[0]) as usize;
+            all += d[0].iter().zip(want).filter(|(g, w)| g == w).count();
+            total += 1;
+        }
+        println!("prompt {p}: {} tokens, {total} blocks: first draft agrees at {first}/{total}, drafts at {all}/{}", ids.len(), total * 7);
+        p += 1;
     }
     Ok(())
 }

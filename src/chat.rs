@@ -1,8 +1,10 @@
 //! Prompts from the model's own chat template, tokenization, and parsing of the model's output into reasoning,
 //! content and tool calls, with Qwen3.5's details: Python's `str()` in the template, the XML tool format of
 //! Qwen3-Coder with typed parameters, two end tokens, a think block that ends with a newline.
+use crate::engine::Family;
 use anyhow::{Context, Result, bail, ensure};
-use minijinja::{Environment, Error, ErrorKind, Value, value::Serde, value::ValueKind};
+use minijinja::value::{Kwargs, Serde, ValueKind};
+use minijinja::{Environment, Error, ErrorKind, Value, syntax::SyntaxConfig};
 use serde_json::{Map, Value as Json, json};
 use std::{collections::HashMap, fs, path::Path};
 use tokenizers::Tokenizer;
@@ -11,6 +13,7 @@ pub struct Chat {
     env: Environment<'static>,
     pub tok: Tokenizer,
     bos: Json,
+    pub family: Family,
     /// Every token that ends a reply: the tokenizer's eos token (`<|im_end|>`), `<|endoftext|>` and config.json's
     /// eos_token_id.
     ends: Vec<u32>,
@@ -113,14 +116,21 @@ impl Chat {
     pub fn load(dir: &Path) -> Result<Self> {
         let config: Json = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).context("config.json")?)
             .context("config.json")?;
-        crate::engine::check_config(&config).with_context(|| dir.display().to_string())?;
+        let family = Family::of(&config).with_context(|| dir.display().to_string())?;
         let src = fs::read_to_string(dir.join("chat_template.jinja")).context("chat_template.jinja")?;
+        // as Transformers renders templates (a line with only a tag or comment leaves nothing behind)
         let mut env = Environment::new();
+        env.set_syntax(SyntaxConfig::builder().trim_blocks(true).lstrip_blocks(true).build()?);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
-        env.add_filter("tojson", |v: Value| -> Result<Value, Error> {
+        // Transformers' tojson does not escape non-ASCII: ensure_ascii=False is what it does anyway
+        env.add_filter("tojson", |v: Value, kw: Kwargs| -> Result<Value, Error> {
+            if kw.get::<Option<bool>>("ensure_ascii")? == Some(true) {
+                return Err(Error::new(ErrorKind::InvalidOperation, "tojson: ensure_ascii=True is not supported"));
+            }
+            kw.assert_all_used()?;
             let j = serde_json::to_value(&v).map_err(|e| Error::new(ErrorKind::InvalidOperation, e.to_string()))?;
             let mut s = String::new();
             py_json(&j, &mut s);
@@ -146,11 +156,11 @@ impl Chat {
         if let Some(pad) = cfg["pad_token"].as_str() {
             ends.push(token_id(pad)?);
         }
-        let ids = &config["text_config"]["eos_token_id"];
+        let ids = &config.get("text_config").unwrap_or(&config)["eos_token_id"];
         ends.extend(ids.as_u64().into_iter().chain(ids.as_array().into_iter().flatten().filter_map(Json::as_u64)).map(|i| i as u32));
         ends.sort_unstable();
         ends.dedup();
-        Ok(Chat { env, tok, bos, ends })
+        Ok(Chat { env, tok, bos, family, ends })
     }
 
     /// The token that opens a turn of the conversation (`<|im_start|>`), if the vocabulary has it: a

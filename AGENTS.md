@@ -61,8 +61,10 @@ tools/checks.sh mlx                         # the MLX backend (builds with --fea
   `mlx` (the MLX backend: logits vs. Transformers, and vs. CUDA's on the same prompts within a bound (`check
   --write` makes CUDA's into a reference), speccheck for DeltaNet rollback; `tools/backend_diff.py`, whether CUDA and
   MLX servers reply byte for byte alike, as INFO: the backends round differently, so sampled replies can split at a
-  near-tie). `areas_of` in the script maps changed files to areas.
-- Correctness is tested on the 4B: everything but `qwen-train-27b` runs on `Qwen/Qwen3.5-4B` (bf16, int8 and
+  near-tie), `granite-infer` (TwIL-8B on int8: template and tokens, logits vs. Transformers for int8 and 16-bit,
+  layercheck, speccheck, the self-checks, and a real server over HTTP, `tools/serve_check.py`). `areas_of` in the script
+  maps changed files to areas.
+- Correctness is tested on the 4B: everything but `qwen-train-27b` and `granite-infer` runs on `Qwen/Qwen3.5-4B` (bf16, int8 and
   16-bit) and `RedHatAI/Qwen3.5-4B-quantized.w4a16` (int4), from the Hugging Face cache.
 - `QWENNY_BIN` and `QWENNY_PY` override the binary and the Python.
 - The single checks, for a quick look while working: `qwenny check <ref>`, `layercheck <ref> --layer=N`,
@@ -142,6 +144,8 @@ gpu-unlock is active (`sudo journalctl -k -b | grep gpu_unlock`, currently activ
   `BigBojangles/Swift-1.5-Qwen3.8-27b-EXL3-4.00bpw-H5`, branch `SC_4.00bpw_H5`), for the EXL3 port.
 - `/opt/qwen38/models/`: `Qwen3.8-27B-W4A16-AutoRound` (the 27B training check's model, `Q27` in checks.sh),
   `Qwen3.8-27B-W4A16-AutoRound-fast`, `Qwen3.5-4B`, `Qwen3.5-4B-w4a16`, `adapters/`.
+- `webAI-Official/TwIL-8B` (Granite, area `granite-infer`): 18 GB of disk, about 12 GB of GPU at int8; in the dev box's
+  Hugging Face cache. Check Granite changes on it: there is no smaller Granite with kernels.
 - Hugging Face cache (`/home/ubuntu/.cache/huggingface/hub`): `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-9B`,
   `RedHatAI/Qwen3.5-{4B,9B}-quantized.w4a16`, `unsloth/Qwen3.8-27B-unsloth-bnb-4bit`.
 - Learned draft-vocabulary rows: `~/.cache/qwenny/draft-heads/`.
@@ -172,8 +176,12 @@ The page is at `http://192.168.31.153:18024/`. A restart reloads the 27B and tak
 
 - `src/main.rs`: the CLI (serve, train, merge, bench and the checks) and its options.
 - `src/engine.rs`, `src/cuda/core.rs`, `src/cuda/qwen/mod.rs`: the model, one step of up to 2,048 tokens, CUDA graphs.
-- `src/cuda/qwen/{attn,deltanet,draft}.rs` + `kernels/qwen_{attn,deltanet}.cuh`: gated attention, Gated DeltaNet,
-  the MTP's draft head.
+- `src/cuda/qwen/{attn,deltanet,draft}.rs` + `kernels/attn.cuh`, `kernels/qwen_deltanet.cuh`: attention over the KV cache,
+  Gated DeltaNet, the MTP's draft head.
+- `src/cuda/qwen/dflash2.rs` + `kernels/dflash.cuh`: a DFlash2 drafter (`--dflash2`, Granite only; `engine::drafter`),
+  trained with `tools/train_dflash2.py` on `tools/make_draft_traces.py`'s replies.
+- `kernels/stack.cuh`: what every model's kernels share; `kernels/qwen.cu`, `kernels/granite.cu`: a model's defines and
+  its `attn_prep`. `Dims` in `src/cuda/qwen/mod.rs` holds what differs per model, `engine::Family` the family.
 - `kernels/gemm.cuh` (int8 / f16 tensor-core products), `kernels/marlin.cuh` (all int4, symmetric or with zero
   points; argmax epilogue), `kernels/sampling.cuh` (the sampler, sampled drafts).
 - `src/server.rs`, `src/sessions.rs` (slots, saved states, host swap), `src/chat.rs` (template, tool calls),

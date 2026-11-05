@@ -1,5 +1,5 @@
-// Compiles kernels/qwen.cu (per Qwen size) to PTX, and kernels/qwen_train.cu (per size) three times each (bf16, f32
-// and f16 activations) (compute_86: JIT-compiled by the driver on the 3090 and newer GPUs).
+// Compiles kernels/qwen.cu (per Qwen size) and kernels/granite.cu to PTX, and kernels/qwen_train.cu (per size) three
+// times each (bf16, f32 and f16 activations) (compute_86: JIT-compiled by the driver on the 3090 and newer GPUs).
 use std::{env, path::PathBuf, process::Command};
 
 fn ptx(src: &str, out: &str, defines: &[&str]) {
@@ -34,6 +34,7 @@ fn main() {
     ptx("kernels/qwen.cu", "qwen4b.ptx", &[]);
     ptx("kernels/qwen.cu", "qwen27b.ptx", &["-DQWEN_27B"]);
     ptx("kernels/qwen.cu", "qwen9b.ptx", &["-DQWEN_9B"]);
+    ptx("kernels/granite.cu", "granite8b.ptx", &[]);
     ptx("kernels/qwen_train.cu", "qwen4b_train_bf16.ptx", &[]);
     ptx("kernels/qwen_train.cu", "qwen4b_train_f32.ptx", &["-DACT_F32"]);
     ptx("kernels/qwen_train.cu", "qwen4b_train_f16.ptx", &["-DACT_F16"]);

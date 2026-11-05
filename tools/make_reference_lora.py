@@ -7,7 +7,7 @@ it and B random (PEFT's B is zero), seed 0; written to <adapter dir> in PEFT's f
 names, as `qwenny train` saves) when it is not there, else loaded from it (one adapter for several models).
 --weights: the weights of a compressed-tensors int4 / int8 checkpoint, dequantized exactly into the model
 (make_train_reference.py), e.g. RedHatAI/Qwen3.5-4B-quantized.w4a16 into Qwen/Qwen3.5-4B's architecture.
-Per prompt i (those of make_reference_qwen.py): ids_i, pos_i, and with the adapter logits_i (at pos_i), argmax_i (every
+Per prompt i (those of make_reference.py): ids_i, pos_i, and with the adapter logits_i (at pos_i), argmax_i (every
 position), gen_i (32 greedy tokens); without it the same as base_logits_i, base_argmax_i, base_gen_i."""
 import json, os, sys
 import torch

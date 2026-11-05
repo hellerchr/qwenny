@@ -4,6 +4,7 @@
 //! samples the next tokens on the GPU, accepting drafts so the output follows the model's distribution exactly. A
 //! decision request (crate::decide) is prefilled like a chat request, then reads the logits at its last position.
 use crate::chat::{Chat, OutputParser, Piece, ToolCall, split_stray_think};
+use crate::engine::Family;
 use crate::sessions::{self, Held, Image, SNAP_FROM, Store};
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{self, Params, Rng};
@@ -85,6 +86,37 @@ struct Seq {
     /// the host copy of what the slot holds below where the request resumed (sessions::Image::below)
     /// admission order (the newest request gives way when device memory runs out)
     born: u64,
+    /// what its speculative decoding did (SpecStats)
+    spec: SpecStats,
+}
+
+/// Per request, with QWENNY_SPEC_STATS set, on the server's log: tokens per step and acceptance per draft position
+#[derive(Default)]
+struct SpecStats {
+    tokens: usize,
+    steps: usize,
+    /// per draft position: drafts offered, accepted
+    offered: [usize; 16],
+    accepted: [usize; 16],
+}
+
+impl SpecStats {
+    /// A step that offered `drafts` tokens, the first `accepted` of them taken, and made `tokens` tokens
+    fn step(&mut self, drafts: usize, accepted: usize, tokens: usize) {
+        self.steps += 1;
+        self.tokens += tokens;
+        for j in 0..drafts.min(self.offered.len()) {
+            self.offered[j] += 1;
+            self.accepted[j] += (j < accepted) as usize;
+        }
+    }
+
+    fn line(&self) -> String {
+        let rates: Vec<String> = self.offered.iter().zip(&self.accepted).take_while(|(o, _)| **o > 0)
+            .map(|(o, a)| format!("{:.2}", *a as f64 / *o as f64)).collect();
+        format!("SPECSTAT tokens={} steps={} per_step={:.2} accepted=[{}]", self.tokens, self.steps,
+                self.tokens as f64 / self.steps.max(1) as f64, rates.join(" "))
+    }
 }
 
 /// N-gram chains next to a draft layer: a deterministic request (temperature 0 or top_k 1) whose last CHAIN_MIN or more
@@ -95,6 +127,12 @@ struct Seq {
 /// only (under sampling a lookup draft is accepted with p(token) and would displace the draft layer's better ones).
 const CHAIN_MIN: usize = 8;
 const CHAIN_MAX: usize = 32;
+/// N-gram chains without a draft layer (Granite): every step of every request drafts from the longest match, however
+/// short, sampled requests too (a draft is accepted with p(token), else the sampler draws from the rest: the output
+/// follows the model's distribution). A wrong draft costs next to nothing: on TwIL-8B a step of 8 tokens takes about 5 %
+/// longer than one of 1. Measured on the 5080 with tools/decode_bench.py: 88 tok/s without chains, 97 with matches of at
+/// least 8 tokens, 108 of 2, 113 of 1.
+const ONLY_CHAINS_MIN: usize = 1;
 
 /// The latest earlier occurrence of the longest suffix of `h` of `nmin` to `nmax` tokens with a token after it: the
 /// index after that occurrence (where its continuation starts)
@@ -193,6 +231,8 @@ fn use_adapter(m: &mut Box<dyn Engine>, slot: u32, adapter: bool) -> Result<()> 
 fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize) {
     // drafts per step from the model's draft layer (MTP); an n-gram chain drafts up to `spec`
     let mtp = if m.has_draft() { spec.min(m.draft_tokens()) } else { 0 };
+    let only_chains = mtp == 0 && chat.family == Family::Granite;
+    let spec_stats = std::env::var_os("QWENNY_SPEC_STATS").is_some();
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut active: Vec<Seq> = Vec::new();
     let mut free: Vec<u32> = (0..m.slots() as u32).rev().collect();
@@ -255,7 +295,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             }
         }
         while parked.is_empty() && let Some(job) = held.front() {
-            if !(active.is_empty() || room(&m, m.image_bytes(job.prompt.len()))) {
+            if !(active.is_empty() || room(&m, m.slot_bytes(job.prompt.len()))) {
                 break;
             }
             waiting.push_front(held.pop_front().unwrap());
@@ -267,7 +307,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             // swapped in from host memory); a new one starts when the device has room, idle sequences moving to
             // host memory as it holds them
             let continues = store.as_ref().is_some_and(|st| st.continues(&job.prompt, job.adapter));
-            if !(continues || active.is_empty() || room(&m, 0)) {
+            if !(continues || active.is_empty() || room(&m, m.slot_bytes(job.prompt.len()))) {
                 let keep = store.as_ref().and_then(|st| st.slot_for(&job.prompt, job.adapter));
                 match store.as_mut().map(|st| st.park_one(&mut m, keep, false)) {
                     Some(Ok(Some(slot))) => { free.push(slot); continue }
@@ -318,7 +358,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             }
             let outs = vec![0u32; if job.params.presence_penalty != 0.0 { m.vocab() / 32 } else { 0 }];
             active.push(Seq { job, slot, fed: at, generated: Vec::new(), outs, history, text: String::new(), from: 0, read: 0,
-                              rng, finish: None, marked: at, drafts: Vec::new(), sampled: false, chain: false, valid: at,
+                              rng, finish: None, marked: at, drafts: Vec::new(), sampled: false, chain: false, valid: at, spec: SpecStats::default(),
                               dirty: false, snaps, snap_at, born });
         }
         if active.is_empty() {
@@ -344,6 +384,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             if s.fed == s.job.prompt.len() {
                 let room = s.job.max_tokens.saturating_sub(s.generated.len() + 1).min(m.max_ctx().saturating_sub(s.history.len() + 1));
                 let d: Vec<u32> = if s.chain { chain_draft(&s.history, CHAIN_MIN, per_chain.min(room)).to_vec() }
+                                  else if only_chains && s.job.decide.is_none() { chain_draft(&s.history, ONLY_CHAINS_MIN, per_chain.min(room)).to_vec() }
                                   else { s.drafts.iter().take(per.min(room)).copied().collect() };
                 let pos = s.history.len() - 1;
                 segs.push((i, toks.len(), pos, d.len() + 1));
@@ -493,18 +534,26 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
         };
         // per request: accepted drafts, then the token sampled where the first draft failed (or after the last)
         let mut acc = vec![0usize; active.len()];
+        let (mut made, mut rows_of) = (vec![0usize; active.len()], vec![0usize; active.len()]);
         let mut j = 0;
         while j < want.len() {
             let i = want[j].0;
             let mut done = false;
             while j < want.len() && want[j].0 == i {
+                rows_of[i] += 1;
                 if !done && active[i].finish.is_none() && active[i].job.decide.is_none() {
                     let (tok, accepted) = next[j];
                     active[i].accept(tok, &chat, m.max_ctx());
                     done = !accepted;
                     acc[i] += accepted as usize;
+                    made[i] += 1;
                 }
                 j += 1;
+            }
+        }
+        for i in 0..active.len() {
+            if made[i] > 0 {
+                active[i].spec.step(rows_of[i] - 1, acc[i], made[i]);
             }
         }
         // what each slot holds now: a decode segment's first token and its accepted drafts, a prompt chunk; the
@@ -569,11 +618,11 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 for &i in &who {
                     let s = &mut active[i];
                     let p = &s.job.params;
-                    sampling.push(p.sampling().then(|| {
+                    sampling.push((p.sampling() && m.samples_drafts()).then(|| {
                         let u = (0..mtp).map(|_| s.rng.next_f32()).collect();
                         DraftSampling { row: p.draft_row(!s.generated.is_empty()), u }
                     }));
-                    if p.sampling() && p.presence_penalty != 0.0 && !s.generated.is_empty() {
+                    if p.sampling() && m.samples_drafts() && p.presence_penalty != 0.0 && !s.generated.is_empty() {
                         let _ = m.set_outputs(s.slot, &s.outs);
                     }
                 }
@@ -593,6 +642,9 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             let s = &active[i];
             if s.finish.is_some() || s.job.tx.is_closed() {
                 let s = active.swap_remove(i);
+                if spec_stats {
+                    eprintln!("{}", s.spec.line());
+                }
                 let keep = s.job.decide.is_none() && s.finish != Some("error") && s.valid > 0;
                 match &mut store {
                     Some(st) if keep => {
@@ -696,12 +748,16 @@ pub fn bad_request(msg: String) -> Response {
         .into_response()
 }
 
-/// Sampling parameters the request leaves out: the model card's general ones, which depend on thinking (the prompt
-/// opened a think block), with its presence penalty of 1.5 (against endless thinking: the card's advice for both
-/// modes).
-fn sampling_defaults(thinking: bool) -> Params {
-    let (temperature, top_p, top_k) = if thinking { (1.0, 0.95, 20) } else { (0.7, 0.8, 20) };
-    Params { temperature, top_p, top_k, repetition_penalty: 1.0, presence_penalty: 1.5, seed: 0 }
+/// Sampling parameters the request leaves out. Qwen: the model card's general ones, which depend on thinking (the prompt
+/// opened a think block), with its presence penalty of 1.5 (against endless thinking: the card's advice for both modes).
+/// Granite: generation_config.json's temperature and top_p of Granite 4.2 and TwIL-8B, which set nothing else.
+fn sampling_defaults(family: Family, thinking: bool) -> Params {
+    let (temperature, top_p, top_k, presence_penalty) = match (family, thinking) {
+        (Family::Qwen, true) => (1.0, 0.95, 20, 1.5),
+        (Family::Qwen, false) => (0.7, 0.8, 20, 1.5),
+        (Family::Granite, _) => (1.0, 0.95, 0, 0.0),
+    };
+    Params { temperature, top_p, top_k, repetition_penalty: 1.0, presence_penalty, seed: 0 }
 }
 
 /// A rendered, tokenized request; `thinking`: the prompt opened a think block, so output starts as reasoning.
@@ -746,7 +802,7 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
     let prompt_text = app.chat.render(messages, tools, &kwargs)?;
     let prompt = app.chat.encode(&prompt_text)?;
     let thinking = prompt_text.trim_end().ends_with("<think>");
-    let d = sampling_defaults(thinking);
+    let d = sampling_defaults(app.chat.family, thinking);
     let f = |k: &str| body.get(k).and_then(Json::as_f64);
     let params = Params {
         temperature: f("temperature").map_or(d.temperature, |t| t as f32),
@@ -1198,10 +1254,24 @@ mod tests {
 
     #[test]
     fn sampling_defaults_follow_thinking() {
-        let q = sampling_defaults;
+        let q = |thinking| sampling_defaults(Family::Qwen, thinking);
         assert!((q(true).temperature, q(true).top_p, q(true).top_k, q(true).repetition_penalty) == (1.0, 0.95, 20, 1.0));
         assert!((q(false).temperature, q(false).top_p, q(false).top_k, q(false).repetition_penalty) == (0.7, 0.8, 20, 1.0));
         assert!((q(true).presence_penalty, q(false).presence_penalty) == (1.5, 1.5));
+        for thinking in [true, false] {
+            let g = sampling_defaults(Family::Granite, thinking);
+            assert!((g.temperature, g.top_p, g.top_k, g.presence_penalty) == (1.0, 0.95, 0, 0.0));
+        }
+    }
+
+    #[test]
+    fn only_chains_draft_from_a_single_token_match() {
+        // nothing occurred before: no draft
+        assert_eq!(chain_draft(&[1, 2, 3], ONLY_CHAINS_MIN, 7), &[] as &[u32]);
+        // one token matches: what followed it, up to the end of the history
+        assert_eq!(chain_draft(&[5, 6, 7, 5], ONLY_CHAINS_MIN, 7), &[6, 7, 5]);
+        // the longest match wins over a later, shorter one
+        assert_eq!(chain_draft(&[1, 2, 9, 8, 2, 7, 1, 2], ONLY_CHAINS_MIN, 2), &[9, 8]);
     }
 
     #[test]

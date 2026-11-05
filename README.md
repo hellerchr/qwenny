@@ -1,6 +1,6 @@
 # qwenny
 
-An inference server and LoRA trainer for Qwen3.5 / Qwen3.8 models on a single NVIDIA GPU. The host code is Rust,
+An inference server and LoRA trainer for Qwen3.5 / Qwen3.8 models, and an inference server for Granite 8B, on a single NVIDIA GPU. The host code is Rust,
 the model runs in CUDA kernels compiled with `nvcc`, and the server speaks the OpenAI chat completions API. It is
 built for running the 27B model with a 250k-token context on one 24 GB GPU.
 
@@ -28,7 +28,20 @@ accepted per step. Tokens per second are counted after the first token.
 
 `model_type` qwen3_5 (three of four layers Gated DeltaNet, every fourth gated attention): Qwen3.5-4B, Qwen3.5-9B,
 Qwen3.8-27B. Weights in bf16, or pre-quantized as compressed-tensors `pack-quantized` int4 / int8 (llm-compressor,
-AutoRound, GPTQModel), symmetric or with zero points. A model without an MTP layer decodes without drafts.
+AutoRound, GPTQModel), symmetric or with zero points. A model without an MTP layer decodes without drafts unless it is
+Granite (below).
+
+`model_type` granite (attention in every layer), inference on CUDA only: Granite 4.2 8B and what is post-trained from it,
+such as `webAI-Official/TwIL-8B` (non-commercial license). A Hugging Face id fetches the top-level files, which are TwIL's
+balanced variant; for its verbose one, `hf download webAI-Official/TwIL-8B --include "verbose/*"` and `--model=<snapshot>/verbose`.
+Training, adapters, `merge`, `capture`, `bake-direction` and `--backend=mlx` refuse these models. They have no MTP layer: every
+request drafts from n-gram chains of its own prompt and reply, sampled ones too. TwIL-8B at int8 on an RTX 5080 (`tools/decode_bench.py`, 400
+tokens): 113 tok/s sampled, 117 greedy (without the chains: 88). About 10 GiB on the GPU; a slot takes at least 1.6 GiB.
+
+A DFlash2 drafter (`serve --dflash2=<dir>`) proposes seven drafts per step for these models in one pass over a block, from taps of
+the target's residual stream. `tools/make_draft_traces.py` collects the model's own replies, `tools/train_dflash2.py` trains the
+drafter on one GPU (recipe of vLLM `speculators`, architecture of z-lab's DFlash 2), `qwenny dflash2check` compares its drafts with
+PyTorch's, and `QWENNY_SPEC_STATS=1` logs tokens per step and acceptance by draft position per request.
 
 ## Requirements
 
@@ -201,9 +214,10 @@ uncommitted changes need), `all`, or one area (`qwen-infer`, `chat`, `qwen-train
 | `traincheck`, `datacheck` | PEFT's LoRA gradients and AdamW step; Unsloth's loss masks |
 | `dpocheck` | preference training: RPO loss, log-probabilities and LoRA gradients of PyTorch + PEFT (cross-checked with TRL's `DPOTrainer`), the pairs' tokens and masks |
 
-The references are made by `tools/make_reference_qwen.py`, `make_reference_mtp.py`, `make_reference_lora.py`,
+The references are made by `tools/make_reference.py`, `make_reference_mtp.py`, `make_reference_lora.py`,
 `make_train_reference.py`, `make_dpo_reference.py` and `make_tokref.py`; `make_reference_vllm.py` takes top-k log-probabilities from a vLLM server for int4 checkpoints.
-`tools/decode_bench.py` (one stream) and `tools/serve_bench.py` (1 to 16 streams) measure a running server.
+`tools/decode_bench.py` (one stream) and `tools/serve_bench.py` (1 to 16 streams) measure a running server;
+`tools/serve_check.py` starts one and checks its replies over HTTP (thinking, streaming, tools, continued conversations, concurrent requests).
 
 ## Layout
 

@@ -315,7 +315,7 @@ impl Trainer {
             .map(|w| w.rows * w.cols).sum::<usize>()).max().unwrap_or(0);
         let scr_elems = if lm_head.in_place() { widest } else { widest.max(32768 * d.h) };
         let ck_rows = tmax.div_ceil(C_CK);
-        let inv_freq: Vec<f32> = (0..attn::ROT / 2).map(|i| attn::THETA.powf(-2.0 * i as f64 / attn::ROT as f64) as f32).collect();
+        let inv_freq: Vec<f32> = (0..d.rot / 2).map(|i| attn::THETA.powf(-2.0 * i as f64 / d.rot as f64) as f32).collect();
         let t = Trainer {
             lm_head,
             scr: alloc(scr_elems * es)?,

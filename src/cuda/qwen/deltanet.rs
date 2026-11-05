@@ -10,7 +10,7 @@ use super::{CONV_K, Ctx, Dims, LK_HEADS, LKD, LVD};
 use crate::checkpoint::Checkpoint;
 use crate::cuda::core::{SPEC_TOK, cfg};
 use crate::cuda::vmm::{Pool, Region};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, PushKernelArg};
 use std::sync::Arc;
 
@@ -95,7 +95,8 @@ impl DeltaNet {
     /// Read the in-projection's partial products `b.part` [split][n][delta_in] and those of [in_proj_b; in_proj_a] `b.ba`
     /// [ba_split][n][2 lv_heads], write `b.mix` [n][mix] (`b.o`: the raw output before the gated norm).
     pub fn run(&self, c: &Ctx, split: usize, ba_split: usize) -> Result<()> {
-        let (s, st, b, k, cv) = (c.s, c.st, c.b, &c.k.delta, &c.b.cv);
+        let (s, st, b, cv) = (c.s, c.st, c.b, &c.b.cv);
+        let k = c.k.delta.as_ref().context("DeltaNet layer without the DeltaNet kernels")?;
         let (lv_heads, lqkv) = (c.d.lv_heads, c.d.lqkv());
         let (sp, n, segs, bsp) = (split as i32, st.n as i32, st.segs as i32, ba_split as i32);
         let (mem, ss) = (self.mem.ptr(), self.ss as i64);

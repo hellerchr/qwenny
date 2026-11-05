@@ -40,28 +40,54 @@ pub fn backend() -> Backend {
     *CURRENT.get_or_init(|| if cfg!(has_cuda) { Backend::Cuda } else { Backend::Mlx })
 }
 
-/// That a parsed config.json is a model this engine runs: Qwen3.5 / Qwen3.8 (`model_type` qwen3_5: Gated DeltaNet and
-/// gated attention)
-pub fn check_config(config: &serde_json::Value) -> Result<()> {
-    match config["model_type"].as_str() {
-        Some("qwen3_5") => Ok(()),
-        other => bail!("a {} model; this engine runs Qwen3.5 / Qwen3.8 (model_type qwen3_5, e.g. Qwen/Qwen3.5-4B)",
-                       other.unwrap_or("?")),
-    }
+static DRAFTER: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// A DFlash2 drafter's directory for the models this process loads (--dflash2, once, at startup)
+pub fn set_drafter(dir: std::path::PathBuf) {
+    let _ = DRAFTER.set(dir);
 }
 
-/// `check_config` of a model directory
-pub fn check_model(dir: &Path) -> Result<()> {
-    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)
-        .with_context(|| format!("{}/config.json", dir.display()))?;
-    check_config(&config).with_context(|| format!("{}", dir.display()))
+/// The drafter's directory, if one was given
+pub fn drafter() -> Option<&'static Path> {
+    DRAFTER.get().map(|p| p.as_path())
+}
+
+/// The model families this engine runs, by config.json's `model_type`
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family {
+    /// Qwen3.5 / Qwen3.8 (`qwen3_5`): Gated DeltaNet and gated attention; inference, adapters and training
+    Qwen,
+    /// Granite (`granite`, e.g. TwIL-8B): plain attention in every layer; inference on CUDA only
+    Granite,
+}
+
+impl Family {
+    /// The family of a parsed config.json
+    pub fn of(config: &serde_json::Value) -> Result<Self> {
+        match config["model_type"].as_str() {
+            Some("qwen3_5") => Ok(Family::Qwen),
+            Some("granite") => Ok(Family::Granite),
+            other => bail!("a {} model; this engine runs Qwen3.5 / Qwen3.8 (model_type qwen3_5, e.g. Qwen/Qwen3.5-4B) and \
+                            Granite (model_type granite, e.g. webAI-Official/TwIL-8B)", other.unwrap_or("?")),
+        }
+    }
+
+    /// The family of a model directory
+    pub fn of_dir(dir: &Path) -> Result<Self> {
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)
+            .with_context(|| format!("{}/config.json", dir.display()))?;
+        Self::of(&config).with_context(|| format!("{}", dir.display()))
+    }
 }
 
 /// The model in `dir` on the selected backend: `int8` weights (else 16-bit), `adapter` served unmerged for the slots
 /// that use it (Engine::set_adapter; CUDA only).
 #[allow(unused_variables)]
 pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Option<&Adapter>) -> Result<Box<dyn Engine>> {
-    check_model(dir)?;
+    let family = Family::of_dir(dir)?;
+    ensure!(adapter.is_none() || family == Family::Qwen, "LoRA adapters: Qwen models only so far");
+    ensure!(drafter().is_none() || (family == Family::Granite && backend() == Backend::Cuda),
+            "--dflash2: Granite models on CUDA only so far");
     if let Some(a) = adapter {
         a.check(&crate::checkpoint::Checkpoint::open(dir)?)?;
     }
@@ -70,6 +96,7 @@ pub fn load(dir: &Path, max_ctx: usize, slots: usize, int8: bool, adapter: Optio
         Backend::Cuda => Ok(Box::new(crate::cuda::qwen::Model::load(dir, max_ctx, slots, int8, adapter)?)),
         #[cfg(has_mlx)]
         Backend::Mlx => {
+            ensure!(family == Family::Qwen, "--backend=mlx: Qwen models only so far");
             ensure!(adapter.is_none(), "LoRA adapters: CUDA backend only so far");
             Ok(Box::new(crate::mlx::model::Model::load(dir, max_ctx, slots, int8)?))
         }
@@ -135,9 +162,14 @@ pub trait Engine {
     fn set_adapter(&mut self, _slot: u32, _on: bool) -> Result<()> {
         bail!("no adapter loaded")
     }
-    /// Whether the model has a draft layer for speculative decoding (Qwen's MTP)
+    /// Whether the model has a draft layer for speculative decoding (Qwen's MTP, a DFlash2 drafter)
     fn has_draft(&self) -> bool {
         false
+    }
+    /// Whether `draft` draws from a distribution it keeps for the sampler (MTP); else its drafts are fixed proposals,
+    /// accepted with p(token)
+    fn samples_drafts(&self) -> bool {
+        true
     }
     /// Most drafts the model's draft layer returns per step
     fn draft_tokens(&self) -> usize {

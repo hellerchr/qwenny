@@ -183,7 +183,8 @@ impl Checkpoint {
         // Qwen3.5 keeps its text model under model.language_model. (beside the vision tower and MTP): names as stored
         // (the embedding may be stored packed: HyperQwen's AutoRound keeps it int8)
         let embed = |n: &str| index.contains_key(&format!("{n}.weight")) || index.contains_key(&format!("{n}.weight_packed"));
-        let prefix = if embed("model.language_model.embed_tokens") {
+        // (a DFlash2 drafter, too: it shares the target's embedding instead of storing one)
+        let prefix = if embed("model.language_model.embed_tokens") || index.contains_key("fc.weight") {
             String::new()
         } else {
             ["", "language_model."].into_iter()
