@@ -531,7 +531,11 @@ impl Weights {
             let layer = load_layer("mtp.layers.0", Kind::Attn)?;
             let stages = Stages::of(&layer, d, true)?;
             let has_head = ck.has("mtp.draft_lm_head.weight");
-            let ids = if has_head { draft_ids(dir, d.vocab)? } else { (0..d.vocab as u32).collect() };
+            let ids = if has_head {
+                draft_ids(dir, d.vocab)?.context("mtp.draft_lm_head without its draft vocabulary")?
+            } else {
+                (0..d.vocab as u32).collect()
+            };
             Some(Mtp {
                 pre_e: norm("mtp.pre_fc_norm_embedding.weight")?,
                 pre_h: norm("mtp.pre_fc_norm_hidden.weight")?,
@@ -548,10 +552,9 @@ impl Weights {
             Some(lin(&[format!("{head_base}.weight")])?)
         } else { None };
         if let (Some(m), Some(source @ Linear::Quant { bits: 4, .. })) = (&mut mtp, &head) {
-            if dir.join("mtp_draft_vocab_ids.pt").exists() {
-                let seed = draft_ids(dir, d.vocab)?;
+            if let Some(seed) = draft_ids(dir, d.vocab)? {
                 let adaptive = Adaptive::load(dir, d.vocab, &seed)?;
-                m.ids = adaptive.rows.ids.clone();
+                m.ids = adaptive.ids().to_vec();
                 m.head = Some(source.select_rows(&m.ids)?);
                 eprintln!("MLX adaptive draft vocabulary: {} rows (up to {})", m.ids.len(), crate::draft_vocab::MAX_ROWS);
                 m.adaptive = Some(adaptive);
@@ -588,29 +591,22 @@ impl Weights {
     pub fn learn_drafts(&mut self, ids: &[u32]) -> Result<()> {
         let (Some(m), Some(source)) = (&mut self.mtp, &self.head) else { return Ok(()) };
         let Some(adaptive) = &mut m.adaptive else { return Ok(()) };
-        let before = adaptive.rows.may_change(ids).then(|| adaptive.rows.clone());
-        let old = m.ids.len();
-        let tiles = adaptive.rows.take(ids);
-        if !tiles.is_empty() {
-            let update = (|| -> MResult<Linear> {
-                // Keep the old head live until every packed-row write succeeds (no partial publication on OOM).
-                let mut head = m.head.as_ref().unwrap().clone();
-                let rows = &adaptive.rows.ids;
-                if rows.len() > old { head.append(&source.select_rows(&rows[old..])?)?; }
-                for tile in tiles.into_iter().filter(|&t| t * 16 < old) {
-                    let at = tile * 16;
-                    head.replace_tile(at as i32, &source.select_rows(&rows[at..at + 16])?)?;
-                }
-                mlx_rs::transforms::eval(head.arrays())?;
-                Ok(head)
-            })();
-            match update {
-                Ok(head) => { m.head = Some(head); m.ids = adaptive.rows.ids.clone(); adaptive.changed(); }
-                Err(e) => { adaptive.rows = before.expect("row changes have a snapshot"); return Err(e.into()); }
+        let (head, row_ids) = (&mut m.head, &mut m.ids);
+        adaptive.learn(ids, |rows, tiles| {
+            // Keep the old head live until every packed-row write succeeds (no partial publication on OOM).
+            let old = row_ids.len();
+            let mut new = head.as_ref().unwrap().clone();
+            if rows.len() > old {
+                new.append(&source.select_rows(&rows[old..])?)?;
             }
-        }
-        adaptive.maybe_save();
-        Ok(())
+            for at in tiles.iter().map(|t| t * 16).filter(|&at| at < old) {
+                new.replace_tile(at as i32, &source.select_rows(&rows[at..at + 16])?)?;
+            }
+            mlx_rs::transforms::eval(new.arrays())?;
+            *head = Some(new);
+            *row_ids = rows.to_vec();
+            Ok(())
+        })
     }
 
     pub fn counts(&self) -> (usize, usize) {

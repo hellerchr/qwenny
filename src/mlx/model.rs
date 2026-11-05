@@ -800,7 +800,7 @@ mod tests {
         let saved_ids = m.w.mtp.as_ref().unwrap().ids.clone();
         drop(m);
         let restored = crate::draft_vocab::Adaptive::load(&dir,vocab,&seed)?;
-        assert_eq!(restored.rows.ids,saved_ids,"learned vocabulary did not survive reload");
+        assert_eq!(restored.ids(),saved_ids,"learned vocabulary did not survive reload");
         println!("adaptive head: 16-row growth, packed target rows, cold replacement, hot-row retention, old q and reload OK");
         Ok(())
     }

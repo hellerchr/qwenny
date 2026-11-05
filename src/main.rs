@@ -5,7 +5,6 @@ mod checks;
 #[cfg(has_cuda)]
 mod cuda;
 mod decide;
-#[cfg(has_mlx)]
 mod draft_vocab;
 mod engine;
 mod hub;
