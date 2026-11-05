@@ -19,11 +19,12 @@ parts, the LoRA gradients, and the weights after one AdamW step (lr 2e-4, clip 1
 loss_type ["sigmoid", "sft"], loss_weights [1, alpha] (TRL's RPO) and a "ref" copy of the starting adapter computes
 the loss and gradients of each pair again; its loss is saved ("trl_loss") and both differences are printed.
 """
-import json, sys
+import json
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 from make_train_reference import TARGETS, load_model
+from refutil import cli
 
 HEADER = "<|im_start|>assistant\n"
 
@@ -162,8 +163,7 @@ def trl_check(m, tok, params, ref, pol, enc, beta, alpha, grads):
 
 
 if __name__ == "__main__":
-    opts = dict((a[2:].split("=", 1) + [""])[:2] for a in sys.argv[1:] if a.startswith("--"))
-    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    argv, opts = cli(__doc__)
     model, data, out = argv[:3]
     main(model, data, out, int(argv[3]) if len(argv) > 3 else 3, int(argv[4]) if len(argv) > 4 else 4, opts.get("weights"),
          float(opts.get("beta", 0.1)), float(opts.get("nll", 1.0)), "no-trl" not in opts)

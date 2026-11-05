@@ -4,12 +4,12 @@ Takes the prompts (ids_i) of an existing reference and asks vLLM for the top-k l
 (prompt_logprobs) and 32 greedy tokens. Per prompt i: ids_i, topk_ids_i and topk_lp_i [positions][k] (the k most
 likely next tokens after each position and their log-probabilities, rank order), argmax_i, gen_i.
 vLLM returns log-probabilities, not logits: `qwenny check` compares its own log-softmax on those tokens."""
-import json, os, sys, urllib.request
+import json, os, urllib.request
 import torch
 from safetensors.torch import load_file, save_file
+from refutil import cli
 
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
-opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--"))
+args, opts = cli(__doc__)
 ref, url, name, out = args[:4]
 top = int(opts.get("top", 20))
 r = load_file(ref)

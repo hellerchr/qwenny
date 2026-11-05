@@ -12,9 +12,10 @@
       weights are dequantized exactly into the model (<model dir> may be that checkpoint: its config is used without
       the quantization), the reference for training on it.
 """
-import json, sys
+import json
 import torch
 from safetensors.torch import save_file
+from refutil import cli
 
 # every linear layer of the language model, as Unsloth's get_peft_model (AutoModelForCausalLM loads the text model
 # alone, "model.layers.N"; the tensors are saved under the multimodal checkpoint's names, as Unsloth's adapters)
@@ -178,11 +179,10 @@ def grads_ref(model, data, out, docs, layers, weights=None):
 
 
 if __name__ == "__main__":
-    opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--"))
-    sys.argv = [a for a in sys.argv if not a.startswith("--")]
-    mode, model, data, out = sys.argv[1:5]
+    args, opts = cli(__doc__)
+    mode, model, data, out = args[:4]
     if mode == "data":
         data_ref(model, data, out)
     else:
-        grads_ref(model, data, out, int(sys.argv[5]) if len(sys.argv) > 5 else 3, int(sys.argv[6]) if len(sys.argv) > 6 else 0,
+        grads_ref(model, data, out, int(args[4]) if len(args) > 4 else 3, int(args[5]) if len(args) > 5 else 0,
                   opts.get("weights"))
