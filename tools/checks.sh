@@ -279,6 +279,7 @@ areas_of() {
         src/preference.rs|tools/make_dpo_reference.py) echo qwen-dpo ;;
         src/checkpoint.rs|build.rs|src/engine.rs|src/hub.rs) echo qwen-train qwen-dpo qwen-infer mlx ;;
         src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-dpo qwen-infer ;;
+        src/abliterate.rs) echo qwen-infer ;;
         src/mlx/*|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
         src/draft_vocab.rs) echo qwen-infer mlx ;;
         src/main.rs|tools/checks.sh) echo qwen-train qwen-dpo chat qwen-infer mlx ;;

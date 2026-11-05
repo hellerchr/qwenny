@@ -1,3 +1,5 @@
+#[cfg(has_cuda)]
+mod abliterate;
 mod auth;
 mod chat;
 mod checkpoint;
@@ -83,7 +85,9 @@ Each ends in one summary line and exits non-zero when it fails. They take --mode
                                                 + PEFT (tools/make_dpo_reference.py; --precision, --packed)
 research commands (not checks):
   qwenny capture <prompts.jsonl> <out.safetensors>   residual activations per prompt and layer (--last=K suffix rows)
-  qwenny bake-direction <direction.safetensors> <out_adapter_dir>   abliteration adapter from a direction (--alpha=1.0)";
+  qwenny bake-direction <direction.safetensors> <out_adapter_dir>   abliteration adapter from a direction (--alpha=1.0)
+  qwenny abliterate <harmful.jsonl> <harmless.jsonl> <out dir>   find the refusal direction, test each candidate layer on
+                                                held-out prompts, write the adapter that passes (--alpha=1.0)";
 
 /// --stats: log speculative decoding per request
 static SPEC_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -219,6 +223,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
         "layercheck" => (vec!["model", "layer", "limit"], bf16, 1..=1),
         "capture" => (with(&LOAD, &["last"]), bf16, 2..=2),
         "bake-direction" => (vec!["model", "alpha"], vec![], 2..=2),
+        "abliterate" => (vec!["model", "cache-mem", "alpha"], vec!["bf16"], 3..=3),
         "mtpcheck" => (with(&GPU, &[]), bf16, 1..=1),
         "adaptercheck" => (with(&GPU, &["adapter", "limit"]), bf16, 1..=1),
         "tokcheck" | "datacheck" => (vec!["model"], vec![], 2..=2),
@@ -385,6 +390,8 @@ fn main() -> Result<()> {
         #[cfg(has_cuda)]
         "capture" => checks::capture(&opts, m, a[0], a[1]),
         "bake-direction" => lora::bake_direction(&model, p(0), p(1), opts.get("alpha", 1.0f32)?),
+        #[cfg(has_cuda)]
+        "abliterate" => abliterate::run(&model, p(0), p(1), p(2), opts.get("alpha", 1.0f32)?, opts.int8),
         "mtpcheck" => checks::mtpcheck(&opts, m, a[0]),
         "adaptercheck" => checks::adaptercheck(&opts, m, a[0]),
         "tokcheck" => checks::tokcheck(m, a[0], a[1]),

@@ -338,6 +338,11 @@ pub fn bake_direction(model: &Path, dir_file: &Path, out: &Path, alpha: f32) -> 
     let st = SafeTensors::deserialize(&bytes)?;
     let (r, rshape) = floats(&st, "r")?;
     ensure!(rshape.len() == 1, "direction 'r' must be a vector, got shape {rshape:?}");
+    bake(model, &r, out, alpha)
+}
+
+/// The abliteration adapter of the unit direction `r` (bake_direction)
+pub fn bake(model: &Path, r: &[f32], out: &Path, alpha: f32) -> Result<()> {
     let ck = crate::checkpoint::Checkpoint::open(model)?;
     let writers = writers_of(&ck);
     ensure!(!writers.is_empty(), "no residual-writer matrices under model.language_model.layers.*");
@@ -345,13 +350,13 @@ pub fn bake_direction(model: &Path, dir_file: &Path, out: &Path, alpha: f32) -> 
     // The serving kernel serves LoRA ranks [8,16,32,64], so pad rank 1 -> 8 with zero rows/cols (exact same edit).
     const RANK: usize = 8;
     let mut b_bytes: Vec<u8> = Vec::with_capacity(r.len() * RANK * 4); // B = -r in col 0, zeros in cols 1..8, [rows][8]
-    for &v in &r {
+    for &v in r {
         b_bytes.extend_from_slice(&(-v).to_le_bytes());
         b_bytes.extend(std::iter::repeat_n(0u8, (RANK - 1) * 4));
     }
     let mut tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
     for base in &writers {
-        let (rows, cols, a) = writer_a(&ck, base, &r).with_context(|| format!("writer {base}"))?;
+        let (rows, cols, a) = writer_a(&ck, base, r).with_context(|| format!("writer {base}"))?;
         ensure!(rows == r.len(), "{base}: {rows} output rows != direction length {}", r.len());
         let stem = format!("base_model.model.{base}");
         let mut a_bytes: Vec<u8> = Vec::with_capacity(RANK * cols * 4); // A = rᵀW in row 0, zeros in rows 1..8, [8][cols]

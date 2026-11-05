@@ -1088,7 +1088,6 @@ pub struct ServeOpts {
     pub sessions: Option<usize>,
     /// decision presets (a JSON array of {"name", "question", "options", ...})
     pub presets: Json,
-    /// serve the web page (chat and decisions) and its artifacts too, not only the API
     /// where the page's password and the API keys are kept (auth.rs)
     pub db: std::path::PathBuf,
     /// no --ctx: the engine is loaded at the model's native context and lowered to what one session can hold
@@ -1257,10 +1256,11 @@ async fn auth_password(State(app): State<Arc<App>>, h: axum::http::HeaderMap, Ax
 /// `sessions`: the slots asked for (None: as many as fit at the whole context)
 /// `fit_ctx`: lower the engine's context to what one session can hold on the device (no --ctx given)
 fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Arc<Chat>,
-                drafts: Option<usize>, sessions: Option<usize>, fit_ctx: bool) -> Result<(UnboundedSender<Job>, usize)> {
+                drafts: Option<usize>, sessions: Option<usize>, fit_ctx: bool)
+                -> Result<(UnboundedSender<Job>, usize, std::thread::JoinHandle<()>)> {
     let (jobs, rx) = unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         // finished sequences kept for the requests that continue them (engines that can save slots)
         let ready = load().and_then(|mut m| {
             if fit_ctx && m.cache_room().is_some() {
@@ -1284,14 +1284,64 @@ fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
         }
     });
     let max_ctx = ready_rx.recv()??;
-    Ok((jobs, max_ctx))
+    Ok((jobs, max_ctx, thread))
+}
+
+/// A model answering in this process, without HTTP (qwenny abliterate): the base model is "qwenny"
+pub struct Local {
+    app: Arc<App>,
+    engine: std::thread::JoinHandle<()>,
+    db: std::path::PathBuf,
+}
+
+impl Local {
+    pub fn start(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Arc<Chat>, adapter: AdapterUse,
+                 sessions: usize) -> Result<Self> {
+        let (jobs, max_ctx, engine) = start_engine(load, chat.clone(), None, Some(sessions), false)?;
+        let db = std::env::temp_dir().join(format!("qwenny-local-{}.db", std::process::id()));
+        let app = Arc::new(App { chat, jobs, name: "qwenny".into(), max_ctx, adapter, presets: json!([]),
+                                 artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db)?) });
+        Ok(Self { app, engine, db })
+    }
+
+    /// Every request at once; the replies in order, an error if any fails
+    fn all<F: Future<Output = Response> + Send + 'static>(&self, bodies: Vec<Json>, f: impl Fn(State<Arc<App>>, AxJson<Json>) -> F) -> Result<Vec<Json>> {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        rt.block_on(async {
+            let tasks: Vec<_> = bodies.into_iter().map(|b| tokio::spawn(f(State(self.app.clone()), AxJson(b)))).collect();
+            let mut out = Vec::with_capacity(tasks.len());
+            for t in tasks {
+                let r = t.await?;
+                let status = r.status();
+                let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await?;
+                anyhow::ensure!(status.is_success(), "{status}: {}", String::from_utf8_lossy(&bytes));
+                out.push(serde_json::from_slice(&bytes)?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn chats(&self, bodies: Vec<Json>) -> Result<Vec<Json>> {
+        self.all(bodies, chat_completions)
+    }
+
+    pub fn decisions(&self, bodies: Vec<Json>) -> Result<Vec<Json>> {
+        self.all(bodies, crate::decide::decisions)
+    }
+
+    /// Free the device: the engine ends once nothing can send it requests
+    pub fn stop(self) {
+        drop(self.app);
+        let _ = self.engine.join();
+        let _ = std::fs::remove_file(self.db);
+    }
 }
 
 /// Load the model on the engine thread, then serve until the process ends.
 pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Chat, opts: ServeOpts) -> Result<()> {
     let auth = Arc::new(Auth::open(&opts.db)?);
     let chat = Arc::new(chat);
-    let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.drafts, opts.sessions, opts.fit_ctx)?;
+    let (jobs, max_ctx, _) = start_engine(load, chat.clone(), opts.drafts, opts.sessions, opts.fit_ctx)?;
     let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
                              presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
     // the base model first (the page shows the first), then the adapter
