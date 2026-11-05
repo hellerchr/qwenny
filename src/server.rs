@@ -104,7 +104,7 @@ struct Seq {
     spec: SpecStats,
 }
 
-/// Per request, with QWENNY_SPEC_STATS set, on the server's log: tokens per step and acceptance per draft position
+/// Per request, with --stats, on the server's log: tokens per step and acceptance per draft position
 #[derive(Default)]
 struct SpecStats {
     tokens: usize,
@@ -263,7 +263,7 @@ fn mtp_depth(has_draft: bool, default: usize, capacity: usize, drafts: Option<us
 fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize,
           mtp: usize) {
     // `mtp`: drafts per step from the model's draft layer; an n-gram chain drafts up to `spec`
-    let spec_stats = std::env::var_os("QWENNY_SPEC_STATS").is_some();
+    let spec_stats = crate::SPEC_STATS.load(std::sync::atomic::Ordering::Relaxed);
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut active: Vec<Seq> = Vec::new();
     let mut free: Vec<u32> = (0..m.slots() as u32).rev().collect();

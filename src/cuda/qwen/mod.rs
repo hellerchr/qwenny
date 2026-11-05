@@ -24,9 +24,13 @@ use crate::cuda::vmm::{HostMapped, Pool};
 const PAGE_RESERVE: usize = 512 << 20;
 use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
-/// QWENNY_CACHE_MEM=<GiB>: device memory the slots' caches take at most (a GPU shared with other work). Unset: all
-/// that is free when the model is loaded, less PAGE_RESERVE.
+/// --cache-mem=<GiB>: device memory the slots' caches take at most (a GPU shared with other work). Unset: all that is
+/// free when the model is loaded, less PAGE_RESERVE. (The variable QWENNY_CACHE_MEM works beside the flag during the
+/// cleanup; the coordinator removes it.)
 fn cache_mem_cap() -> Result<Option<usize>> {
+    if let Some(&gib) = crate::CACHE_MEM_GIB.get() {
+        return Ok(Some((gib * 1073741824.0) as usize));
+    }
     match std::env::var("QWENNY_CACHE_MEM") {
         Ok(v) => match v.parse::<f64>() {
             Ok(g) if g > 0.0 => Ok(Some((g * 1073741824.0) as usize)),

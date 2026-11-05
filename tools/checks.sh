@@ -38,8 +38,8 @@ make_ref() {
         $QREF/dpo-4l-w4a16.safetensors)
             echo "$PY tools/make_dpo_reference.py \$(snapshot $W4A16) $FJ $1 3 4 --weights=\$(snapshot $W4A16)" ;;
         $QREF/data-ref.safetensors) echo "$PY tools/make_train_reference.py data Qwen/Qwen3.5-4B $FJ $1" ;;
-        $QREF/reference.safetensors) echo "$PY tools/make_reference_qwen.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         # fp32 is 33 GiB: the memory limits keep it from the dev box's swap (the rest runs from disk, on the GPU layer by layer)
+        $QREF/reference.safetensors) echo "$PY tools/make_reference.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         $QREF/mtp-ref.safetensors) echo "$PY tools/make_reference_mtp.py Qwen/Qwen3.5-4B $FJ/dev.jsonl $1" ;;
         # the LoRA references share one random adapter ($LORA, written by the first one made): remake all together
         $QREF/lora-ref-w4a16.safetensors)
@@ -68,7 +68,18 @@ fail() { echo "FAIL  $*"; FAILS+=("$*"); }
 
 # --- checks ---------------------------------------------------------------------------------------------------------
 
+# run <name> <command...>: one check. It passes when the command exits 0 and its last line is the summary. Every
+# `qwenny` check takes its limit as --limit=<x>, fails with an error when its measure is not below it, and ends in one
+# summary line.
+run() {
+    local name=$1; shift
+    local out; out=$("$@" 2>&1)
+    if [ $? -eq 0 ]; then ok "$name: $(tail -1 <<<"$out")"
+    else fail "$name: $(tail -3 <<<"$out" | tr '\n' ' ' | cut -c1-500)"; fi
+}
+
 # traincheck <name> <reference> <max worst relative error> <args...>: loss, LoRA gradients, AdamW vs. PEFT fp32
+# (traincheck, dpocheck and datacheck print their numbers and do not judge them yet: their criteria are read here)
 traincheck() {
     local name=$1 ref=$2 max=$3; shift 3
     need "$ref" || return
@@ -116,62 +127,29 @@ datacheck() {
 logits() {
     local name=$1 ref=$2 max=$3; shift 3
     need "$ref" || return
-    local out; out=$($BIN check "$ref" "$@" 2>&1)
-    local worst; worst=$(grep -oP 'mean \K[0-9.]+' <<<"$out" | sort -g | tail -1)
-    if [ -n "$worst" ] && awk -v e="$worst" -v m="$max" 'BEGIN { exit !(e < m) }'; then
-        ok "check $name: mean |logit diff| at most $worst per prompt (< $max)"
-    else
-        fail "check $name: mean |logit diff| ${worst:-?} (limit $max): $(grep -E 'Error' <<<"$out" | head -1)"
-    fi
+    run "check $name" $BIN check "$ref" "$@" --limit="$max"
 }
 
 # layercheck <layer> [reference] [model] [limit]: one layer's mixer vs. Transformers (max |diff|; default the Qwen 4B, 0.05)
 layercheck() {
     local ref=${2:-$QREF/reference.safetensors} model=${3:-Qwen/Qwen3.5-4B} max=${4:-0.05}
     need "$ref" || return
-    local out; out=$($BIN layercheck "$ref" --model="$model" --layer="$1" 2>&1)
-    local worst; worst=$(grep -oP 'max \|diff\| \K[0-9.]+' <<<"$out" | sort -g | tail -1)
-    if [ -n "$worst" ] && awk -v e="$worst" -v m="$max" 'BEGIN { exit !(e < m) }'; then
-        ok "layercheck $1: max |diff| $worst (< $max)"
-    else
-        fail "layercheck $1: max |diff| ${worst:-?}: $(grep Error <<<"$out" | head -1)"
-    fi
+    run "layercheck $1" $BIN layercheck "$ref" --model="$model" --layer="$1" --limit="$max"
 }
 
 # chatcheck <tokref> <args...>: chat template and tokenizer vs. Transformers, every case identical
-chatcheck() {
-    local out; out=$($BIN chatcheck "$1" "${@:2}" 2>&1)
-    local line; line=$(grep -E 'cases identical' <<<"$out")
-    if [[ $line =~ ^([0-9]+)/([0-9]+) ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
-        ok "chatcheck $1: $line"
-    else
-        fail "chatcheck $1: ${line:-$(tail -1 <<<"$out")}"
-    fi
-}
+chatcheck() { run "chatcheck $1" $BIN chatcheck "$1" "${@:2}"; }
 
 # tokcheck [reference] [model]: prompt tokens identical to Transformers' (the reference's first two prompts; default the
 # Qwen 4B)
 tokcheck() {
     local ref=${1:-$QREF/reference.safetensors} model=${2:-Qwen/Qwen3.5-4B}
     need "$ref" || return
-    local out; out=$($BIN tokcheck "$ref" "$FJ/dev.jsonl" --model="$model" 2>&1)
-    if grep -q identical <<<"$out" && ! grep -qE 'DIFFERENT|Error' <<<"$out"; then
-        ok "tokcheck: $(grep -c identical <<<"$out") prompts identical"
-    else
-        fail "tokcheck: $(grep -E 'DIFFERENT|Error' <<<"$out" | head -2)"
-    fi
+    run tokcheck $BIN tokcheck "$ref" "$FJ/dev.jsonl" --model="$model"
 }
 
 # speccheck <options>: drafts (the model's draft layer) give the tokens of one token per step
-speccheck() {
-    local out
-    out=$($BIN speccheck "$@" 2>&1)
-    if grep -q 'tokens as one token per step' <<<"$out" && ! grep -qP 'first (\d+)/(?!\1 )\d+ tokens' <<<"$out"; then
-        ok "speccheck $*: drafts give the same tokens as one token per step"
-    else
-        fail "speccheck $*: $(grep -E 'first|Error' <<<"$out" | head -2 | tr '\n' ' ')"
-    fi
-}
+speccheck() { run "speccheck $*" $BIN speccheck "$@"; }
 
 # backend_logits <name> <max mean |diff| per prompt> [chunk] <args...>: MLX's logits vs. CUDA's on the reference prompts
 # (CUDA writes them as a reference: qwenny check --write); the two backends' kernels sum in different orders, so this is a
@@ -204,27 +182,14 @@ backend_diff() {
 }
 
 # samplecheck <options>: the sampler draw for draw against its host reference (no files)
-samplecheck() {
-    local out; out=$($BIN samplecheck "$@" 2>&1)
-    if grep -q 'draws agree' <<<"$out" && grep -qE '^(sampled drafts|no draft layer)' <<<"$out" && ! grep -qP '(?<!\d)(\d+)/(?!\1 )\d+ draws agree' <<<"$out" && ! grep -q Error <<<"$out"; then
-        ok "samplecheck $*: every draw agrees ($(grep -oP 'total variation \K[0-9.]+' <<<"$out" | sort -g | tail -1 | sed 's/^/max total variation of drafts /'))"
-    else
-        fail "samplecheck $*: $(grep -E 'Error' <<<"$out" | head -1) $(grep -P '(?<!\d)(\d+)/(?!\1 )\d+ draws agree' <<<"$out" | head -1)"
-    fi
-}
+samplecheck() { run "samplecheck $*" $BIN samplecheck "$@"; }
 
 # longcheck <limit> <options>: long contexts at every position, decode steps vs. prompt chunks: the logits of the last 64
 # positions agree up to rounding (an argmax may flip where two logits nearly tie: the 4B has one at 1,500 tokens, 0.026
 # apart)
 longcheck() {
     local max=$1; shift
-    local out; out=$($BIN longcheck "$@" 2>&1)
-    local worst; worst=$(grep -oP 'max \|logit diff\| \K[0-9.]+' <<<"$out" | sort -g | tail -1)
-    if [ "$(grep -c 'argmax agrees' <<<"$out")" = 3 ] && awk -v e="$worst" -v m="$max" 'BEGIN { exit !(e < m) }'; then
-        ok "longcheck $*: max |logit diff| $worst (< $max) at every context length, argmax $(grep -oP 'agrees at \K\d+/64' <<<"$out" | tr '\n' ' ')"
-    else
-        fail "longcheck $*: $(grep -E 'agrees|Error' <<<"$out" | tr '\n' ' ')"
-    fi
+    run "longcheck $*" $BIN longcheck "$@" --limit="$max"
 }
 
 # adaptercheck <reference> <max mean |diff|> <args...>: a LoRA served unmerged and its base model in the same steps:
@@ -232,38 +197,11 @@ longcheck() {
 adaptercheck() {
     local ref=$1 max=$2; shift 2
     need "$ref" || return
-    local out; out=$($BIN adaptercheck "$ref" "$@" 2>&1)
-    local worst; worst=$(grep -oP 'mean \|logit diff\| \K[0-9.]+' <<<"$out" | sort -g | tail -1)
-    local line; line=$(grep -oP 'mixed steps: \K\d+/\d+' <<<"$out")
-    if [[ $line =~ ^([0-9]+)/([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ] && [ -n "$worst" ] \
-        && awk -v e="$worst" -v m="$max" 'BEGIN { exit !(e < m) }'; then
-        ok "adaptercheck $*: mixed base + adapter steps: $line rows identical to one-model steps, mean |logit diff| at most $worst (< $max)"
-    else
-        fail "adaptercheck $*: rows identical ${line:-?}, mean |logit diff| ${worst:-?} (limit $max): $(grep -E 'Error' <<<"$out" | head -1)"
-    fi
-}
-
-# sessions <command> <pass line> <args...>: a slot saved, loaded or moved to host memory continues with the logits
-# and tokens it has when it never leaves its slot (cachecheck, swapcheck)
-sessions() {
-    local cmd=$1 want=$2; shift 2
-    local out; out=$($BIN "$cmd" "$@" 2>&1)
-    if grep -qF "$want" <<<"$out"; then
-        ok "$cmd $*: $want"
-    else
-        fail "$cmd $*: $(grep -E 'MISMATCH|Error|diff' <<<"$out" | head -2 | tr '\n' ' ')"
-    fi
+    run "adaptercheck $*" $BIN adaptercheck "$ref" "$@" --limit="$max"
 }
 
 # serve <args...>: a real server answering over HTTP (tools/serve_check.py), every case OK
-serve() {
-    local out; out=$(python3 -I tools/serve_check.py --bin="$BIN" "$@" 2>&1)
-    if grep -q '^all cases OK' <<<"$out"; then
-        ok "serve $*: $(grep -c '^OK' <<<"$out") cases"
-    else
-        fail "serve $*: $(grep -E '^FAIL' <<<"$out" | cut -c1-300 | head -3 | tr '\n' ' ')"
-    fi
-}
+serve() { run "serve $*" python3 tools/serve_check.py --bin="$BIN" "$@"; }
 
 # --- areas ----------------------------------------------------------------------------------------------------------
 
@@ -303,8 +241,8 @@ area() {
             speccheck --model=Qwen/Qwen3.5-4B
             samplecheck --model=Qwen/Qwen3.5-4B
             longcheck 0.1 --bf16 --model=Qwen/Qwen3.5-4B
-            sessions cachecheck "slots continue identically after save and load" --model=Qwen/Qwen3.5-4B
-            sessions swapcheck "sequences continue identically" --model=Qwen/Qwen3.5-4B --len=32768
+            run cachecheck $BIN cachecheck --model=Qwen/Qwen3.5-4B
+            run swapcheck $BIN swapcheck --model=Qwen/Qwen3.5-4B --len=32768
             serve --model=Qwen/Qwen3.5-4B --slots=4 --ctx=32768 --bf16
             if need "$QREF/mtp-ref.safetensors"; then   # no pass criterion yet: its result, to compare by eye
                 echo "INFO  mtpcheck: $($BIN mtpcheck "$QREF/mtp-ref.safetensors" --model=Qwen/Qwen3.5-4B 2>&1 | tail -1)"
@@ -341,7 +279,9 @@ areas_of() {
         src/preference.rs|tools/make_dpo_reference.py) echo qwen-dpo ;;
         src/checkpoint.rs|build.rs|src/engine.rs|src/hub.rs) echo qwen-train qwen-dpo qwen-infer mlx ;;
         src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-dpo qwen-infer ;;
-        src/mlx/*|src/draft_vocab.rs|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
+        src/mlx/*|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
+        src/draft_vocab.rs) echo qwen-infer mlx ;;
+        src/main.rs|tools/checks.sh) echo qwen-train qwen-dpo chat qwen-infer mlx ;;
         src/chat.rs) echo chat qwen-train qwen-dpo ;;
         kernels/*|src/cuda/*) echo qwen-infer ;;
         src/sample.rs|src/sessions.rs|src/checks.rs|src/server.rs) echo qwen-infer mlx ;;
@@ -353,6 +293,7 @@ areas_of() {
 args=()
 for a in "$@"; do
     case $a in
+        -h|--help|help) sed -n 2,10p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --make) MAKE=1 ;;
         all) args+=(qwen-train qwen-dpo chat qwen-infer) ;;
         changed)
@@ -372,9 +313,13 @@ done
 # the MLX backend needs its cargo feature (MLX's CUDA build, long the first time); the binary keeps the CUDA backend
 features=(); [[ " ${args[*]} " == *" mlx "* ]] && features=(--features mlx)
 cargo build --release "${features[@]}" 2>&1 | grep -E '^error' -A5 && { echo "FAIL  the build"; exit 1; }
-# the unit tests (CPU, seconds) with every run
-tests=$(cargo test --release "${features[@]}" 2>&1 | grep -E '^test result')
-if [ -n "$tests" ] && ! grep -qv '^test result: ok' <<<"$tests"; then ok "cargo test: $(grep -oP "\d+(?= passed)" <<<"$tests" | awk "{ s += \$1 } END { print s }") passed"
+# the unit tests (CPU, seconds) with every run; a test whose model is not in the Hugging Face cache prints SKIPPED and
+# returns early: that is a FAIL, not a pass
+output=$(cargo test --release "${features[@]}" -- --nocapture 2>&1)
+tests=$(grep -E '^test result' <<<"$output")
+skipped=$(grep -oE 'SKIPPED: .*' <<<"$output" | sort -u)
+if [ -n "$skipped" ]; then fail "cargo test: tests checked nothing: $(tr '\n' ' ' <<<"$skipped")"
+elif [ -n "$tests" ] && ! grep -qv '^test result: ok' <<<"$tests"; then ok "cargo test: $(grep -oP "\d+(?= passed)" <<<"$tests" | awk "{ s += \$1 } END { print s }") passed"
 else fail "cargo test: ${tests:-does not build}"; fi
 for a in "${args[@]}"; do area "$a"; done
 echo
