@@ -274,7 +274,7 @@ const WRITER_SUBMODULES: &[&str] = &["linear_attn.out_proj", "self_attn.o_proj",
 /// The residual-writer matrices of the model, found structurally from the checkpoint (never a hardcoded layer count):
 /// scan `model.language_model.layers.{i}` while it exists and take whichever `WRITER_SUBMODULES` are present. The base
 /// weight names without `.weight`.
-fn writers_of(ck: &crate::checkpoint::Checkpoint) -> Vec<String> {
+fn writers_of(ck: &crate::checkpoint::Checkpoint) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     for i in 0.. {
         let layer = format!("model.language_model.layers.{i}");
@@ -284,7 +284,7 @@ fn writers_of(ck: &crate::checkpoint::Checkpoint) -> Vec<String> {
         for sub in WRITER_SUBMODULES {
             let base = format!("{layer}.{sub}");
             if ck.is_quant(&base) || ck.has(&format!("{base}.weight")) {
-                out.push(base);
+                out.push((i, base));
             }
         }
     }
@@ -341,39 +341,37 @@ pub fn bake_direction(model: &Path, dir_file: &Path, out: &Path, alpha: f32) -> 
     let st = SafeTensors::deserialize(&bytes)?;
     let (r, rshape) = floats(&st, "r")?;
     ensure!(rshape.len() == 1, "direction 'r' must be a vector, got shape {rshape:?}");
-    bake(model, &r, out, alpha)
+    bake(model, &|_| Some(&r[..]), out, alpha)
 }
 
-/// The abliteration adapter of the unit direction `r` (bake_direction)
-pub fn bake(model: &Path, r: &[f32], out: &Path, alpha: f32) -> Result<()> {
+/// The abliteration adapter that removes, from what each layer writes to the residual stream, that layer's unit
+/// direction `r(layer)` (None: the layer is left alone)
+pub fn bake<'a>(model: &Path, r: &dyn Fn(usize) -> Option<&'a [f32]>, out: &Path, alpha: f32) -> Result<()> {
     let ck = crate::checkpoint::Checkpoint::open(model)?;
-    let writers = writers_of(&ck);
-    ensure!(!writers.is_empty(), "no residual-writer matrices under model.language_model.layers.*");
-
     // The serving kernel serves LoRA ranks [8,16,32,64], so pad rank 1 -> 8 with zero rows/cols (exact same edit).
     const RANK: usize = 8;
-    let mut b_bytes: Vec<u8> = Vec::with_capacity(r.len() * RANK * 4); // B = -r in col 0, zeros in cols 1..8, [rows][8]
-    for &v in r {
-        b_bytes.extend_from_slice(&(-v).to_le_bytes());
-        b_bytes.extend(std::iter::repeat_n(0u8, (RANK - 1) * 4));
-    }
     let mut tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
-    for base in &writers {
-        let (rows, cols, a) = writer_a(&ck, base, r).with_context(|| format!("writer {base}"))?;
+    for (layer, base) in writers_of(&ck) {
+        let Some(r) = r(layer) else { continue };
+        let (rows, cols, a) = writer_a(&ck, &base, r).with_context(|| format!("writer {base}"))?;
         ensure!(rows == r.len(), "{base}: {rows} output rows != direction length {}", r.len());
         let stem = format!("base_model.model.{base}");
         let mut a_bytes: Vec<u8> = Vec::with_capacity(RANK * cols * 4); // A = rᵀW in row 0, zeros in rows 1..8, [8][cols]
         a_bytes.extend(a.iter().flat_map(|x| x.to_le_bytes()));
         a_bytes.extend(std::iter::repeat_n(0u8, (RANK - 1) * cols * 4));
+        let mut b_bytes: Vec<u8> = Vec::with_capacity(rows * RANK * 4); // B = -r in col 0, zeros in cols 1..8, [rows][8]
+        for &v in r {
+            b_bytes.extend_from_slice(&(-v).to_le_bytes());
+            b_bytes.extend(std::iter::repeat_n(0u8, (RANK - 1) * 4));
+        }
         tensors.push((format!("{stem}.lora_A.weight"), Dtype::F32, vec![RANK, cols], a_bytes));
-        tensors.push((format!("{stem}.lora_B.weight"), Dtype::F32, vec![rows, RANK], b_bytes.clone()));
+        tensors.push((format!("{stem}.lora_B.weight"), Dtype::F32, vec![rows, RANK], b_bytes));
     }
-
+    ensure!(!tensors.is_empty(), "no residual-writer matrices to edit under model.language_model.layers.*");
     fs::create_dir_all(out)?;
     save_tensors(&out.join("adapter_model.safetensors"), tensors.iter().map(|(n, d, s, b)| (n.clone(), *d, s.clone(), &b[..])))?;
     write_config(out, &crate::hub::name(model), RANK, alpha * RANK as f32, 0.0, tensors.iter().map(|t| t.0.as_str()))?;
-    println!("baked {} residual-writer matrices (hidden {}, rank {RANK}, alpha {alpha}) into {}", writers.len(), r.len(),
-             out.display());
+    println!("baked {} residual-writer matrices (rank {RANK}, alpha {alpha}) into {}", tensors.len() / 2, out.display());
     Ok(())
 }
 
