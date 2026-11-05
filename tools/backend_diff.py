@@ -173,7 +173,7 @@ def serve(binary, model, backend, bf16, directory, spec=0):
     log_path = Path(directory) / f"{backend}.log"
     log = open(log_path, "wb")
     command = [binary, "serve", f"--backend={backend}", f"--model={model}", "--host=127.0.0.1",
-               f"--port={port}", "--ctx=4096", "--slots=4", f"--spec={spec}", f"--db={directory}/{backend}.db"]
+               f"--port={port}", "--ctx=4096", "--slots=4", f"--drafts={spec}", f"--db={directory}/{backend}.db"]
     if bf16:
         command.append("--bf16")
     env = os.environ.copy()

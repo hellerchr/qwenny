@@ -21,10 +21,13 @@ fn ptx(src: &str, out: &str, defines: &[&str]) {
 fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
     // backends: CUDA when its feature is on (never on macOS), MLX always on macOS and with the `mlx` feature
-    println!("cargo::rustc-check-cfg=cfg(has_cuda, has_mlx)");
+    println!("cargo::rustc-check-cfg=cfg(has_cuda, has_mlx, has_metal)");
     let macos = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
     if env::var_os("CARGO_FEATURE_MLX").is_some() || macos {
         println!("cargo:rustc-cfg=has_mlx");
+    }
+    if macos {
+        println!("cargo:rustc-cfg=has_metal");
     }
     if env::var_os("CARGO_FEATURE_CUDA").is_none() || macos {
         return;

@@ -132,9 +132,10 @@ pub trait Engine {
     /// Vocabulary size: the length of a logits row
     fn vocab(&self) -> usize;
     /// Run one step; afterwards the logits of the tokens at `out` (indices into `toks`) are available. `marks`: per
-    /// segment of the step, tokens to add to its slot's repetition-penalty set.
+    /// segment of the step, the tokens committed since the last step, for its slot's repetition-penalty set and the
+    /// draft vocabulary (None: the step's own tokens).
     fn step(&mut self, toks: &[Tok], out: &[usize], marks: Option<&[Vec<u32>]>) -> Result<()>;
-    /// `step` without repetition-penalty marks
+    /// `step` with every token of the step committed
     fn run(&mut self, toks: &[Tok], out: &[usize]) -> Result<()> {
         self.step(toks, out, None)
     }
@@ -151,6 +152,9 @@ pub trait Engine {
     fn set_outputs(&mut self, _slot: u32, _words: &[u32]) -> Result<()> {
         bail!("presence penalty: not supported by this backend")
     }
+    /// Compile/prime common decode shapes before the server advertises readiness. No-op for backends that
+    /// do not need this; it must not learn tokens or leave a user sequence in a slot.
+    fn warmup(&mut self, _draft_depth: usize) -> Result<()> { Ok(()) }
     /// Wait for the device (timing)
     fn sync(&self) -> Result<()>;
     /// Whether a LoRA adapter is loaded (served unmerged beside the base model: set_adapter)
@@ -171,9 +175,13 @@ pub trait Engine {
     fn samples_drafts(&self) -> bool {
         true
     }
-    /// Most drafts the model's draft layer returns per step
+    /// Drafts per step from the model's draft layer, unless --mtp-drafts asks for another depth
     fn draft_tokens(&self) -> usize {
         4
+    }
+    /// Most drafts the model's draft layer can return per step
+    fn draft_capacity(&self) -> usize {
+        self.draft_tokens()
     }
     /// Speculative decoding with the draft layer, after a step: `toks` are the tokens that followed the step's tokens
     /// at `rows` (indices into the step's tokens), each at the position of its row's token (the draft layer's cache

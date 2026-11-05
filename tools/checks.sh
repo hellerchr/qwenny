@@ -354,6 +354,11 @@ area() {
             backend_logits "Qwen3.5-4B int4, chunks of 64" 0.035 64 --model=$W4A16
             # DeltaNet rollback: restarts inside a step replay from the checkpoint
             speccheck --model=Qwen/Qwen3.5-4B --backend=mlx
+            # MTP on MLX: its drafts and rollback, sampled drafts, then the Metal code's Rust side (it runs on a Mac only)
+            speccheck --model=$W4A16 --backend=mlx
+            samplecheck --model=$W4A16 --backend=mlx
+            if RUSTFLAGS="--cfg has_metal" cargo check --features mlx --target-dir target/metal-check 2>&1 | grep -q '^error'; then
+                fail "Metal code does not type-check"; else ok "Metal code type-checks"; fi
             backend_diff --model=Qwen/Qwen3.5-4B --bf16
             backend_diff --model=Qwen/Qwen3.5-4B
             backend_diff --model=$W4A16 ;;
@@ -369,7 +374,7 @@ areas_of() {
         src/preference.rs|tools/make_dpo_reference.py) echo qwen-dpo ;;
         src/checkpoint.rs|build.rs|src/engine.rs|src/hub.rs) echo qwen-train qwen-dpo qwen-infer mlx ;;
         src/cuda/qwen/mod.rs|src/lora.rs) echo qwen-train qwen-dpo qwen-infer ;;
-        src/mlx/*|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
+        src/mlx/*|src/draft_vocab.rs|vendor/mlx-sys/*|tools/backend_diff.py|Cargo.toml) echo mlx ;;
         src/chat.rs) echo chat qwen-train qwen-dpo ;;
         kernels/granite.cu|tools/tokref-twil.json) echo granite-infer ;;
         kernels/*|src/cuda/*) echo qwen-infer ;;

@@ -5,6 +5,8 @@ mod checks;
 #[cfg(has_cuda)]
 mod cuda;
 mod decide;
+#[cfg(has_mlx)]
+mod draft_vocab;
 mod engine;
 mod hub;
 mod lora;
@@ -62,7 +64,8 @@ options: --adapter=[<name>=]<dir>[,<dir>...] (a LoRA, served unmerged. Without <
          bench: --pos=0 (context before decoding) --slots=1 --ctx=4096,
          serve: --ui (the web page at /), --host=0.0.0.0 --port=18023 --name=qwenny, --ctx=<tokens> (default: the
                 model's native context, or what one session can hold on the GPU if less), --slots=16 (sessions at
-                most; they share GPU and host memory by what they hold), --spec=7 (draft tokens per step; 0: off),
+                most; they share GPU and host memory by what they hold), --drafts=<n> (speculative drafts per step, 0: off;
+                default: the draft layer's own, 7 for n-gram chains),
                 --decisions=<presets.json>[,more.json] (named decision tasks for /v1/decisions and the Decide tab),
                 --db=<file> (the password and API keys; default ~/.local/share/qwenny/qwenny.db)
          train: the defaults are the tested recipe: --epochs=3 (at most: the adapter of the lowest dev loss is kept,
@@ -172,7 +175,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
     let bf16 = vec!["bf16"];
     let lora = ["model", "rank", "alpha", "dropout", "precision"];
     Some(match cmd {
-        "serve" => ([&LOAD[..], &["host", "port", "name", "spec", "decisions", "db"]].concat(), vec!["bf16", "ui"], 0..=0),
+        "serve" => ([&LOAD[..], &["host", "port", "name", "drafts", "decisions", "db"]].concat(), vec!["bf16", "ui"], 0..=0),
         "password" => (vec!["db"], vec![], 0..=0),
         "train" => ([&lora[..], &["epochs", "batch", "lr", "max-len", "init-adapter", "beta", "nll"]].concat(), vec![], 1..=2),
         "merge" => (vec!["model"], vec![], 2..=2),
@@ -288,7 +291,7 @@ fn main() -> Result<()> {
             let (ctx, slots, int8) = (opts.get("ctx", native)?, opts.get("slots", 16)?, opts.int8);
             let so = server::ServeOpts { host: opts.get("host", "0.0.0.0".to_string())?, port: opts.get("port", 18023)?,
                                          name: opts.get("name", "qwenny".to_string())?, adapter: None, adapter_default: false,
-                                         spec: opts.get("spec", 7)?,
+                                         drafts: opts.path("drafts").map(|_| opts.get("drafts", 0)).transpose()?,
                                          sessions: opts.path("slots").map(|_| slots), ui: flags.iter().any(|f| *f == "--ui"),
                                          presets: match opts.get("decisions", String::new())? {
                                              // several files, comma-separated: their presets one after the other

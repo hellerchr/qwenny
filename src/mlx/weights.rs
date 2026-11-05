@@ -2,6 +2,7 @@
 //! checkpoint's affine quantization), with f32 residual streams, norms, mixer state and element-wise gates. The
 //! backend-specific cache operations are supplied by `Mix`, as in lfm3-engine's MLX backend.
 use crate::checkpoint::{Checkpoint, Matrix, Quant};
+use crate::draft_vocab::{Adaptive, draft_ids};
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use mlx_rs::{Array, Dtype, error::Exception, fast, nn, ops};
@@ -23,8 +24,6 @@ const QGROUP: i32 = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Dims {
-    pub h: i32,
-    pub ff: i32,
     pub nh: i32,
     pub lv_heads: i32,
     pub vocab: usize,
@@ -46,8 +45,7 @@ impl Dims {
         let rope = &tc["rope_parameters"];
         ensure!(rope["rope_type"] == "default" && rope["rope_theta"].as_f64() == Some(THETA)
                 && rope["partial_rotary_factor"].as_f64() == Some(ROT as f64 / HD as f64), "rope {rope}");
-        Ok(Dims { h: get("hidden_size").context("hidden_size")?, ff: get("intermediate_size").context("intermediate_size")?,
-                  nh: get("num_attention_heads").context("num_attention_heads")?,
+        Ok(Dims { nh: get("num_attention_heads").context("num_attention_heads")?,
                   lv_heads: get("linear_num_value_heads").context("linear_num_value_heads")?,
                   vocab: tc["vocab_size"].as_u64().context("vocab_size")? as usize })
     }
@@ -60,6 +58,7 @@ impl Dims {
 }
 
 /// x W^T for W [out][in], dense in f16 or in MLX's affine quantized layout.
+#[derive(Clone)]
 pub enum Linear {
     Dense(Array),
     Quant { w: Array, scales: Array, biases: Array, group: i32, bits: i32 },
@@ -90,7 +89,7 @@ impl Linear {
         })
     }
 
-    fn arrays(&self) -> Vec<&Array> {
+    pub(super) fn arrays(&self) -> Vec<&Array> {
         match self {
             Linear::Dense(w) => vec![w],
             Linear::Quant { w, scales, biases, .. } => vec![w, scales, biases],
@@ -100,7 +99,7 @@ impl Linear {
     pub fn spec(&self) -> Spec {
         match self {
             Linear::Dense(_) => Spec::Dense,
-            Linear::Quant { group, bits, .. } => Spec::Quant { group: *group, bits: *bits },
+            Linear::Quant { group, bits, .. } => Spec::Quant { group: *group, bits: *bits, draft: false },
         }
     }
 
@@ -112,16 +111,61 @@ impl Linear {
     pub fn apply(&self, x: &Array) -> MResult<Array> {
         self.spec().apply(&self.owned(), x)
     }
+
+    pub fn apply_draft(&self, x: &Array) -> MResult<Array> {
+        self.spec().for_draft().apply(&self.owned(), x)
+    }
+
+    fn select_rows(&self, ids: &[u32]) -> MResult<Self> {
+        let idx = Array::from_slice(ids, &[ids.len() as i32]).as_dtype(Dtype::Int32)?;
+        Ok(match self {
+            Linear::Dense(w) => Linear::Dense(w.take_axis(&idx, 0)?),
+            Linear::Quant { w, scales, biases, group, bits } => Linear::Quant {
+                w: w.take_axis(&idx, 0)?, scales: scales.take_axis(&idx, 0)?, biases: biases.take_axis(&idx, 0)?,
+                group: *group, bits: *bits,
+            },
+        })
+    }
+
+    fn append(&mut self, tail: &Self) -> MResult<()> {
+        match (self, tail) {
+            (Linear::Dense(a), Linear::Dense(b)) => *a = ops::concatenate(&[&*a, b], 0)?,
+            (Linear::Quant { w, scales, biases, .. }, Linear::Quant { w: tw, scales: ts, biases: tb, .. }) => {
+                *w = ops::concatenate(&[&*w, tw], 0)?;
+                *scales = ops::concatenate(&[&*scales, ts], 0)?;
+                *biases = ops::concatenate(&[&*biases, tb], 0)?;
+            }
+            _ => unreachable!("draft rows keep the source matrix's format"),
+        }
+        Ok(())
+    }
+
+    fn replace_tile(&mut self, at: i32, tile: &Self) -> MResult<()> {
+        use mlx_rs::ops::indexing::TryIndexMutOp;
+        match (self, tile) {
+            (Linear::Dense(a), Linear::Dense(b)) => a.try_index_mut((at..at + 16, ..), b)?,
+            (Linear::Quant { w, scales, biases, .. }, Linear::Quant { w: tw, scales: ts, biases: tb, .. }) => {
+                w.try_index_mut((at..at + 16, ..), tw)?;
+                scales.try_index_mut((at..at + 16, ..), ts)?;
+                biases.try_index_mut((at..at + 16, ..), tb)?;
+            }
+            _ => unreachable!("draft rows keep the source matrix's format"),
+        }
+        Ok(())
+    }
 }
 
 /// How a Linear computes, without its arrays: what a compiled stage captures
 #[derive(Clone, Copy, Debug)]
 pub enum Spec {
     Dense,
-    Quant { group: i32, bits: i32 },
+    Quant { group: i32, bits: i32, #[cfg_attr(not(has_metal), expect(dead_code))] draft: bool },
 }
 
 impl Spec {
+    fn for_draft(self) -> Self {
+        match self { Spec::Dense => self, Spec::Quant { group, bits, .. } => Spec::Quant { group, bits, draft: true } }
+    }
     fn n(self) -> usize {
         match self { Spec::Dense => 1, Spec::Quant { .. } => 3 }
     }
@@ -131,7 +175,23 @@ impl Spec {
     fn apply_take<'a>(self, a: &'a [Array], x: &Array) -> MResult<(Array, &'a [Array])> {
         let y = match self {
             Spec::Dense => ops::matmul(x, ops::transpose(&a[0])?),
-            Spec::Quant { group, bits } => ops::quantized_matmul(x, &a[0], &a[1], &a[2], true, group, bits),
+            // Prefill (large M): MLX's quantized_matmul is weight-bandwidth-bound and barely amortizes the int4
+            // weight read across the step's tokens, so a step of 2,048 is only ~3x a single decode. Dequantize the
+            // weight to f16 once and run a dense (compute-bound) matmul instead; the f16 weight is transient, read
+            // once and reused across all M rows. Decode (small M) keeps quantized_matmul: there the weight read is
+            // the work and dequantizing first would only add a pass.
+            Spec::Quant { group, bits, .. } if x.shape()[0] > COMPILE_MAX => {
+                let w = ops::dequantize(&a[0], &a[1], Some(&a[2]), group, bits)?;
+                ops::matmul(x, ops::transpose(&w)?)
+            }
+            // Measured on an M2 Pro only; the stock product may be better on chips with MLX's newer kernels.
+            #[cfg(has_metal)]
+            Spec::Quant { group, bits: 4, draft: true } if x.shape()[0] == 1 && x.shape()[1] % 512 == 0 && group % 16 == 0 =>
+                super::metal::qmv(x, a),
+            #[cfg(has_metal)]
+            Spec::Quant { group, bits: bits @ (4 | 8), .. } if (1..=16).contains(&x.shape()[0]) && (x.shape()[0] >= 4 || bits == 4)
+                && group % 64 == 0 && x.shape()[1] % 64 == 0 && a[0].shape()[0] >= 1024 => super::metal::verify(x, a),
+            Spec::Quant { group, bits, .. } => ops::quantized_matmul(x, &a[0], &a[1], &a[2], true, group, bits),
         }?;
         Ok((y.as_dtype(Dtype::Float32)?, &a[self.n()..]))
     }
@@ -141,35 +201,30 @@ impl Spec {
     }
 }
 
-/// Steps of at most this many tokens (decode, drafts, batched decode) run the compiled stages; longer ones (prompts)
-/// the same functions uncompiled, so that prompt lengths do not each trace a graph
+/// A step above this many tokens is a prompt chunk. Graphs are compiled per shape, so only the shapes that recur are:
+/// steps of up to this many tokens outside a prompt's start, and the full chunk of FULL_CHUNK tokens; a prompt's
+/// arbitrary lengths run uncompiled instead of each tracing a graph.
 pub const COMPILE_MAX: i32 = 64;
+const FULL_CHUNK: i32 = super::model::MAX_TOK as i32;
 
 /// A function of arrays, also compiled (mlx's compile: one graph, element-wise operations fused; on Metal in its safe
 /// math mode, through NVRTC without fast math: the operations stay exact, rounding may differ by fused multiply-adds).
-/// QWENNY_MLX_NOCOMPILE=1 runs everything uncompiled.
 pub struct Fused {
     plain: std::rc::Rc<dyn Fn(&[Array]) -> MResult<Vec<Array>>>,
-    compiled: Option<Box<dyn FnMut(&[Array]) -> MResult<Vec<Array>>>>,
+    compiled: Box<dyn FnMut(&[Array]) -> MResult<Vec<Array>>>,
 }
 
 impl Fused {
     pub fn new(f: impl Fn(&[Array]) -> MResult<Vec<Array>> + 'static) -> Self {
         let plain: std::rc::Rc<dyn Fn(&[Array]) -> MResult<Vec<Array>>> = std::rc::Rc::new(f);
-        let compiled = std::env::var_os("QWENNY_MLX_NOCOMPILE").is_none().then(|| {
-            let p = plain.clone();
-            let mut c = mlx_rs::transforms::compile::compile(move |a: &[Array]| p(a), false);
-            Box::new(move |a: &[Array]| c(a)) as Box<dyn FnMut(&[Array]) -> MResult<Vec<Array>>>
-        });
-        Fused { plain, compiled }
+        let p = plain.clone();
+        let mut c = mlx_rs::transforms::compile::compile(move |a: &[Array]| p(a), false);
+        Fused { plain, compiled: Box::new(move |a: &[Array]| c(a)) }
     }
 
-    /// compiled when `small` (a step of at most COMPILE_MAX tokens)
+    /// compiled when `small`
     pub fn call(&mut self, small: bool, a: &[Array]) -> MResult<Vec<Array>> {
-        match (&mut self.compiled, small) {
-            (Some(c), true) => c(a),
-            _ => (self.plain)(a),
-        }
+        if small { (self.compiled)(a) } else { (self.plain)(a) }
     }
 }
 
@@ -183,8 +238,9 @@ pub struct Stages {
 }
 
 impl Stages {
-    fn of(l: &Layer, d: Dims) -> MResult<Self> {
-        let (sp_in, sout, sgu, sdown) = (l.in_proj.spec(), l.out_proj.spec(), l.gate_up.spec(), l.down.spec());
+    fn of(l: &Layer, d: Dims, draft: bool) -> MResult<Self> {
+        let spec = |s: Spec| if draft { s.for_draft() } else { s };
+        let (sp_in, sout, sgu, sdown) = (spec(l.in_proj.spec()), spec(l.out_proj.spec()), spec(l.gate_up.spec()), spec(l.down.spec()));
         let mut pre_args = vec![l.input_norm.clone()];
         pre_args.extend(l.in_proj.owned());
         let pre = match l.kind {
@@ -288,6 +344,27 @@ pub struct Weights {
     pub final_norm: Array,
     pub layers: Vec<Layer>,
     stages: Vec<Stages>,
+    pub mtp: Option<Mtp>,
+}
+
+pub struct Mtp {
+    pub pre_e: Array,
+    pub pre_h: Array,
+    pub fc: Linear,
+    pub norm: Array,
+    pub head: Option<Linear>,
+    pub ids: Vec<u32>,
+    pub adaptive: Option<Adaptive>,
+    layer: Layer,
+    stages: Stages,
+}
+
+impl Mtp {
+    pub fn forward(&mut self, m: &mut impl Mix, h: &Array, ai: usize) -> MResult<Array> {
+        let t = h.shape()[0];
+        let compiled = t <= 16 || t == FULL_CHUNK;
+        run_layer(&self.layer, &mut self.stages, At { li: 0, ai, di: 0 }, m, h, compiled)
+    }
 }
 
 /// CUDA's dense-to-int8 quantization (core.rs's pack), in the backend-neutral Quant layout.
@@ -403,14 +480,7 @@ impl Weights {
             let w: Vec<f32> = if zero_centered { w.into_iter().map(|x| 1.0 + x).collect() } else { w };
             Ok(Array::from_slice(&w, &[w.len() as i32]))
         };
-        let mut layers = Vec::new();
-        for (i, kind) in types.iter().enumerate() {
-            let p = format!("{text}.layers.{i}");
-            let kind = match kind.as_str() {
-                Some("linear_attention") => Kind::Delta,
-                Some("full_attention") => Kind::Attn,
-                other => bail!("layer {i}: unknown type {other:?}"),
-            };
+        let load_layer = |p: &str, kind: Kind| -> Result<Layer> {
             let mixer = if kind == Kind::Delta { "linear_attn" } else { "self_attn" };
             let a = format!("{p}.{mixer}");
             let in_names: Vec<String> = if kind == Kind::Delta {
@@ -427,7 +497,7 @@ impl Weights {
             let delta_vec = |n: &str| -> Result<Option<Array>> {
                 if kind == Kind::Delta { Ok(Some(vec(&format!("{a}.{n}"))?)) } else { Ok(None) }
             };
-            layers.push(Layer {
+            Ok(Layer {
                 kind,
                 in_proj: lin(&in_names)?,
                 in_ba,
@@ -447,16 +517,48 @@ impl Weights {
                 a_log: delta_vec("A_log")?,
                 dt_bias: delta_vec("dt_bias")?,
                 delta_norm: delta_vec("norm.weight")?,
-            });
-        }
+            })
+        };
+        let layers = types.iter().enumerate().map(|(i, kind)| {
+            let kind = match kind.as_str() {
+                Some("linear_attention") => Kind::Delta,
+                Some("full_attention") => Kind::Attn,
+                other => bail!("layer {i}: unknown type {other:?}"),
+            };
+            load_layer(&format!("{text}.layers.{i}"), kind)
+        }).collect::<Result<Vec<_>>>()?;
+        let mut mtp = if ck.has("mtp.fc.weight") {
+            let layer = load_layer("mtp.layers.0", Kind::Attn)?;
+            let stages = Stages::of(&layer, d, true)?;
+            let has_head = ck.has("mtp.draft_lm_head.weight");
+            let ids = if has_head { draft_ids(dir, d.vocab)? } else { (0..d.vocab as u32).collect() };
+            Some(Mtp {
+                pre_e: norm("mtp.pre_fc_norm_embedding.weight")?,
+                pre_h: norm("mtp.pre_fc_norm_hidden.weight")?,
+                fc: lin(&["mtp.fc.weight".into()])?,
+                norm: norm("mtp.norm.weight")?,
+                head: if has_head { Some(lin(&["mtp.draft_lm_head.weight".into()])?) } else { None },
+                ids, adaptive: None, layer, stages,
+            })
+        } else { None };
         let embed_base = format!("{text}.embed_tokens");
         let embed = dense(&[format!("{embed_base}.weight")], mats(&[format!("{embed_base}.weight")])?)?;
         let head_base = if ck.has("lm_head.weight") { "lm_head".to_string() } else { embed_base.clone() };
         let head = if ck.is_quant(&head_base) || head_base != embed_base {
             Some(lin(&[format!("{head_base}.weight")])?)
         } else { None };
-        let stages = layers.iter().map(|l| Stages::of(l, d)).collect::<MResult<Vec<_>>>()?;
-        let w = Weights { dtype, d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers, stages };
+        if let (Some(m), Some(source @ Linear::Quant { bits: 4, .. })) = (&mut mtp, &head) {
+            if dir.join("mtp_draft_vocab_ids.pt").exists() {
+                let seed = draft_ids(dir, d.vocab)?;
+                let adaptive = Adaptive::load(dir, d.vocab, &seed)?;
+                m.ids = adaptive.rows.ids.clone();
+                m.head = Some(source.select_rows(&m.ids)?);
+                eprintln!("MLX adaptive draft vocabulary: {} rows (up to {})", m.ids.len(), crate::draft_vocab::MAX_ROWS);
+                m.adaptive = Some(adaptive);
+            }
+        }
+        let stages = layers.iter().map(|l| Stages::of(l, d, false)).collect::<MResult<Vec<_>>>()?;
+        let w = Weights { dtype, d, embed, head, final_norm: norm(&format!("{text}.norm.weight"))?, layers, stages, mtp };
         w.eval()?;
         Ok(w)
     }
@@ -473,7 +575,42 @@ impl Weights {
             all.extend(l.q_norm.iter().chain(&l.k_norm).chain(&l.conv_w).chain(&l.a_log).chain(&l.dt_bias).chain(&l.delta_norm));
         }
         all.extend(self.stages.iter().flat_map(Stages::arrays));
+        if let Some(m) = &self.mtp {
+            all.extend([&m.pre_e, &m.pre_h, &m.norm]);
+            all.extend(m.fc.arrays());
+            all.extend(m.head.iter().flat_map(Linear::arrays));
+            all.extend(m.stages.arrays());
+        }
         mlx_rs::transforms::eval(all)
+    }
+
+    /// Learn only committed ids. Draft distributions already drawn retain their token ids and probabilities.
+    pub fn learn_drafts(&mut self, ids: &[u32]) -> Result<()> {
+        let (Some(m), Some(source)) = (&mut self.mtp, &self.head) else { return Ok(()) };
+        let Some(adaptive) = &mut m.adaptive else { return Ok(()) };
+        let before = adaptive.rows.may_change(ids).then(|| adaptive.rows.clone());
+        let old = m.ids.len();
+        let tiles = adaptive.rows.take(ids);
+        if !tiles.is_empty() {
+            let update = (|| -> MResult<Linear> {
+                // Keep the old head live until every packed-row write succeeds (no partial publication on OOM).
+                let mut head = m.head.as_ref().unwrap().clone();
+                let rows = &adaptive.rows.ids;
+                if rows.len() > old { head.append(&source.select_rows(&rows[old..])?)?; }
+                for tile in tiles.into_iter().filter(|&t| t * 16 < old) {
+                    let at = tile * 16;
+                    head.replace_tile(at as i32, &source.select_rows(&rows[at..at + 16])?)?;
+                }
+                mlx_rs::transforms::eval(head.arrays())?;
+                Ok(head)
+            })();
+            match update {
+                Ok(head) => { m.head = Some(head); m.ids = adaptive.rows.ids.clone(); adaptive.changed(); }
+                Err(e) => { adaptive.rows = before.expect("row changes have a snapshot"); return Err(e.into()); }
+            }
+        }
+        adaptive.maybe_save();
+        Ok(())
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -490,16 +627,31 @@ impl Weights {
         }).collect()
     }
 
-    pub fn layers(&mut self, m: &mut impl Mix, mut h: Array) -> MResult<Array> {
-        let small = h.shape()[0] <= COMPILE_MAX;
+    pub fn layers(&mut self, m: &mut impl Mix, mut h: Array, prompt: bool) -> MResult<Array> {
+        let prefill = h.shape()[0] > COMPILE_MAX;
+        // Short prompts vary in length: tracing each length causes seconds of cold compilation.
+        // Keep decode shapes compiled, but run short prompt stages directly.
+        let small = if prefill { h.shape()[0] == FULL_CHUNK } else { !prompt };
+        let mut pending = std::collections::VecDeque::<Array>::new();
         for at in self.positions() {
+            if pending.len() == 2 {
+                pending.pop_front().unwrap().eval()?;
+            }
             h = self.layer(at, m, &h, small)?;
+            if prefill {
+                m.submit(&h)?;
+                pending.push_back(h.clone());
+            }
         }
         Ok(h)
     }
 
     fn layer(&mut self, at: At, m: &mut impl Mix, h: &Array, small: bool) -> MResult<Array> {
-        let (l, st) = (&self.layers[at.li], &mut self.stages[at.li]);
+        run_layer(&self.layers[at.li], &mut self.stages[at.li], at, m, h, small)
+    }
+}
+
+fn run_layer(l: &Layer, st: &mut Stages, at: At, m: &mut impl Mix, h: &Array, small: bool) -> MResult<Array> {
         let with = |front: Vec<Array>, rest: &[Array]| -> Vec<Array> { front.into_iter().chain(rest.iter().cloned()).collect() };
         match l.kind {
             Kind::Attn => {
@@ -514,7 +666,6 @@ impl Weights {
                 Ok(st.tail.call(small, &with(vec![h.clone(), y], &st.tail_args))?.remove(0))
             }
         }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -522,6 +673,8 @@ pub struct At { pub li: usize, pub ai: usize, pub di: usize }
 
 /// The cache-dependent parts of a step. Arrays have no batch dimension: each segment is one sequence.
 pub trait Mix {
+    /// Start computing `h` and the cache writes so far (the step's end waits for them)
+    fn submit(&self, h: &Array) -> MResult<()>;
     /// Split-half RoPE tables [T][1][ROT], f32.
     fn rope(&self) -> (Array, Array);
     /// q [T][Nq][256] f32; the new keys and values quantize_kv'd: int8 [T][Nkv][256], f32 scales [T][Nkv][1];
@@ -582,7 +735,8 @@ pub fn init() -> MResult<()> {
                 unsafe { std::env::set_var(k, v) };
             }
         }
-        r = mlx_rs::memory::set_cache_limit(2 << 30).map(|_| ());
+        let cache = if cfg!(has_metal) { 256 << 20 } else { 2 << 30 };
+        r = mlx_rs::memory::set_cache_limit(cache).map(|_| ());
     });
     r
 }

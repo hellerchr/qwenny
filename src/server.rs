@@ -227,10 +227,18 @@ fn use_adapter(m: &mut Box<dyn Engine>, slot: u32, adapter: bool) -> Result<()> 
     if m.has_adapter() { m.set_adapter(slot, adapter) } else if adapter { bail!("no adapter loaded") } else { Ok(()) }
 }
 
+/// N-gram chains' drafts per step, unless --drafts says otherwise
+const DEFAULT_DRAFTS: usize = 7;
+
+/// Drafts per step from the draft layer: --drafts, else the layer's own default, at most what the backend can do
+fn mtp_depth(has_draft: bool, default: usize, capacity: usize, drafts: Option<usize>) -> usize {
+    if has_draft { drafts.unwrap_or(default).min(capacity) } else { 0 }
+}
+
 /// `spec`: draft tokens per step at most (0: no speculative decoding)
-fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize) {
-    // drafts per step from the model's draft layer (MTP); an n-gram chain drafts up to `spec`
-    let mtp = if m.has_draft() { spec.min(m.draft_tokens()) } else { 0 };
+fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize,
+          mtp: usize) {
+    // `mtp`: drafts per step from the model's draft layer; an n-gram chain drafts up to `spec`
     let only_chains = mtp == 0 && chat.family == Family::Granite;
     let spec_stats = std::env::var_os("QWENNY_SPEC_STATS").is_some();
     let mut waiting: VecDeque<Job> = VecDeque::new();
@@ -579,7 +587,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
         }
         // the draft layer over the step's accepted positions (each with the token that followed it), then the drafts
         // for the next step after each decoding request's last token
-        if mtp > 0 {
+        if mtp > 0 || (per_chain > 0 && !only_chains) {
             let (mut dt, mut rows, mut out, mut who) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for &(i, at, p0, n) in &segs {
                 let s = &mut active[i];
@@ -611,7 +619,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                     }
                 }
             }
-            if !dt.is_empty() {
+            if mtp > 0 && !dt.is_empty() {
                 // a sampled reply's drafts are drawn from the draft layer's distribution under its sampling (the
                 // presence penalty's set as of now)
                 let mut sampling = Vec::with_capacity(who.len());
@@ -971,8 +979,8 @@ pub struct ServeOpts {
     /// the loaded adapter is applied to the single served model (served under `name`, no separate pristine base);
     /// set when --adapter has no explicit name=
     pub adapter_default: bool,
-    /// draft tokens per step at most (speculative decoding; 0: off)
-    pub spec: usize,
+    /// Drafts per step at most (speculative decoding; 0: off). None: the draft layer's default, DEFAULT_DRAFTS for chains
+    pub drafts: Option<usize>,
     /// the sessions (--slots) asked for, each promised the whole context; None: as many as fit
     pub sessions: Option<usize>,
     /// decision presets (a JSON array of {"name", "question", "options", ...})
@@ -1168,8 +1176,8 @@ async fn auth_password(State(app): State<Arc<App>>, h: axum::http::HeaderMap, Ax
 /// Start an engine thread for `load`; its job queue and context once the model is loaded.
 /// `sessions`: the slots asked for (None: as many as fit at the whole context)
 /// `fit_ctx`: lower the engine's context to what one session can hold on the device (no --ctx given)
-fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Arc<Chat>, spec: usize,
-                sessions: Option<usize>, fit_ctx: bool) -> Result<(UnboundedSender<Job>, usize)> {
+fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Arc<Chat>,
+                drafts: Option<usize>, sessions: Option<usize>, fit_ctx: bool) -> Result<(UnboundedSender<Job>, usize)> {
     let (jobs, rx) = unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1179,13 +1187,16 @@ fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
                 let c = sessions::fitting_ctx(&m, m.max_ctx());
                 m.limit_ctx(c);
             }
+            let capacity = m.draft_capacity().min(m.spec_tok().saturating_sub(1)).min(m.max_out().saturating_sub(1));
+            let mtp = mtp_depth(m.has_draft(), m.draft_tokens(), capacity, drafts);
+            m.warmup(mtp)?;
             let store = if m.can_save() { Some(Store::new(&m, sessions)?) } else { None };
-            Ok((m, store))
+            Ok((m, store, mtp))
         });
         match ready {
-            Ok((m, store)) => {
+            Ok((m, store, mtp)) => {
                 let _ = ready_tx.send(Ok(m.max_ctx()));
-                engine(m, store, chat, rx, spec);
+                engine(m, store, chat, rx, drafts.unwrap_or(DEFAULT_DRAFTS), mtp);
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -1200,7 +1211,7 @@ fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
 pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, chat: Chat, opts: ServeOpts) -> Result<()> {
     let auth = Arc::new(Auth::open(&opts.db)?);
     let chat = Arc::new(chat);
-    let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.spec, opts.sessions, opts.fit_ctx)?;
+    let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.drafts, opts.sessions, opts.fit_ctx)?;
     let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
                              adapter_default: opts.adapter_default,
                              presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
@@ -1251,6 +1262,17 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
 mod tests {
     use super::*;
     use crate::chat::test_models;
+
+    #[test]
+    fn mtp_depth_follows_drafts_within_capacity() {
+        assert_eq!(mtp_depth(true, 4, 15, None), 4);
+        assert_eq!(mtp_depth(true, 7, 7, None), 7, "a drafter keeps its own default");
+        assert_eq!(mtp_depth(true, 4, 15, Some(7)), 7);
+        assert_eq!(mtp_depth(true, 4, 4, Some(7)), 4);
+        assert_eq!(mtp_depth(true, 4, 15, Some(2)), 2);
+        assert_eq!(mtp_depth(true, 4, 15, Some(0)), 0);
+        assert_eq!(mtp_depth(false, 4, 4, Some(7)), 0);
+    }
 
     #[test]
     fn sampling_defaults_follow_thinking() {
@@ -1364,7 +1386,8 @@ mod tests {
         let engine_chat = chat.clone();
         std::thread::spawn(move || {
             let m = Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts };
-            engine(Box::new(m), None, engine_chat, rx, spec)
+            let mtp = mtp_depth(m.has_draft(), m.draft_tokens(), m.draft_capacity(), Some(spec));
+            engine(Box::new(m), None, engine_chat, rx, spec, mtp)
         });
         let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
         let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: None, adapter_default: false,

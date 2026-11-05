@@ -7,7 +7,7 @@ built for running the 27B model with a 250k-token context on one 24 GB GPU.
 - Output follows the model: speculative drafts are verified against the full model, sampling with drafts keeps the
   model's distribution, and checks compare the results with PyTorch / Transformers / PEFT references.
 - int4 weights (symmetric or with zero points) run on Marlin kernels; the KV cache is int8; decode steps replay as
-  CUDA graphs; the checkpoint's MTP layer drafts up to 4 tokens per step.
+  CUDA graphs; the checkpoint's MTP layer drafts four tokens per step by default.
 - One binary: `serve` (API and an optional web page), `train` (LoRA), `merge`, `bench` and the checks.
 
 ## Performance
@@ -72,11 +72,27 @@ qwenny bench --pos=32000                  # decode, verify steps and prefill aft
 qwenny bench --adapter=<dir>              # the same for base requests with the adapter loaded, then adapter requests
 ```
 
+## MLX on Apple Silicon
+
+Build without CUDA's default feature on macOS:
+
+```bash
+cargo build --release --no-default-features
+target/release/qwenny serve --backend=mlx --model=<model-directory> --ctx=8192 --slots=1 --ui
+```
+
+MLX caches int8 attention keys/values with f32 scales, f32 DeltaNet state, and the MTP's own KV. The adaptive
+vocabulary uses the existing int4 output weights and saves ids/scores under `~/.cache/qwenny/draft-heads/` (or
+`$XDG_CACHE_HOME/qwenny/draft-heads/`). It grows on demand from the checkpoint's list to at most 65,536 rows.
+Cross-request saved sessions/prefix reuse, adapters and training are not implemented on MLX yet. `--ctx` limits
+context but KV allocation grows on demand; long-context performance must be measured separately.
+
 ## Server
 
 `qwenny serve` options: `--host=0.0.0.0 --port=18023 --name=qwenny`, `--ctx=<tokens>` (default: the model's native
 context, or the longest one session can hold on the GPU if that is less), `--slots=16` (concurrent sessions at most),
-`--spec=7` (drafts per step at most; 0 turns drafting off), `--ui` (the web page), `--decisions=<presets.json>[,...]`,
+`--drafts=<n>` (speculative drafts per step, 0 turns drafting off; default: the draft layer's own, 7 for n-gram chains),
+`--ui` (the web page), `--decisions=<presets.json>[,...]`,
 `--db=<file>` (where the password and keys are kept; default `~/.local/share/qwenny/qwenny.db`),
 `--adapter=[<name>=]<dir>` (a LoRA served beside the base model under `<name>`; default the directory's name, or its
 parent's for `qwenny train`'s `runs/<data>-N/adapter`).
@@ -148,7 +164,8 @@ belongs to the model it was computed with: a request for the other model reads i
 Supported: ranks 8, 16, 32, 64 (PEFT, no rsLoRA / DoRA / rank or alpha patterns) on the language model's linear
 layers (an adapter of the MTP or output layer is refused).
 
-**Speculative decoding.** The checkpoint's MTP layer drafts up to 4 tokens per step; the target model checks all of
+**Speculative decoding.** The checkpoint's MTP layer drafts four tokens per step by default (`--drafts=N`
+for more on MLX). The target model checks all of
 them in one step.
 
 - Draft vocabulary: the drafts are scored over a subset of the output layer only (its rows for up to 65,536 tokens),
@@ -156,7 +173,10 @@ them in one step.
   adapts while the server runs: it counts the tokens it reads and writes (older counts decay), gives frequent tokens
   without a row one, and replaces rows that have not been used for a while. The selection is saved under
   `~/.cache/qwenny/draft-heads/` and loaded on the next start. No weights are trained; only which rows are included
-  changes, so tokens you use often (code identifiers, domain terms, other languages) become draftable.
+  changes, so tokens you use often (code identifiers, domain terms, other languages) become draftable. MLX now
+  uses the same 16-row growth/replacement and 65,536-row cap when the target output layer is stored in int4 and
+  the checkpoint provides draft vocabulary ids. Its rows are gathered from the existing target weights, with no
+  requantization; sampled draft distributions already drawn remain valid after a head update.
 - Sampled replies draw their drafts from the draft layer's distribution q under the request's sampling settings;
   the target accepts a draft d with probability min(1, p(d) / q(d)) and otherwise samples from max(0, p − q)
   normalized (speculative sampling), so the output distribution is the model's. Greedy replies draft the argmax.

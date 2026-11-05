@@ -1699,6 +1699,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mlx-rs",
+ "mlx-sys",
  "rusqlite",
  "safetensors",
  "serde_json",

@@ -29,6 +29,15 @@ PROMPTS = {
 }
 
 
+def has_output(chunk):
+    """The initial role-only SSE event is sent before prefill and is not a generated token."""
+    return any(
+        choice.get("delta", {}).get(key)
+        for choice in chunk.get("choices", [])
+        for key in ("content", "reasoning_content", "tool_calls")
+    )
+
+
 def run(prompt, seed):
     body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": n_tok, "stream": True, "ignore_eos": True,
             "seed": seed, "stream_options": {"include_usage": True}, **extra}
@@ -41,7 +50,7 @@ def run(prompt, seed):
         chunk = json.loads(line[6:])
         if chunk.get("usage"):
             usage = chunk["usage"]
-        if chunk.get("choices") and first is None:
+        if first is None and has_output(chunk):
             first = time.time()
     return (usage["completion_tokens"] - 1) / (time.time() - first)
 
