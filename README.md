@@ -8,7 +8,33 @@ built for running the 27B model with a 250k-token context on one 24 GB GPU.
   model's distribution, and checks compare the results with PyTorch / Transformers / PEFT references.
 - int4 weights (symmetric or with zero points) run on Marlin kernels; the KV cache is int8; decode steps replay as
   CUDA graphs; the checkpoint's MTP layer drafts four tokens per step by default.
-- One binary: `serve` (API and an optional web page), `train` (LoRA), `merge`, `bench` and the checks.
+- One binary: `serve` (API and web page), `train` (LoRA), `merge`, `bench`, `password` and the checks.
+
+## Quick start
+
+Needs an NVIDIA GPU with compute capability 8.6 or newer (24 GB for the 27B), the CUDA toolkit (`nvcc`) and a Rust
+toolchain (edition 2024); Python with Transformers and PEFT only to make the check references.
+
+```bash
+cargo build --release
+target/release/qwenny serve --model=Qwen/Qwen3.5-4B         # API and web page on http://localhost:18023/
+
+curl -s localhost:18023/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 200}'
+```
+
+`qwenny --help` lists the commands and options. `--model=<directory or Hugging Face id>` (default
+`Qwen/Qwen3.5-4B`, downloaded once to the Hugging Face cache; `HF_HOME`, `HF_TOKEN` and `HF_HUB_OFFLINE` apply),
+`--adapter=[<name>=]<dir>` (a PEFT LoRA, served unmerged: see Server) and `--bf16` (16-bit weights instead of int8;
+pre-quantized checkpoints keep their format) go with every command that loads a model.
+
+```bash
+qwenny train data/                        # LoRA on data/train.jsonl (+ dev.jsonl), rows {"messages": [...]}
+qwenny serve --adapter=runs/data-1/adapter  # "model": "data-1" with the adapter, "qwenny" without
+qwenny merge runs/data-1/adapter merged/  # write the merged model (bf16 checkpoints)
+qwenny bench --pos=32000                  # decode, verify steps and prefill after a 32k context
+qwenny bench --adapter=<dir>              # the same for base requests with the adapter loaded, then adapter requests
+```
 
 ## Performance
 
@@ -22,7 +48,8 @@ Swift 1.5 (Qwen3.8-27B, int4) on one RTX 3090 at 350 W, default settings (a cont
 | Prefill, a 32k-token context | ~1,660 tok/s |
 
 Decode speed depends on the text: the more predictable it is (code, structured output), the more drafts are
-accepted per step. Tokens per second are counted after the first token.
+accepted per step. Decode: tokens per second on the client's wall clock from the first streamed token to the end of the
+reply. Prefill: `qwenny bench`'s wall clock around synchronized steps.
 
 ## Models
 
@@ -31,44 +58,13 @@ Qwen3.8-27B. Weights in bf16, or pre-quantized as compressed-tensors `pack-quant
 AutoRound, GPTQModel), symmetric or with zero points. A model without an MTP layer decodes without drafts, except
 n-gram chains on deterministic requests.
 
-`QWENNY_SPEC_STATS=1` logs tokens per step and acceptance by draft position per request.
-
-## Requirements
-
-- An NVIDIA GPU with compute capability 8.6 or newer; 24 GB for the 27B
-- The CUDA toolkit (`nvcc`) and a Rust toolchain (edition 2024)
-- Python with Transformers and PEFT, only to make the check references
-
-## Quick start
-
-```bash
-cargo build --release
-target/release/qwenny serve --model=Qwen/Qwen3.5-4B --ui     # API and web page on http://localhost:18023/
-
-curl -s localhost:18023/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 200}'
-```
-
-Every command takes `--model=<directory or Hugging Face id>` (default `Qwen/Qwen3.5-4B`, downloaded once to the
-Hugging Face cache; `HF_HOME`, `HF_TOKEN` and `HF_HUB_OFFLINE` apply), `--adapter=[<name>=]<dir>` (a PEFT LoRA,
-served unmerged: see Server) and `--bf16` (16-bit weights instead of int8; pre-quantized checkpoints keep their
-format).
-
-```bash
-qwenny train data/                        # LoRA on data/train.jsonl (+ dev.jsonl), rows {"messages": [...]}
-qwenny serve --adapter=runs/data-1/adapter  # "model": "data-1" with the adapter, "qwenny" without
-qwenny merge runs/data-1/adapter merged/  # write the merged model (bf16 checkpoints)
-qwenny bench --pos=32000                  # decode, verify steps and prefill after a 32k context
-qwenny bench --adapter=<dir>              # the same for base requests with the adapter loaded, then adapter requests
-```
-
 ## MLX on Apple Silicon
 
 Build without CUDA's default feature on macOS:
 
 ```bash
 cargo build --release --no-default-features
-target/release/qwenny serve --backend=mlx --model=<model-directory> --ctx=8192 --slots=1 --ui
+target/release/qwenny serve --backend=mlx --model=<model-directory> --ctx=8192 --slots=1
 ```
 
 MLX caches int8 attention keys/values with f32 scales, f32 DeltaNet state, and the MTP's own KV. The adaptive
@@ -82,12 +78,12 @@ context but KV allocation grows on demand; long-context performance must be meas
 `qwenny serve` options: `--host=0.0.0.0 --port=18023 --name=qwenny`, `--ctx=<tokens>` (default: the model's native
 context, or the longest one session can hold on the GPU if that is less), `--slots=16` (concurrent sessions at most),
 `--drafts=<n>` (speculative drafts per step, 0 turns drafting off; default: the draft layer's own, 7 for n-gram chains),
-`--ui` (the web page), `--decisions=<presets.json>[,...]`,
+`--decisions=<presets.json>[,...]`, `--stats` (log tokens per step and acceptance by draft position per request),
 `--db=<file>` (where the password and keys are kept; default `~/.local/share/qwenny/qwenny.db`),
 `--adapter=[<name>=]<dir>` (a LoRA served beside the base model under `<name>`; default the directory's name, or its
 parent's for `qwenny train`'s `runs/<data>-N/adapter`).
-`QWENNY_CACHE_MEM=<GiB>` (environment, every command) caps the device memory of the slots' caches; by default they
-take what is free after loading, less 512 MiB for CUDA graphs and the driver (a GPU shared with other work: set it).
+`--cache-mem=<GiB>` (serve, bench and the checks) caps the device memory of the slots' caches; by default they take
+what is free after loading, less 512 MiB for CUDA graphs and the driver (a GPU shared with other work: set it).
 
 **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`. Request fields: `model`,
 `messages`,
@@ -109,7 +105,7 @@ take what is free after loading, less 512 MiB for CUDA graphs and the driver (a 
   come back when continued), and a running request may pause until there is room; when host memory is full, the
   least recently used session is dropped and read again when continued. Requests do not fail for lack of memory.
 
-**Web page** (`--ui`): Chat (streaming, thinking toggle, tok/s per reply; chats are kept in the browser), Decide (the
+**Web page** (always served, at `/`): Chat (streaming, thinking toggle, tok/s per reply; chats are kept in the browser), Decide (the
 decisions endpoint) and Access. HTML and SVG blocks in a reply open in a sandboxed side panel.
 
 **Access**: by default the server is open, the web page and the API alike. The page's Access tab shows the connection
@@ -210,39 +206,36 @@ from a forward pass before the backward of the first.
 
 ## Checks
 
-`tools/checks.sh` runs each check against a reference with a pass criterion: `tools/checks.sh changed` (what the
-uncommitted changes need), `all`, or one area (`qwen-infer`, `chat`, `qwen-train`, `qwen-dpo`, `qwen-train-27b`).
+`tools/checks.sh` runs every check against a reference from the originals (Transformers, PEFT, TRL, Unsloth) with a
+pass criterion, and decides which ones a change needs: `tools/checks.sh changed`, `all`, or one area (`qwen-infer`,
+`chat`, `qwen-train`, `qwen-dpo`, `qwen-train-27b`, `mlx`). `qwenny help checks` lists the checks; each one ends in a
+summary line and fails with an error when its limit is not met. The references come from `tools/make_*.py`
+(`checks.sh --make` makes the missing ones); AGENTS.md has the working rules.
 
-| Check | Compared with |
-|---|---|
-| `check`, `layercheck`, `longcheck` | Transformers fp32 logits and layer outputs |
-| `check --adapter`, `adaptercheck` | Transformers + PEFT fp32 logits with a LoRA; adapter and base requests in the same steps vs. each in steps of one model |
-| `speccheck` | the same model without drafts (one token per step) |
-| `samplecheck` | a host reference sampler, draw for draw, including sampled drafts |
-| `cachecheck`, `swapcheck` | the same sequence without saving or swapping |
-| `chatcheck`, `tokcheck` | Transformers' chat template and tokenizer |
-| `traincheck`, `datacheck` | PEFT's LoRA gradients and AdamW step; Unsloth's loss masks |
-| `dpocheck` | preference training: RPO loss, log-probabilities and LoRA gradients of PyTorch + PEFT (cross-checked with TRL's `DPOTrainer`), the pairs' tokens and masks |
-
-The references are made by `tools/make_reference.py`, `make_reference_mtp.py`, `make_reference_lora.py`,
-`make_train_reference.py`, `make_dpo_reference.py` and `make_tokref.py`; `make_reference_vllm.py` takes top-k log-probabilities from a vLLM server for int4 checkpoints.
-`tools/decode_bench.py` (one stream) and `tools/serve_bench.py` (1 to 16 streams) measure a running server;
-`tools/serve_check.py` starts one and checks its replies over HTTP (thinking, streaming, tools, continued conversations, concurrent requests).
+`tools/decode_bench.py` measures a running server (one stream, or `--streams=1,4,8,16`); `tools/serve_check.py` starts
+one and checks its replies over HTTP (thinking, streaming, tools, continued conversations, concurrent requests).
 
 ## Layout
 
 ```
 src/main.rs                     command line
+src/engine.rs                   the engine interface of both backends
 src/server.rs, src/sessions.rs  API server, scheduling, speculative decoding; slots and host swap
 src/auth.rs                     the page's password and the API keys (SQLite)
 src/chat.rs, src/decide.rs      chat template and tool calls; decisions
 src/sample.rs                   sampling parameters, host reference sampler
 src/checkpoint.rs, src/hub.rs   weight loading and formats; Hugging Face downloads
 src/cuda/                       device code: products, steps, graphs (core.rs), the model (qwen/), training runtime
-src/training.rs, src/lora.rs    LoRA training, loading and merging (served: src/cuda/qwen/lora.rs, kernels/lora.cuh)
+src/mlx/, vendor/mlx-sys        the MLX backend (Metal shaders, MLX's CUDA backend)
+src/training.rs, src/preference.rs, src/lora.rs
+                                LoRA and preference training, adapter loading, merging and baking
+                                (served: src/cuda/qwen/lora.rs, kernels/lora.cuh)
+src/checks.rs                   the checks and `bench`
+src/draft_vocab.rs              the draft vocabulary's saved rows
 kernels/                        CUDA kernels: products (gemm, Marlin), attention, DeltaNet, sampling, training
 tools/                          checks, reference scripts, benchmarks
-docs/exl3-plan.md               plan: EXL3 checkpoints (higher quality at ~4 bits)
+examples/                       decision presets
+scripts/lint.sh                 cargo fmt --check and clippy with warnings as errors
 ```
 
 ## Acknowledgements
@@ -257,5 +250,5 @@ No license has been chosen yet. `kernels/marlin.cuh` keeps Marlin's Apache 2.0 n
 
 ## Linting
 
-`scripts/lint.sh` is the CI gate: `cargo fmt --all --check`, then `cargo clippy --all-targets --all-features -- -D warnings`.
-The lint levels live in the `[lints]` tables of `Cargo.toml` and the format in `rustfmt.toml`. `cargo machete` finds unused dependencies.
+`scripts/lint.sh` runs `cargo fmt --all --check` (`rustfmt.toml`), then `cargo clippy --all-targets --all-features -- -D
+warnings`.
