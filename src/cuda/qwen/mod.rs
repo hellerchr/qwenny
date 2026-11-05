@@ -292,7 +292,7 @@ impl Stack {
         let f = |n: &str| m.load_function(n);
         let k = Kernels { embed: f("embed")?, embed_q8: f("embed_q8")?, rmsnorm: f("rmsnorm")?, add_rmsnorm: f("add_rmsnorm")?,
                           to_xin: f("to_xin")?, mtp_in: f("mtp_in")?, sum_parts: f("sum_parts")?,
-                          attn: attn::Kernels::load(&s, &m, &d)?,
+                          attn: attn::Kernels::load(&m)?,
                           delta: deltanet::Kernels::load(&m)? };
         let w = Checkpoint::open(dir)?;
         let pool = Pool::new(&s)?;
@@ -741,7 +741,7 @@ impl Model {
         }
         // the MTP layer is not adapted
         x.st.lora = false;
-        let key = ((x.st.shape(), Attn::graph_key(&x.k.attn, &x.st), false), Some(own));
+        let key = ((x.st.shape(), Attn::graph_key(&x.st), false), Some(own));
         let m = self.mtp.as_ref().unwrap();
         self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_mtp(m, own))
     }
@@ -935,7 +935,7 @@ impl Engine for Model {
         }
         self.x.st.upload(&self.x.s, toks, out, marks)?;
         self.x.st.lora = self.uses_adapter(toks);
-        let key = ((self.x.st.shape(), Attn::graph_key(&self.x.k.attn, &self.x.st), self.x.st.lora), None);
+        let key = ((self.x.st.shape(), Attn::graph_key(&self.x.st), self.x.st.lora), None);
         self.graphs.run(&self.x.s, self.x.st.n, key, || self.launch_step(|| Ok(())))
     }
 
