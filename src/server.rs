@@ -711,17 +711,23 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
     }
 }
 
+/// How a loaded LoRA adapter is served
+#[derive(Clone)]
+pub enum AdapterUse {
+    /// no adapter is loaded
+    None,
+    /// under this name (`"model"` of a request), beside the base model
+    Named(String),
+    /// always: the one served model is the base with the adapter applied, whatever a request names
+    Always,
+}
+
 pub struct App {
     pub chat: Arc<Chat>,
     pub jobs: UnboundedSender<Job>,
     pub name: String,
     pub max_ctx: usize,
-    /// the name the LoRA adapter is served under IN ADDITION to the base, if dual (`"model"` of a request; the base
-    /// is `name`); None when there is no adapter or it is applied to the single served model (adapter_default)
-    pub adapter: Option<String>,
-    /// the loaded adapter is always applied to the one served model (`name`); any requested "model" maps to it and
-    /// no pristine base is selectable
-    pub adapter_default: bool,
+    pub adapter: AdapterUse,
     /// named decision tasks (question, options, threshold, ...) for the page and for requests with "preset"
     pub presets: Json,
     /// pages from the chat (`POST /v1/artifacts`), newest last
@@ -764,18 +770,15 @@ async fn get_artifact(State(app): State<Arc<App>>, Path(id): Path<String>) -> Re
 }
 
 impl App {
-    /// The model a request names (`"model"`): whether to use the adapter, and the name to answer with. With
-    /// `adapter_default` there is one model (the base with the adapter always applied), served under `name`, and any
-    /// requested model maps to it. Otherwise: without an adapter any name is the base; with a dual adapter a name
-    /// that is neither the base nor the adapter is an error.
+    /// The model a request names (`"model"`): whether to use the adapter, and the name to answer with. Without an adapter
+    /// or with one always applied any name is the one served model; a named adapter makes a name that is neither it nor
+    /// the base an error.
     pub fn model(&self, body: &Json) -> Result<(bool, String)> {
         let asked = body.get("model").and_then(Json::as_str);
-        if self.adapter_default {
-            return Ok((true, self.name.clone()));
-        }
         match (&self.adapter, asked) {
-            (Some(a), Some(m)) if m == a => Ok((true, a.clone())),
-            (Some(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
+            (AdapterUse::Always, _) => Ok((true, self.name.clone())),
+            (AdapterUse::Named(a), Some(m)) if m == a => Ok((true, a.clone())),
+            (AdapterUse::Named(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
             _ => Ok((false, self.name.clone())),
         }
     }
@@ -785,16 +788,33 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn bad_request(msg: String) -> Response {
-    (StatusCode::BAD_REQUEST, AxJson(json!({"error": {"message": msg, "type": "invalid_request_error"}})))
-        .into_response()
+/// An error in the form OpenAI's API has
+fn api_error(status: StatusCode, kind: &str, msg: &str) -> Response {
+    (status, AxJson(json!({"error": {"message": msg, "type": kind}}))).into_response()
 }
 
-/// Sampling parameters the request leaves out. Qwen: the model card's general ones, which depend on thinking (the prompt
-/// opened a think block), with its presence penalty of 1.5 (against endless thinking: the card's advice for both modes).
+pub fn bad_request(msg: String) -> Response {
+    api_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg)
+}
+
+fn unauthorized(msg: &str) -> Response {
+    api_error(StatusCode::UNAUTHORIZED, "invalid_api_key", msg)
+}
+
+fn db_error(e: anyhow::Error) -> Response {
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &format!("{e:#}"))
+}
+
+/// A reply's token counts
+fn usage(prompt_tokens: usize, completion_tokens: usize) -> Json {
+    json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+}
+
+/// Sampling parameters the request leaves out: the model card's general ones, which depend on thinking (the prompt opened
+/// a think block), with its presence penalty of 1.5 (against endless thinking: the card's advice for both modes).
 fn sampling_defaults(thinking: bool) -> Params {
-    let (temperature, top_p, top_k, presence_penalty) = if thinking { (1.0, 0.95, 20, 1.5) } else { (0.7, 0.8, 20, 1.5) };
-    Params { temperature, top_p, top_k, repetition_penalty: 1.0, presence_penalty, seed: 0 }
+    let (temperature, top_p, top_k) = if thinking { (1.0, 0.95, 20) } else { (0.7, 0.8, 20) };
+    Params { temperature, top_p, top_k, repetition_penalty: 1.0, presence_penalty: 1.5, seed: 0 }
 }
 
 /// A rendered, tokenized request; `thinking`: the prompt opened a think block, so output starts as reasoning.
@@ -895,10 +915,10 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
 
     if !stream {
         let mut pieces = Vec::new();
-        let (finish, usage) = loop {
+        let (finish, counts) = loop {
             match rx.recv().await {
                 Some(Msg::Text(t)) => parser.push(&t, &mut pieces),
-                Some(Msg::Done { finish, prompt_tokens, completion_tokens }) => break (finish, (prompt_tokens, completion_tokens)),
+                Some(Msg::Done { finish, prompt_tokens, completion_tokens }) => break (finish, usage(prompt_tokens, completion_tokens)),
                 Some(Msg::Error(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
                 None | Some(Msg::Decision { .. }) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped the request").into_response()
@@ -931,8 +951,7 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
         }
         return AxJson(json!({
             "id": format!("chatcmpl-{id}"), "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {"prompt_tokens": usage.0, "completion_tokens": usage.1, "total_tokens": usage.0 + usage.1}
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": counts
         }))
         .into_response();
     }
@@ -979,9 +998,7 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
                     if include_usage {
                         let _ = etx.send(Event::default().data(json!({
                             "id": format!("chatcmpl-{id}"), "object": "chat.completion.chunk", "created": created,
-                            "model": model, "choices": [],
-                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                                      "total_tokens": prompt_tokens + completion_tokens}
+                            "model": model, "choices": [], "usage": usage(prompt_tokens, completion_tokens)
                         }).to_string()));
                     }
                     break;
@@ -1002,12 +1019,7 @@ pub struct ServeOpts {
     pub host: String,
     pub port: u16,
     pub name: String,
-    /// the name a loaded LoRA adapter is served under IN ADDITION to the base (dual mode); None when there is no
-    /// adapter, or when it is applied to the one served model (adapter_default)
-    pub adapter: Option<String>,
-    /// the loaded adapter is applied to the single served model (served under `name`, no separate pristine base);
-    /// set when --adapter has no explicit name=
-    pub adapter_default: bool,
+    pub adapter: AdapterUse,
     /// Drafts per step at most (speculative decoding; 0: off). None: the draft layer's default, DEFAULT_DRAFTS for chains
     pub drafts: Option<usize>,
     /// the sessions (--slots) asked for, each promised the whole context; None: as many as fit
@@ -1037,10 +1049,6 @@ fn logged_in(app: &App, h: &axum::http::HeaderMap) -> bool {
     cookie(h, auth::COOKIE).is_some_and(|t| app.auth.session(t).unwrap_or(false))
 }
 
-fn unauthorized(msg: &str) -> Response {
-    (StatusCode::UNAUTHORIZED, AxJson(json!({"error": {"message": msg, "type": "invalid_api_key"}}))).into_response()
-}
-
 /// Who may do what (auth.rs). Without a password the web page is open; with one, the page and /auth/* need its login.
 /// The API (/v1/...) takes the page, and anyone else unless it requires a key (`Authorization: Bearer <key>`).
 /// /health, the login page and logging in stay open.
@@ -1060,7 +1068,7 @@ async fn gate(State(app): State<Arc<App>>, req: axum::extract::Request, next: ax
             false => unauthorized("this server requires an API key: Authorization: Bearer <key>"),
         };
     }
-    if req.method() == axum::http::Method::GET && matches!(path, "/" | "/decide") {
+    if req.method() == axum::http::Method::GET && path == "/" {
         return axum::response::Redirect::to("/login").into_response();
     }
     unauthorized("log in first")
@@ -1071,45 +1079,40 @@ fn page_allowed(app: &App, h: &axum::http::HeaderMap) -> bool {
     !app.auth.has_password().unwrap_or(true) || logged_in(app, h)
 }
 
-/// The endpoints that change access: the page (logged in, when a password is set)
-fn need_login(app: &App, h: &axum::http::HeaderMap) -> Option<Response> {
-    (!page_allowed(app, h)).then(|| unauthorized("log in first"))
-}
-
 fn session_cookie(token: &str, max_age: i64) -> String {
     format!("{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}", auth::COOKIE)
-}
-
-fn db_error(e: anyhow::Error) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, AxJson(json!({"error": {"message": format!("{e:#}")}}))).into_response()
 }
 
 fn logged_in_reply(token: String) -> Response {
     ([(header::SET_COOKIE, session_cookie(&token, auth::SESSION_SECS))], AxJson(json!({"ok": true}))).into_response()
 }
 
+/// Run `f` on the database off the async threads: password hashes take a while
+async fn with_auth<T: Send + 'static>(app: &App, f: impl FnOnce(&Auth) -> Result<T> + Send + 'static) -> Result<T> {
+    let a = app.auth.clone();
+    tokio::task::spawn_blocking(move || f(&a)).await?
+}
+
 /// POST /auth/login {"password"}: the session cookie (a wrong password waits a second: no fast guessing)
 async fn auth_login(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
-    let (a, pw) = (app.auth.clone(), b["password"].as_str().unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.login(&pw)).await {
-        Ok(Ok(Some(token))) => logged_in_reply(token),
-        Ok(Ok(None)) => {
+    let pw = b["password"].as_str().unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.login(&pw)).await {
+        Ok(Some(token)) => logged_in_reply(token),
+        Ok(None) => {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             unauthorized("wrong password")
         }
-        Ok(Err(e)) => db_error(e),
-        Err(e) => db_error(e.into()),
+        Err(e) => db_error(e),
     }
 }
 
 /// POST /auth/setup {"password"}: set the first password (while none is set); logged in with it
 async fn auth_setup(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
-    let (a, pw) = (app.auth.clone(), b["password"].as_str().unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.setup(&pw)).await {
-        Ok(Ok(Some(token))) => logged_in_reply(token),
-        Ok(Ok(None)) => unauthorized("a password is set already: log in"),
-        Ok(Err(e)) => bad_request(format!("{e:#}")),
-        Err(e) => db_error(e.into()),
+    let pw = b["password"].as_str().unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.setup(&pw)).await {
+        Ok(Some(token)) => logged_in_reply(token),
+        Ok(None) => unauthorized("a password is set already: log in"),
+        Err(e) => bad_request(format!("{e:#}")),
     }
 }
 
@@ -1140,10 +1143,7 @@ async fn auth_state(State(app): State<Arc<App>>, h: axum::http::HeaderMap) -> Re
 }
 
 /// POST /auth/require-key {"on": bool}
-async fn auth_require_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
+async fn auth_require_key(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
     let on = b["on"].as_bool().unwrap_or(false);
     if on && !app.auth.has_password().unwrap_or(false) {
         return bad_request("set a password first: without one, anyone who can open this page can make a key".into());
@@ -1155,10 +1155,7 @@ async fn auth_require_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap,
 }
 
 /// POST /auth/keys {"name"}: a new API key, returned once
-async fn auth_new_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
+async fn auth_new_key(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
     match app.auth.new_key(b["name"].as_str().unwrap_or("")) {
         Ok((id, key)) => AxJson(json!({"id": id, "key": key})).into_response(),
         Err(e) => bad_request(format!("{e:#}")),
@@ -1166,43 +1163,32 @@ async fn auth_new_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJ
 }
 
 /// DELETE /auth/keys/{id}
-async fn auth_revoke(State(app): State<Arc<App>>, h: axum::http::HeaderMap, Path(id): Path<i64>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
+async fn auth_revoke(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Response {
     match app.auth.revoke(id) {
         Ok(true) => AxJson(json!({"ok": true})).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, AxJson(json!({"error": {"message": "no such key"}}))).into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "no such key"),
         Err(e) => db_error(e),
     }
 }
 
 /// POST /auth/password-remove {"old"}: the page is open again
-async fn auth_password_remove(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
-    let (a, old) = (app.auth.clone(), b["old"].as_str().unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.remove_password(&old)).await {
-        Ok(Ok(true)) => ([(header::SET_COOKIE, session_cookie("", 0))], AxJson(json!({"ok": true}))).into_response(),
-        Ok(Ok(false)) => unauthorized("the password is wrong"),
-        Ok(Err(e)) => db_error(e),
-        Err(e) => db_error(e.into()),
+async fn auth_password_remove(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
+    let old = b["old"].as_str().unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.remove_password(&old)).await {
+        Ok(true) => ([(header::SET_COOKIE, session_cookie("", 0))], AxJson(json!({"ok": true}))).into_response(),
+        Ok(false) => unauthorized("the password is wrong"),
+        Err(e) => db_error(e),
     }
 }
 
 /// POST /auth/password {"old", "new"}: other logins end, this one stays
 async fn auth_password(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
     let (old, new) = (b["old"].as_str().unwrap_or("").to_string(), b["new"].as_str().unwrap_or("").to_string());
-    let (a, keep) = (app.auth.clone(), cookie(&h, auth::COOKIE).unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.change_password(&old, &new, &keep)).await {
-        Ok(Ok(true)) => AxJson(json!({"ok": true})).into_response(),
-        Ok(Ok(false)) => unauthorized("the current password is wrong"),
-        Ok(Err(e)) => bad_request(format!("{e:#}")),
-        Err(e) => db_error(e.into()),
+    let keep = cookie(&h, auth::COOKIE).unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.change_password(&old, &new, &keep)).await {
+        Ok(true) => AxJson(json!({"ok": true})).into_response(),
+        Ok(false) => unauthorized("the current password is wrong"),
+        Err(e) => bad_request(format!("{e:#}")),
     }
 }
 
@@ -1246,10 +1232,12 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     let chat = Arc::new(chat);
     let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.drafts, opts.sessions, opts.fit_ctx)?;
     let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
-                             adapter_default: opts.adapter_default,
                              presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
     // the base model first (the page shows the first), then the adapter
-    let names: Vec<String> = std::iter::once(opts.name.clone()).chain(opts.adapter.clone()).collect();
+    let mut names = vec![opts.name.clone()];
+    if let AdapterUse::Named(a) = &opts.adapter {
+        names.push(a.clone());
+    }
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/decisions", post(crate::decide::decisions))
@@ -1272,7 +1260,6 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
         router = router
             .route("/", get(|| async { Html(include_str!("ui.html")) }))
             .route("/login", get(|| async { Html(include_str!("login.html")) }))
-            .route("/decide", get(|| async { axum::response::Redirect::to("/#decide") }))
             .route("/v1/artifacts", post(put_artifact))
             .route("/artifacts/{id}", get(get_artifact));
     }
@@ -1281,8 +1268,11 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await?;
         println!("serving {}{} on http://{}:{} (context {max_ctx}{}{})", opts.name,
-                 if opts.adapter_default { " (adapter applied)".to_string() }
-                 else { opts.adapter.as_ref().map_or(String::new(), |a| format!(" and its adapter {a}")) }, opts.host, opts.port,
+                 match &opts.adapter {
+                     AdapterUse::None => String::new(),
+                     AdapterUse::Named(a) => format!(" and its adapter {a}"),
+                     AdapterUse::Always => " (adapter applied)".to_string(),
+                 }, opts.host, opts.port,
                  if opts.ui { ", web page at /" } else { "" },
                  if auth.require_key()? { ", the API requires a key" } else { "" });
         axum::serve(listener, router).await?;
@@ -1408,7 +1398,7 @@ mod tests {
             engine(Box::new(m), None, engine_chat, rx, spec, mtp)
         });
         let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
-        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: None, adapter_default: false,
+        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: AdapterUse::None,
                                  presets: json!([]), artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db).unwrap()) });
         // the scripted engine only takes the argmax: greedy, and no presence penalty (Qwen's default would sample)
         body["temperature"] = json!(0);
