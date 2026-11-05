@@ -47,7 +47,7 @@ for i, r in enumerate(rows[:3]):
         anchors = torch.arange(8, T - 8, max((T - 16) // 48, 1), device="cuda")
         starts = torch.zeros(T, dtype=torch.long, device="cuda")
         cuda_embed = lambda t: embed(t).float().cuda()
-        hidden = model(cuda_embed, taps, x_ids, starts, anchors, table, dc["sliding_window"], False)
+        hidden = model(cuda_embed, taps, x_ids, starts, anchors, table, dc["sliding_window"])
         paths, firsts = [], []
         for b in range(anchors.shape[0]):
             prev, path = x_ids[anchors[b]], []

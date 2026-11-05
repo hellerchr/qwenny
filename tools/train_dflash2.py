@@ -39,10 +39,11 @@ class Int8Linear(nn.Module):
         self.register_buffer("q", q)
         self.register_buffer("s", s.to(torch.bfloat16))
 
+    def matrix(self):
+        return (self.q.to(torch.bfloat16) * self.s[..., None]).view(self.q.shape[0], -1)
+
     def forward(self, x):
-        rows = self.q.shape[0]
-        w = (self.q.to(torch.bfloat16) * self.s[..., None]).view(rows, -1)
-        return x.to(torch.bfloat16) @ w.T
+        return x.to(torch.bfloat16) @ self.matrix().T
 
 
 def int8_target(model):
@@ -51,8 +52,7 @@ def int8_target(model):
     for name in names:
         parent, _, leaf = name.rpartition(".")
         owner = model.get_submodule(parent) if parent else model
-        setattr(owner, leaf, Int8Linear(getattr(owner, leaf).weight.data))
-        torch.cuda.empty_cache()
+        setattr(owner, leaf, Int8Linear(getattr(owner, leaf).weight.data.cuda()))
     return model
 
 
@@ -120,20 +120,26 @@ class Attention(nn.Module):
         k = self.k_norm(self.k_proj(ctx).view(t, self.kv, self.dim))
         return rotate(k, cos[:, None], sin[:, None]), self.v_proj(ctx).view(t, self.kv, self.dim)
 
-    def forward(self, x, cos, sin, k_ctx, v_ctx, visible):
-        """x [a][b][H]; RoPE tables [a][b][dim]; the context visible to each anchor: visible [a][T]"""
+    def span(self, q, k, v, k_far, v_far, visible):
+        far = torch.einsum("abgrd,tgd->abgrt", q, k_far).masked_fill(~visible[:, None, None, None], -math.inf)
+        near = torch.einsum("abgrd,acgd->abgrc", q, k)
+        p = torch.cat([far, near], -1).softmax(-1)
+        t = k_far.shape[0]
+        return torch.einsum("abgrt,tgd->abgrd", p[..., :t], v_far) + torch.einsum("abgrc,acgd->abgrd", p[..., t:], v)
+
+    def forward(self, x, cos, sin, k_ctx, v_ctx, spans):
+        """x [a][b][H]; RoPE tables [a][b][dim]; spans: groups of anchors of a document, each its slice of x, its slice of the
+        context and which of those rows each anchor sees. The scores against the context are what takes the memory."""
         a, b, _ = x.shape
         c, s = cos[:, :, None], sin[:, :, None]
         q = rotate(self.q_norm(self.q_proj(x).view(a, b, self.heads, self.dim)), c, s)
         k = rotate(self.k_norm(self.k_proj(x).view(a, b, self.kv, self.dim)), c, s)
         v = self.v_proj(x).view(a, b, self.kv, self.dim)
         q = q.view(a, b, self.kv, self.group, self.dim) * self.scale
-        far = torch.einsum("abgrd,tgd->abgrt", q, k_ctx).masked_fill(~visible[:, None, None, None], -math.inf)
-        near = torch.einsum("abgrd,acgd->abgrc", q, k)
-        p = torch.cat([far, near], -1).softmax(-1)
-        t = k_ctx.shape[0]
-        out = torch.einsum("abgrt,tgd->abgrd", p[..., :t], v_ctx) + torch.einsum("abgrc,acgd->abgrd", p[..., t:], v)
-        return self.o_proj(out.flatten(2))
+        out = []
+        for rows, context, visible in spans:
+            out.append(self.span(q[rows], k[rows], v[rows], k_ctx[context], v_ctx[context], visible))
+        return self.o_proj(torch.cat(out).flatten(2))
 
 
 class Mlp(nn.Module):
@@ -152,12 +158,15 @@ class Layer(nn.Module):
         self.self_attn, self.mlp = Attention(h, heads, kv, dim), Mlp(h, ff)
         self.attention_conv, self.mlp_conv = DynConv(h), DynConv(h)
 
-    def forward(self, x, cos, sin, ctx, ctx_cos, ctx_sin, visible):
+    def forward(self, x, cos, sin, ctx, ctx_cos, ctx_sin, spans):
         k_ctx, v_ctx = self.self_attn.context(ctx, ctx_cos, ctx_sin)
         y, kernel = self.attention_conv.prepare(self.input_layernorm(x))
-        x = x + self.attention_conv.finish(self.self_attn(y, cos, sin, k_ctx, v_ctx, visible), kernel)
+        x = x + self.attention_conv.finish(self.self_attn(y, cos, sin, k_ctx, v_ctx, spans), kernel)
         y, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
         return x + self.mlp_conv.finish(self.mlp(y), kernel)
+
+
+SPAN = 32  # anchors per pass over the context
 
 
 class Drafter(nn.Module):
@@ -180,23 +189,31 @@ class Drafter(nn.Module):
               "candidate_selector.hidden_projection.weight": self.hidden_projection.weight}
         return {k: v.detach().to(torch.bfloat16).cpu().contiguous() for k, v in w.items()}
 
-    def forward(self, embed, taps, ids, doc_start, anchors, table, window, use_checkpoint):
-        """The block's output states [a][b][H]; doc_start [T]: where each token's document starts"""
+    def forward(self, embed, taps, ids, doc_start, anchors, table, window):
+        """The block's output states [a][b][H]; doc_start [T]: where each token's document starts; anchors ascending"""
         device = ids.device
         T, A = ids.shape[0], anchors.shape[0]
-        ctx = self.hidden_norm(self.fc(taps.float()))
+        ctx = self.hidden_norm(self.fc(taps))
         pos = torch.arange(T, device=device) - doc_start
         cos, sin = table(max(int(pos.max()) + self.block + 1, 1), device)
         block_pos = pos[anchors][:, None] + torch.arange(self.block, device=device)
         # the context of an anchor: its document's tokens before it, in the window
-        rows = torch.arange(T, device=device)[None]
-        visible = (rows < anchors[:, None]) & (rows >= doc_start[anchors][:, None]) & (rows >= anchors[:, None] - window)
+        spans, starts = [], doc_start[anchors]
+        for first in range(0, A, SPAN):
+            end = first + SPAN
+            for s in starts[first:end].unique_consecutive():
+                at = first + (starts[first:end] == s).nonzero()[:, 0]
+                lo, hi = int(at[0]), int(at[-1]) + 1
+                context = slice(max(int(s), int(anchors[lo]) - window), int(anchors[hi - 1]))
+                rows = torch.arange(context.start, context.stop, device=device)[None]
+                mine = anchors[lo:hi, None]
+                spans.append((slice(lo, hi), context, (rows < mine) & (rows >= s) & (rows >= mine - window)))
         tokens = torch.full((A, self.block), self.mask, device=device)
         tokens[:, 0] = ids[anchors]
         x = embed(tokens).float()
-        args = (cos[block_pos], sin[block_pos], ctx, cos[pos], sin[pos], visible)
+        args = (cos[block_pos], sin[block_pos], ctx, cos[pos], sin[pos], spans)
         for layer in self.layers:
-            x = checkpoint(layer, x, *args, use_reentrant=False) if use_checkpoint and self.training else layer(x, *args)
+            x = checkpoint(layer, x, *args, use_reentrant=False, preserve_rng_state=False) if torch.is_grad_enabled() else layer(x, *args)
         return self.norm(x)
 
     def select(self, unary, hidden, predecessors, candidates):
@@ -287,50 +304,57 @@ class Stats:
                 f"| 1-TV {(self.tv / c)[1:].mean():.3f} recall {(self.recall / c)[1:].mean():.3f} | loss {self.loss / max(self.steps, 1):.3f}")
 
 
-def compute(model, target, head, embed, batch, a, stats, table):
-    ids, starts, anchors = batch["ids"], batch["starts"], batch["anchors"]
+def compute(model, head, embed, batch, a, stats, table, train=False):
+    """Stats of a batch, and with `train` the gradients of its loss. The output layer has 100k columns and no weights to train:
+    it and the loss run on chunks of rows that are cut from the graph, and their gradient then goes through the layers once."""
+    ids, starts, anchors = batch["ids"], batch["starts"], batch["anchors"].sort().values
     block = a.block_size
-    hidden = model(embed, batch["taps"], ids, starts, anchors, table, a.window, a.checkpoint)
-    rows = hidden[:, 1:].reshape(-1, hidden.shape[-1])
-    at = (anchors[:, None] + torch.arange(block - 1, device=ids.device)).reshape(-1)  # the target's row before each token
-    with torch.no_grad():
-        p = head(batch["last"][at]).float().softmax(-1)
-    unary = head(rows).float()
-    log_q = unary.log_softmax(-1)
-    weights = torch.exp(-torch.arange(block - 1, device=ids.device).float() / a.gamma).repeat(anchors.shape[0])
-    argmax = p.argmax(-1)
-    ce = F.nll_loss(log_q, argmax, reduction="none")
-    tv = 0.5 * (p - log_q.exp()).abs().sum(-1)
-    unary_loss = (weights * (a.ce * ce + (1 - a.ce) * tv)).sum() / weights.sum()
+    device = ids.device
+    hidden = model(embed, batch["taps"], ids, starts, anchors, table, a.window)
+    through_layers = hidden[:, 1:].reshape(-1, hidden.shape[-1])
+    rows = through_layers.detach().requires_grad_(train)
+    at = (anchors[:, None] + torch.arange(block - 1, device=device)).reshape(-1)  # the target's row before each token
+    weights = torch.exp(-torch.arange(block - 1, device=device).float() / a.gamma).repeat(anchors.shape[0])
     # the selector, teacher-forced on the true previous tokens
-    tokens = ids[(anchors[:, None] + torch.arange(block, device=ids.device))]
-    predecessors = tokens[:, :-1].reshape(-1)
-    with torch.no_grad():
-        candidates = unary.topk(a.top_k, -1).indices
-        hit = candidates == argmax[:, None]
-        contains = hit.any(-1)
-        gold = hit.float().argmax(-1)
-    scores = model.select(unary, rows, predecessors, candidates)
-    sel_ce = F.cross_entropy(scores, gold, reduction="none") * contains
-    loss = unary_loss + (weights * sel_ce).sum() / weights.sum()
-    with torch.no_grad():
+    predecessors = ids[anchors[:, None] + torch.arange(block - 1, device=device)].reshape(-1)
+    w = head.matrix().T
+    total, parts = weights.sum(), []
+    for i in range(0, rows.shape[0], a.chunk):
+        cut = slice(i, i + a.chunk)
+        p = (batch["last"][at[cut]].to(torch.bfloat16) @ w).float().softmax(-1)
+        unary = (rows[cut].to(torch.bfloat16) @ w).float()
+        log_q = unary.log_softmax(-1)
+        argmax = p.argmax(-1)
+        tv = 0.5 * (p - log_q.exp()).abs().sum(-1)
+        unary_loss = a.ce * F.nll_loss(log_q, argmax, reduction="none") + (1 - a.ce) * tv
+        with torch.no_grad():
+            candidates = unary.topk(a.top_k, -1).indices
+            hit = candidates == argmax[:, None]
+            contains = hit.any(-1)
+            gold = hit.float().argmax(-1)
+        scores = model.select(unary, rows[cut], predecessors[cut], candidates)
+        sel_ce = F.cross_entropy(scores, gold, reduction="none") * contains
+        loss = (weights[cut] * (unary_loss + sel_ce)).sum() / total
+        if train:
+            loss.backward()
         chosen = candidates.gather(-1, scores.argmax(-1, keepdim=True))[:, 0]
-        correct = (chosen == argmax).view(-1, block - 1)
-        unary_ok = (unary.argmax(-1) == argmax).view(-1, block - 1)
-        for i in range(block - 1):
-            stats.sel[i + 1] += correct[:, i].sum().item()
-            stats.tv[i + 1] += (1 - tv).view(-1, block - 1)[:, i].sum().item()
-            stats.recall[i + 1] += contains.view(-1, block - 1)[:, i].sum().item()
-            stats.count[i + 1] += correct.shape[0]
-        stats.eal += (correct.float().cumprod(1).sum(1) + 1).sum().item()
-        stats.eal_u += (unary_ok.float().cumprod(1).sum(1) + 1).sum().item()
-        taken = p.gather(-1, chosen[:, None])[:, 0].view(-1, block - 1)
-        stats.eal_p += (taken.cumprod(1).sum(1) + 1).sum().item()
-        stats.eal_tv += ((1 - tv).view(-1, block - 1).cumprod(1).sum(1) + 1).sum().item()
-        stats.blocks += correct.shape[0]
-        stats.loss += loss.item()
-        stats.steps += 1
-    return loss
+        parts.append((chosen == argmax, unary.argmax(-1) == argmax, 1 - tv.detach(), contains, p.gather(-1, chosen[:, None])[:, 0], loss.item()))
+    if train:
+        del w  # the layers' gradients take its room
+        through_layers.backward(rows.grad)
+    correct, unary_ok, match, recall, taken = (torch.cat([x[j] for x in parts]).float().view(-1, block - 1) for j in range(5))
+    for i in range(block - 1):
+        stats.sel[i + 1] += correct[:, i].sum().item()
+        stats.tv[i + 1] += match[:, i].sum().item()
+        stats.recall[i + 1] += recall[:, i].sum().item()
+        stats.count[i + 1] += correct.shape[0]
+    stats.eal += (correct.cumprod(1).sum(1) + 1).sum().item()
+    stats.eal_u += (unary_ok.cumprod(1).sum(1) + 1).sum().item()
+    stats.eal_p += (taken.cumprod(1).sum(1) + 1).sum().item()
+    stats.eal_tv += (match.cumprod(1).sum(1) + 1).sum().item()
+    stats.blocks += correct.shape[0]
+    stats.loss += sum(x[5] for x in parts)
+    stats.steps += 1
 
 
 def target_batch(target, taps_at, data, a, rng, device):
@@ -377,7 +401,7 @@ def main():
     p.add_argument("--window", type=int, default=2048)
     p.add_argument("--gamma", type=float, default=4.0)
     p.add_argument("--ce", type=float, default=0.1)
-    p.add_argument("--checkpoint", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--chunk", type=int, default=256, help="rows per pass through the output layer")
     p.add_argument("--init")
     a = p.parse_args()
     torch.manual_seed(0)
@@ -417,12 +441,12 @@ def main():
     def evaluate():
         model.eval()
         stats, er = Stats(a.block_size), random.Random(1)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
             for _ in range(8):
                 b = target_batch(target, a.taps, held, a, er, "cuda")
                 for _ in range(2):
                     pick = b["anchors"][torch.randperm(len(b["anchors"]), device="cuda")[:a.anchors]]
-                    compute(model, target, head, embed, b | {"anchors": pick}, a, stats, table)
+                    compute(model, head, embed, b | {"anchors": pick}, a, stats, table)
         model.train()
         return stats
 
@@ -439,9 +463,15 @@ def main():
         if len(pick) < 8:
             batch = None
             continue
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = compute(model, target, head, embed, batch | {"anchors": batch["anchors"][pick]}, a, stats, table)
-        loss.backward()
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):  # a cache would keep a copy of every weight
+                compute(model, head, embed, batch | {"anchors": batch["anchors"][pick]}, a, stats, table, train=True)
+        except torch.OutOfMemoryError:  # a rare batch of long documents is not worth a day's run
+            print(f"step {step}: out of memory, batch skipped", flush=True)
+            model.zero_grad(set_to_none=True)
+            batch = None
+            torch.cuda.empty_cache()
+            continue
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         progress = step / a.steps
         opt.step(min(1.0, step / 200) * (1 - progress))
