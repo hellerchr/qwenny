@@ -9,6 +9,7 @@
     --bg: #faf9f7; --side: #f3f1ed; --fg: #1c1b19; --muted: #8a867e; --line: #e7e4de;
     --bubble: #ebe8e2; --hover: #e9e6e0; --accent: #c2410c; --think: #f3f1ec; --danger: #dc2626; --ok: #15803d; --warn: #b45309;
     --col: min(720px, calc(100% - 40px));  /* one column: messages and input */
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
@@ -80,7 +81,7 @@
   .shint { color: var(--muted); font-size: 13px; }
   .kv { display: grid; grid-template-columns: 6.5em 1fr auto; gap: 8px 10px; align-items: center; }
   .kv > span { color: var(--muted); font-size: 13px; }
-  .kv code, .ex pre { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--think);
+  .kv code, .ex pre { font: 12.5px var(--mono); background: var(--think);
                       border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; overflow-x: auto;
                       white-space: pre; min-width: 0; margin: 0; }
   .ex { display: flex; flex-direction: column; gap: 8px; }
@@ -92,7 +93,7 @@
   .akeys { width: 100%; border-collapse: collapse; font-size: 13.5px; }
   .akeys th, .akeys td { padding: 7px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
   .akeys th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  .akeys code, .newkey code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .akeys code, .newkey code { font: 12.5px var(--mono); }
   .newkey { background: var(--think); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
             display: flex; flex-direction: column; gap: 8px; }
   .newkey code { word-break: break-all; color: var(--fg); }
@@ -116,7 +117,7 @@
   #questions { display: flex; flex-direction: column; gap: 12px; }
   .card { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 10px; }
   .qhead { display: flex; align-items: center; gap: 8px; }
-  .qname { width: 9em; flex: none; padding: 4px 8px; font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .qname { width: 9em; flex: none; padding: 4px 8px; font: 12.5px var(--mono); }
   .seg { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--hover); }
   .seg button { height: 26px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--muted); cursor: pointer; font-size: 12.5px; }
   .seg button:hover { color: var(--fg); }
@@ -127,7 +128,7 @@
   .opt { display: flex; align-items: center; gap: 6px; }
   .tag { flex: none; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border-radius: 8px;
          background: var(--think); border: 1px solid var(--line); color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .opt .key { width: 9em; flex: none; font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 7px 10px; }
+  .opt .key { width: 9em; flex: none; font: 12.5px var(--mono); padding: 7px 10px; }
   .opt .desc { flex: 1; padding: 6px 10px; }
   .opt .ib { visibility: hidden; } .opt:hover .ib, .opt:focus-within .ib { visibility: visible; }
   @media (hover: none) { .opt .ib { visibility: visible; } }
@@ -148,8 +149,8 @@
   details.setup .num { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
   details.setup .num .in { width: 6em; }
   .num { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
-  .num .in::-webkit-inner-spin-button { display: none; } .num .in { -moz-appearance: textfield; }
-  .num .in { width: 76px; padding: 6px 10px; font-variant-numeric: tabular-nums; }
+  .num .in::-webkit-inner-spin-button { display: none; }
+  .num .in { width: 76px; padding: 6px 10px; font-variant-numeric: tabular-nums; -moz-appearance: textfield; }
   .drow .grow { flex: 1; }
   .kbd { color: var(--muted); font-size: 12px; }
   #go { height: 38px; padding: 0 20px; border: 0; border-radius: 12px; background: var(--fg); color: var(--bg); cursor: pointer;
@@ -161,7 +162,7 @@
   .result .ticket { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .answer + .answer { border-top: 1px solid var(--line); padding-top: 14px; }
   .answer .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-  .answer .q { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted); }
+  .answer .q { font: 12px var(--mono); color: var(--muted); }
   .answer .choice { font-weight: 600; font-size: 15px; }
   .answer .conf { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; margin-left: auto; }
   .badge { font-size: 12px; padding: 1px 10px; border-radius: 99px; border: 1px solid; align-self: center; }
@@ -179,8 +180,6 @@
              border: 3px solid var(--bg); transform: translate(-50%, -50%); box-shadow: 0 0 0 1px var(--accent); }
   .result .stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
   .answer .lowmass { color: var(--warn); font-size: 12px; margin: -4px 0 10px; }
-  .notice { width: var(--col); margin: 18vh auto 0; text-align: center; color: var(--muted); font-size: 14px; }
-  .notice code { font-size: 13px; background: var(--think); padding: .1em .4em; border-radius: 4px; }
   .chat {
     display: flex; align-items: center; gap: 4px; padding: 7px 10px; border-radius: 8px;
     cursor: pointer; font-size: 14px; color: var(--muted);
@@ -239,10 +238,9 @@
   details.think summary::before { content: "▸ "; }
   details.think[open] summary::before { content: "▾ "; }
   .meta {
-    display: flex; gap: 12px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 6px;
+    display: flex; gap: 2px; align-items: center; color: var(--muted); font-size: 12px; margin: 6px 0 0 -5px;
     font-variant-numeric: tabular-nums; min-height: 18px;
   }
-  .meta { gap: 2px; margin-left: -5px; }
   .user .meta { margin: 4px -5px 0 0; }
   .meta .stat { margin: 0 6px 0 5px; }
   .meta .stat:empty { margin: 0; }
@@ -274,7 +272,7 @@
   .body ul, .body ol { margin: .3em 0 .75em; padding-left: 1.5em; }
   .body li { margin: .15em 0; }
   .body li > p { margin: 0; }
-  .body code { font: .88em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--think); padding: .1em .35em; border-radius: 4px; }
+  .body code { font: .88em/1.5 var(--mono); background: var(--think); padding: .1em .35em; border-radius: 4px; }
   .body pre { background: var(--think); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: .4em 0 .8em; }
   .body pre code { background: none; padding: 0; font-size: 13px; }
   .body blockquote { margin: .4em 0 .8em; padding: 0 0 0 12px; border-left: 2px solid var(--line); color: var(--muted); }
@@ -308,11 +306,11 @@
   #pnew:not([href]) { opacity: .35; pointer-events: none; }
   #perr { display: flex; align-items: center; gap: 10px; padding: 8px 12px 8px 16px; font-size: 13px; border-bottom: 1px solid var(--line);
           color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
-  #perr span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #perr span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
   #perr .btn { flex: none; height: 26px; }
   #frame { flex: 1; width: 100%; border: 0; background: #fff; }
   #pcode { flex: 1; margin: 0; overflow: auto; padding: 12px 16px; background: var(--think);
-           font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+           font: 13px/1.5 var(--mono); }
   #grip { position: absolute; inset: 0 auto 0 -4px; width: 8px; cursor: col-resize; z-index: 1; }
   body.dragging { user-select: none; cursor: col-resize; }
   body.dragging iframe { pointer-events: none; }
@@ -411,7 +409,6 @@
       </div>
       <div id="results"></div>
     </div>
-    <p class="notice" id="dnone" hidden>This server has no decision endpoint (<code>/v1/decisions</code>).</p>
   </main>
 </div>
 <dialog id="settings" aria-labelledby="stitle">
@@ -433,10 +430,14 @@ const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), send = $("send"), main = document.querySelector("main");
 const KEY = "qwenny.chats";
 
+// localStorage may be blocked: nothing is kept then
+const stored = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+const store = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+const storedJson = (key, fallback) => { try { return JSON.parse(stored(key)) || fallback; } catch { return fallback; } };
+
 // chats: [{id, title, updated, messages: [{role, content, reasoning?, stats?, error?}]}], newest first
-let chats = [], cur = null, busy = null;
-try { chats = JSON.parse(localStorage.getItem(KEY)) || []; } catch { chats = []; }
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(chats)); } catch {} };
+let chats = storedJson(KEY, []), cur = null, busy = null;
+const save = () => store(KEY, JSON.stringify(chats));
 
 fetch("/v1/models").then(r => r.json()).then(d => { $("model").textContent = d.data[0].id; }).catch(() => {});
 
@@ -449,6 +450,8 @@ function el(tag, cls, text) {
 function button(label, onclick, cls) { const b = el("button", cls, label); b.type = "button"; b.onclick = onclick; return b; }
 const atBottom = () => main.scrollHeight - main.scrollTop - main.clientHeight < 80;
 const toBottom = () => { main.scrollTop = main.scrollHeight; };
+// a text area as high as its text (up to its max-height), borders included
+const fit = (t) => { t.style.height = "auto"; t.style.height = t.scrollHeight + t.offsetHeight - t.clientHeight + "px"; };
 
 // ---- icons (Lucide shapes) ----
 const ICONS = {
@@ -483,12 +486,11 @@ const setSend = (busy) => { send.innerHTML = icon(busy ? "stop" : "send"); send.
 setSend(false);
 const think = $("thinking");
 // The thinking toggle starts on, as Qwen is meant to run, until the user flips it.
-think.setAttribute("aria-pressed", "true");
-try { think.setAttribute("aria-pressed", localStorage.getItem("qwenny.thinking") !== "0"); } catch {}
+think.setAttribute("aria-pressed", stored("qwenny.thinking") !== "0");
 think.onclick = () => {
   const on = think.getAttribute("aria-pressed") !== "true";
   think.setAttribute("aria-pressed", on);
-  try { localStorage.setItem("qwenny.thinking", on ? "1" : "0"); } catch {}
+  store("qwenny.thinking", on ? "1" : "0");
 };
 
 // ---- markdown (replies only; HTML is escaped first, links only http(s)) ----
@@ -588,6 +590,7 @@ function copyText(text, b) {
     b.innerHTML = icon("check"); setTimeout(() => b.innerHTML = icon("copy"), 1200);
   });
 }
+function copyBtn(text) { const b = iconButton("copy", "Copy", () => copyText(text, b)); return b; }
 
 // ---- artifact panel: the page runs in a frame sandboxed without allow-same-origin (an opaque origin, so it cannot
 // read the chats); the server keeps it at /artifacts/<id> with the same sandbox, for a tab of its own ----
@@ -649,14 +652,14 @@ panel.querySelectorAll("[data-view]").forEach((b) => b.onclick = () => setView(b
 $("preload").onclick = () => { if (art) { setView("preview"); load(); } };
 $("pcopy").onclick = () => { if (art) copyText(art, $("pcopy")); };
 $("pclose").onclick = closeArt;
-try { const w = localStorage.getItem("qwenny.panel"); if (w) panel.style.width = w; } catch {}
+if (stored("qwenny.panel")) panel.style.width = stored("qwenny.panel");
 $("grip").onpointerdown = (e) => {
   const grip = e.target;
   e.preventDefault(); grip.setPointerCapture(e.pointerId); document.body.classList.add("dragging");
   grip.onpointermove = (e) => { panel.style.width = Math.max(320, innerWidth - e.clientX) + "px"; };
   grip.onpointerup = () => {
     grip.onpointermove = grip.onpointerup = null; document.body.classList.remove("dragging");
-    try { localStorage.setItem("qwenny.panel", panel.style.width); } catch {}
+    store("qwenny.panel", panel.style.width);
   };
 };
 
@@ -694,8 +697,7 @@ function open(id) {
   document.body.classList.remove("side-open");
   renderList(); renderChat(); input.focus();
 }
-function newChat() { stop(); closeArt(); cur = null; document.body.classList.remove("side-open"); renderList(); renderChat(); input.focus(); }
-$("new").onclick = newChat;
+$("new").onclick = () => open(null);
 document.querySelectorAll(".menu").forEach((b) => b.onclick = () => document.body.classList.toggle("side-open"));
 document.querySelectorAll("main").forEach((m) => m.addEventListener("click", () => document.body.classList.remove("side-open")));
 
@@ -735,12 +737,8 @@ function assistantEl(m, i) {
   d.append(body);
   const meta = el("div", "meta");
   meta.append(el("span", "stat" + (m.error ? " error" : ""), m.error || m.stats || ""));
-  if (m.content) {
-    const cp = iconButton("copy", "Copy", () => copyText(m.content, cp));
-    meta.append(cp);
-  }
+  if (m.content) meta.append(copyBtn(m.content));
   meta.append(iconButton("regen", "Regenerate", () => regenerate(i)));
-
   d.append(meta);
   return d;
 }
@@ -749,8 +747,7 @@ function edit(i, node) {
   const m = cur.messages[i];
   const box = el("div", "editor"), ta = el("textarea"), row = el("div", "row");
   ta.value = m.content; ta.rows = 1;
-  const fit = () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; };
-  ta.oninput = fit;
+  ta.oninput = () => fit(ta);
   row.append(button("Cancel", () => renderChat(), "btn"), button("Send", () => {
     const text = ta.value.trim();
     if (!text) return;
@@ -764,7 +761,7 @@ function edit(i, node) {
   };
   box.append(ta, row);
   node.replaceChildren(box);
-  fit(); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  fit(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 function regenerate(i) {
   if (busy) return;
@@ -779,8 +776,7 @@ function touch() {  // the current chat moves to the top of the list
 }
 function stop() { if (busy) busy.abort(); }
 
-function grow() { input.style.height = "auto"; input.style.height = input.scrollHeight + "px"; }
-input.addEventListener("input", grow);
+input.addEventListener("input", () => fit(input));
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
 });
@@ -789,7 +785,7 @@ $("form").addEventListener("submit", (e) => {
   if (busy) { stop(); return; }
   const text = input.value.trim();
   if (!text) return;
-  input.value = ""; grow();
+  input.value = ""; fit(input);
   if (!cur) cur = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: title(text), messages: [] };
   cur.messages.push({ role: "user", content: text });
   touch(); renderChat(); generate();
@@ -883,7 +879,7 @@ async function generate() {
 function setMode(mode) {
   document.body.dataset.mode = mode;
   document.querySelectorAll(".tabs button").forEach((b) => b.setAttribute("aria-selected", b.dataset.mode === mode));
-  try { localStorage.setItem("qwenny.mode", mode); } catch {}
+  store("qwenny.mode", mode);
   // #decide/<preset> opens that preset
   if (mode !== "decide" || !location.hash.startsWith("#decide"))
     history.replaceState(null, "", mode === "decide" ? "#decide" : location.pathname);
@@ -901,14 +897,6 @@ async function authJson(url, opts) {
 }
 const post = (url, body) => authJson(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 const day = (t) => t ? new Date(t * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "never";
-// a copy button for `text`
-function copyBtn(text) {
-  const b = iconButton("copy", "Copy", () => {
-    navigator.clipboard?.writeText(text);
-    b.innerHTML = icon("check"); setTimeout(() => b.innerHTML = icon("copy"), 1500);
-  });
-  return b;
-}
 const card = (title, ...parts) => { const c = el("section"); c.append(el("h3", null, title), ...parts); return c; };
 async function loadAdmin(fresh) {
   const box = $("aform");
@@ -1009,8 +997,7 @@ const TYPES = { choice: "Choice", score: "Score", noul: "Yes / No" };
 let presets = [], preset = null, questions = [];
 // edits are kept per preset in the browser ("" is Custom), with the last preset used
 const DRAFTS = "qwenny.decide";
-let drafts = {};
-try { drafts = JSON.parse(localStorage.getItem(DRAFTS)) || {}; } catch {}
+const drafts = storedJson(DRAFTS, {});
 const FIELDS = ["dsystem", "dtemplate", "dthreshold", "dtemp", "dticket", "dcontext"];
 function saveDraft() {
   const d = { questions };
@@ -1018,10 +1005,9 @@ function saveDraft() {
   drafts[preset?.name || ""] = d;
   drafts.last = preset?.name || "";
   $("dreset").hidden = false;
-  try { localStorage.setItem(DRAFTS, JSON.stringify(drafts)); } catch {}
+  store(DRAFTS, JSON.stringify(drafts));
 }
 fetch("/v1/decisions/presets").then((r) => r.ok ? r.json() : null).catch(() => null).then((p) => {
-  if (!p) { $("dnone").hidden = false; return; }
   presets = Array.isArray(p) ? p : [];
   $("dform").hidden = false;
   const linked = decodeURIComponent(location.hash.match(/^#decide\/(.+)/)?.[1] ?? "");
@@ -1064,14 +1050,14 @@ function choosePreset(p, reset) {
   $("dticket").value = p?.example || "";
   $("dcontext").value = p?.example_context || "";
   if (d) { questions = d.questions; for (const id of FIELDS) $(id).value = d[id] ?? $(id).value; }
-  // drafts from before the question field started empty carry the old placeholder question
-  for (const q of questions) if (q.question === "Which option fits?") q.question = "";
   $("dreset").hidden = !d;
   $("dsetup").open = false;
   renderQuestions(); showContext(); renderPresets();
   drafts.last = p?.name || "";
-  try { localStorage.setItem(DRAFTS, JSON.stringify(drafts)); } catch {}
+  store(DRAFTS, JSON.stringify(drafts));
 }
+// a score's levels as the model reads them (decide.rs): from 1, but ten levels from 0, since "10" is no single token
+const firstLevel = (q) => q.options.length > 9 ? 0 : 1;
 const textInput = (cls, value, placeholder, oninput) => {
   const i = el("input", "in " + cls); i.value = value; i.placeholder = placeholder; i.oninput = () => oninput(i.value); return i;
 };
@@ -1092,10 +1078,11 @@ function renderQuestions() {
     const opts = el("div", "opts");
     q.options.forEach((o, oi) => {
       const row = el("div", "opt");
-      const tag = q.type === "score" ? String(oi + 1) : q.type === "noul" ? (oi ? "no" : "yes") : String.fromCharCode(65 + oi);
+      const level = firstLevel(q) + oi;
+      const tag = q.type === "score" ? String(level) : q.type === "noul" ? (oi ? "no" : "yes") : String.fromCharCode(65 + oi);
       row.append(el("span", "tag", tag));
       if (q.type !== "noul") row.append(textInput("key", o.key, "key", (v) => o.key = v));
-      const fallback = q.type === "noul" ? (oi ? "Nein" : "Ja") : q.type === "score" ? (oi ? oi === q.options.length - 1 ? "highest level" : "level " + (oi + 1) : "lowest level") : "option text the model reads";
+      const fallback = q.type === "noul" ? (oi ? "Nein" : "Ja") : q.type === "score" ? (oi ? oi === q.options.length - 1 ? "highest level" : "level " + level : "lowest level") : "option text the model reads";
       row.append(textInput("desc", o.description, fallback, (v) => o.description = v));
       if (q.type !== "noul") {
         const rm = iconButton("x", "Remove", () => { q.options.splice(oi, 1); edited(); });
@@ -1114,7 +1101,7 @@ function renderQuestions() {
       add.innerHTML = icon("plus") + (q.type === "score" ? "Add level" : "Add option");
       card.append(add);
     }
-    if (q.type === "score") card.append(el("p", "hint", "Levels go from low (1) to high; the score is the probability-weighted level, 0 to 1."));
+    if (q.type === "score") card.append(el("p", "hint", `Levels go from low (${firstLevel(q)}) to high; the score is the probability-weighted level, 0 to 1.`));
     if (q.type === "noul") card.append(el("p", "hint", "Optional: describe what yes and no mean. The answer is the probability of yes."));
     box.append(card);
   });
@@ -1140,8 +1127,6 @@ $("addq").onclick = () => {
   $("questions").lastChild.querySelector(".qtext").focus();
 };
 function showContext() { $("dctxwrap").hidden = !$("dtemplate").value.includes("{context}"); fitAll(); }
-// the text areas grow with their text (up to their max-height)
-const fit = (t) => { t.style.height = "auto"; t.style.height = t.scrollHeight + 2 + "px"; };
 const AREAS = ["dticket", "dcontext", "dsystem", "dtemplate"];
 const fitAll = () => AREAS.forEach((id) => fit($(id)));
 AREAS.forEach((id) => $(id).addEventListener("input", () => fit($(id))));
@@ -1196,8 +1181,7 @@ function answerEl(name, a, texts) {
   const label = (k) => texts[k] && texts[k] !== k ? texts[k] : k;
   if (a.type === "noul") {
     const c = el("span", "conf", `p(yes) ${pct(a.noul)}`);
-    c.title = `"Act at p ≥" compares the larger of p(yes) and p(no) · ` + (a.label_mass == null ? "read by the decision head"
-      : `label mass ${pct(a.label_mass)} (share of the next-token distribution on Ja / Nein)`);
+    c.title = `"Act at p ≥" compares the larger of p(yes) and p(no) · label mass ${pct(a.label_mass)} (share of the next-token distribution on Ja / Nein)`;
     head.append(el("span", "choice", a.noul >= 0.5 ? "Yes" : "No"), c);
   }
   else head.append(el("span", "choice", a.type === "score" ? a.score.toFixed(2) : label(a.choice)));
@@ -1210,8 +1194,7 @@ function answerEl(name, a, texts) {
     const c = el("span", "conf", (a.type === "score" ? `most likely ${label(a.choice)} · ` : "") + (near ? `p ±1 level ${pct(a.p_near)}` : `p ${pct(top)}`));
     c.title = (near ? `probability of the most likely level and its neighbours (compared with "Act at p ≥"; the level alone ${pct(top)})`
       : `probability of the top option (compared with "Act at p ≥")`) + ` · margin to the runner-up ${(100 * a.margin).toFixed(1)} pts · ` +
-      `spread (1 - normalized entropy) ${pct(a.confidence)} · ` + (a.label_mass == null ? "read by the decision head"
-      : `label mass ${pct(a.label_mass)} (share of the next-token distribution on the options)`);
+      `spread (1 - normalized entropy) ${pct(a.confidence)} · label mass ${pct(a.label_mass)} (share of the next-token distribution on the options)`;
     head.append(c);
   }
   box.append(head);
@@ -1241,10 +1224,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 renderList(); renderChat();
-let start = "chat";
-try { start = localStorage.getItem("qwenny.mode") || "chat"; } catch {}
-if (start !== "decide") start = "chat";
-setMode(location.hash.startsWith("#decide") ? "decide" : start);
+setMode(location.hash.startsWith("#decide") || stored("qwenny.mode") === "decide" ? "decide" : "chat");
 </script>
 </body>
 </html>

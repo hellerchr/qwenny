@@ -10,7 +10,7 @@ use tokenizers::Tokenizer;
 
 pub struct Chat {
     env: Environment<'static>,
-    pub tok: Tokenizer,
+    tok: Tokenizer,
     bos: Json,
     /// Every token that ends a reply: the tokenizer's eos token (`<|im_end|>`), `<|endoftext|>` and config.json's
     /// eos_token_id.
@@ -91,17 +91,16 @@ fn normalize(messages: &Json) -> Result<Json> {
     Ok(messages)
 }
 
-/// Replace `{% name %}` tags (any whitespace control) by `with`: HF's `generation` markers do not render.
-fn replace_tags(src: &str, names: &[&str], with: &[&str]) -> String {
+/// Remove `{% name %}` tags (any whitespace control): HF's `generation` markers do not render.
+fn remove_tags(src: &str, names: &[&str]) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
     while let Some(i) = rest.find("{%") {
         let Some(j) = rest[i..].find("%}") else { break };
         let inner = rest[i + 2..i + j].trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
         out.push_str(&rest[..i]);
-        match names.iter().position(|n| *n == inner) {
-            Some(k) => out.push_str(with[k]),
-            None => out.push_str(&rest[i..i + j + 2]),
+        if !names.contains(&inner) {
+            out.push_str(&rest[i..i + j + 2]);
         }
         rest = &rest[i + j + 2..];
     }
@@ -159,7 +158,7 @@ impl Chat {
                 _ => v.to_string(),
             }
         });
-        env.add_template_owned("chat", replace_tags(&src, &["generation", "endgeneration"], &["", ""]))?;
+        env.add_template_owned("chat", remove_tags(&src, &["generation", "endgeneration"]))?;
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
         let cfg: Json = serde_json::from_str(&fs::read_to_string(dir.join("tokenizer_config.json"))?)?;
         // Qwen has none (null) and its template does not use it
@@ -189,22 +188,21 @@ impl Chat {
         self.ends.contains(&tok)
     }
 
-    /// The output parser. `thinking`: the prompt ended inside a think block; `tools`: the request's tools (OpenAI
-    /// format), which give the parser the parameter types.
-    pub fn parser(&self, thinking: bool, tools: Option<&Json>) -> OutputParser {
-        OutputParser::new(thinking, tools)
-    }
-
     /// The prompt for `messages` (OpenAI format) with the generation prompt; `kwargs` are extra template variables
     /// such as enable_thinking.
     pub fn render(&self, messages: &Json, tools: Option<&Json>, kwargs: &Map<String, Json>) -> Result<String> {
+        self.render_template(messages, tools, kwargs, true)
+    }
+
+    fn render_template(&self, messages: &Json, tools: Option<&Json>, kwargs: &Map<String, Json>, generation_prompt: bool)
+                       -> Result<String> {
         let mut ctx = Map::new();
         // Qwen's template takes arguments as objects and fails on OpenAI's JSON strings
         ctx.insert("messages".into(), normalize(messages)?);
         if let Some(t) = tools {
             ctx.insert("tools".into(), t.clone());
         }
-        ctx.insert("add_generation_prompt".into(), json!(true));
+        ctx.insert("add_generation_prompt".into(), json!(generation_prompt));
         ctx.insert("bos_token".into(), self.bos.clone());
         for (k, v) in kwargs {
             ctx.insert(k.clone(), v.clone());
@@ -225,14 +223,7 @@ impl Chat {
     }
 
     fn encode_masked(&self, messages: &Json, kwargs: &Map<String, Json>, last: bool) -> Result<(Vec<u32>, Vec<u8>)> {
-        let mut ctx = Map::new();
-        ctx.insert("messages".into(), normalize(messages)?);
-        ctx.insert("add_generation_prompt".into(), json!(false));
-        ctx.insert("bos_token".into(), self.bos.clone());
-        for (k, v) in kwargs {
-            ctx.insert(k.clone(), v.clone());
-        }
-        let text = self.env.get_template("chat")?.render(Value::from(Serde(&ctx)))?;
+        let text = self.render_template(messages, None, kwargs, false)?;
         let mut spans = response_spans(&text);
         if last {
             spans.drain(..spans.len().saturating_sub(1));
@@ -338,14 +329,13 @@ fn param_value(raw: &str, schema: Option<&Json>) -> Json {
     }
     let t = raw.trim();
     let allows = |k: &str| types.contains(&k);
-    let json = || serde_json::from_str::<Json>(t).ok();
-    match t {
-        "None" | "null" if allows("null") => return Json::Null,
-        "True" | "true" if allows("boolean") => return json!(true),
-        "False" | "false" if allows("boolean") => return json!(false),
-        _ => {}
-    }
-    let want = |v: &Json| match v {
+    let value = match t {
+        "None" => Some(Json::Null),
+        "True" => Some(json!(true)),
+        "False" => Some(json!(false)),
+        _ => serde_json::from_str::<Json>(t).ok(),
+    };
+    let fits = |v: &Json| match v {
         Json::Number(n) => allows("number") || (allows("integer") && (n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0))),
         Json::Array(_) => allows("array"),
         Json::Object(_) => allows("object"),
@@ -353,11 +343,8 @@ fn param_value(raw: &str, schema: Option<&Json>) -> Json {
         Json::Null => allows("null"),
         Json::String(_) => allows("string"),
     };
-    // "string" first: a string-typed parameter keeps "123" as text
-    if allows("string") {
-        return text();
-    }
-    json().filter(want).unwrap_or_else(text)
+    // a type that also allows strings keeps "123" as text; only null and booleans win over it
+    value.filter(|v| fits(v) && (!allows("string") || v.is_null() || v.is_boolean())).unwrap_or_else(text)
 }
 
 /// The tools' parameter schemas by function name.

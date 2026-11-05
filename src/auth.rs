@@ -35,8 +35,12 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn sha(s: &str) -> String {
-    Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    hex(&Sha256::digest(s.as_bytes()))
 }
 
 /// `N` bytes from the kernel's random source
@@ -49,7 +53,7 @@ fn random<const N: usize>() -> [u8; N] {
 
 /// 32 random bytes as 64 hex digits
 fn random_hex() -> String {
-    random::<32>().iter().map(|x| format!("{x:02x}")).collect()
+    hex(&random::<32>())
 }
 
 fn hash_password(pw: &str) -> Result<String> {
@@ -57,10 +61,6 @@ fn hash_password(pw: &str) -> Result<String> {
     let salt = SaltString::encode_b64(&random::<16>()).map_err(|e| anyhow::anyhow!("a salt: {e}"))?;
     Ok(Argon2::default().hash_password(pw.as_bytes(), &salt).map_err(|e| anyhow::anyhow!("hashing the password: {e}"))?
         .to_string())
-}
-
-fn verify_password(pw: &str, hash: &str) -> bool {
-    PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
 }
 
 impl Auth {
@@ -95,6 +95,13 @@ impl Auth {
         Ok(self.db().query_row("SELECT hash FROM password WHERE id = 1", [], |r| r.get(0)).optional()?)
     }
 
+    /// Whether `password` is the one set
+    fn password_ok(&self, password: &str) -> Result<bool> {
+        Ok(self.hash()?.is_some_and(|hash| {
+            PasswordHash::new(&hash).is_ok_and(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+        }))
+    }
+
     /// Whether a password is set (else the web page is open)
     pub fn has_password(&self) -> Result<bool> {
         Ok(self.hash()?.is_some())
@@ -111,7 +118,7 @@ impl Auth {
 
     /// A new session token for the right password, else None
     pub fn login(&self, password: &str) -> Result<Option<String>> {
-        if !self.hash()?.is_some_and(|h| verify_password(password, &h)) {
+        if !self.password_ok(password)? {
             return Ok(None);
         }
         Ok(Some(self.new_session()?))
@@ -146,7 +153,7 @@ impl Auth {
 
     /// Change the password, given the current one; false when that is wrong. Other logins end, `keep` stays.
     pub fn change_password(&self, old: &str, new: &str, keep: &str) -> Result<bool> {
-        if !self.hash()?.is_some_and(|h| verify_password(old, &h)) {
+        if !self.password_ok(old)? {
             return Ok(false);
         }
         let hash = hash_password(new)?;
@@ -158,7 +165,7 @@ impl Auth {
 
     /// Remove the password, given it (the page is open again); false when it is wrong
     pub fn remove_password(&self, old: &str) -> Result<bool> {
-        if !self.hash()?.is_some_and(|h| verify_password(old, &h)) {
+        if !self.password_ok(old)? {
             return Ok(false);
         }
         let db = self.db();

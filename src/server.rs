@@ -45,9 +45,8 @@ pub struct Job {
 
 /// The output state of a request that gave way without room for its image in host memory
 pub struct Progress {
-    generated: Vec<u32>,
+    reply_at: usize,
     outs: Vec<u32>,
-    text: String,
     pending: String,
     from: usize,
     read: usize,
@@ -67,17 +66,16 @@ struct Seq {
     slot: u32,
     /// prompt tokens fed so far
     fed: usize,
-    generated: Vec<u32>,
-    /// `generated` as a bit per vocabulary entry, words of 32 (presence penalty: Engine::set_outputs)
-    outs: Vec<u32>,
-    /// prompt + generated
+    /// prompt + reply
     history: Vec<u32>,
-    /// decoded text sent so far
-    text: String,
-    /// decoded text held back: its end may be the start of a stop string
+    /// where the reply starts in `history` (the prompt's end, unless the request restarted: Progress)
+    reply_at: usize,
+    /// the reply as a bit per vocabulary entry, words of 32 (presence penalty: Engine::set_outputs)
+    outs: Vec<u32>,
+    /// decoded text held back: its end may be the start of a stop string (what was sent cannot hold one's start)
     pending: String,
-    /// incremental decoding: `text` ends with the text of generated[from..read] (from: the start of the window
-    /// before the last one sent, a character boundary; read: the tokens sent)
+    /// incremental decoding: the text so far ends with the text of reply[from..read] (from: the start of the window
+    /// before the last one decoded, a character boundary; read: the tokens decoded)
     from: usize,
     read: usize,
     rng: Rng,
@@ -97,7 +95,6 @@ struct Seq {
     /// last turn: the reply's header, which the next turn renders differently, e.g. without an empty think block)
     snaps: Vec<(usize, Vec<u8>)>,
     snap_at: Vec<usize>,
-    /// the host copy of what the slot holds below where the request resumed (sessions::Image::below)
     /// admission order (the newest request gives way when device memory runs out)
     born: u64,
     /// what its speculative decoding did (SpecStats)
@@ -141,20 +138,21 @@ impl SpecStats {
 /// only (under sampling a lookup draft is accepted with p(token) and would displace the draft layer's better ones).
 const CHAIN_MIN: usize = 8;
 const CHAIN_MAX: usize = 32;
-/// The latest earlier occurrence of the longest suffix of `h` of `nmin` to `nmax` tokens with a token after it: the
+
+/// The latest earlier occurrence of the longest suffix of `h` of CHAIN_MIN to CHAIN_MAX tokens with a token after it: the
 /// index after that occurrence (where its continuation starts)
-fn suffix_match(h: &[u32], nmin: usize, nmax: usize) -> Option<usize> {
+fn suffix_match(h: &[u32]) -> Option<usize> {
     let n = h.len();
-    if n <= nmin {
+    if n <= CHAIN_MIN {
         return None;
     }
     let mut best: Option<(usize, usize)> = None;
     // j: the index after a candidate occurrence, before the end so that a continuation follows
-    for j in (nmin..n).rev() {
-        let len = (1..=nmax.min(j)).take_while(|&l| h[j - l] == h[n - l]).count();
-        if len >= nmin && best.is_none_or(|b| len > b.0) {
+    for j in (CHAIN_MIN..n).rev() {
+        let len = (1..=CHAIN_MAX.min(j)).take_while(|&l| h[j - l] == h[n - l]).count();
+        if len >= CHAIN_MIN && best.is_none_or(|b| len > b.0) {
             best = Some((len, j));
-            if len == nmax {
+            if len == CHAIN_MAX {
                 break;
             }
         }
@@ -162,20 +160,23 @@ fn suffix_match(h: &[u32], nmin: usize, nmax: usize) -> Option<usize> {
     best.map(|b| b.1)
 }
 
-/// A chain's drafts: up to `k` tokens after the latest longest suffix match of `h` of at least `nmin` (suffix_match)
-fn chain_draft(h: &[u32], nmin: usize, k: usize) -> &[u32] {
-    match suffix_match(h, nmin, CHAIN_MAX) {
+/// A chain's drafts: up to `k` tokens after the latest longest suffix match of `h` (suffix_match)
+fn chain_draft(h: &[u32], k: usize) -> &[u32] {
+    match suffix_match(h) {
         Some(j) if k > 0 => &h[j..(j + k).min(h.len())],
         _ => &[],
     }
 }
 
 impl Seq {
-    /// The reply ended without completing a stop string: the text held back is the reply's
+    fn reply(&self) -> &[u32] {
+        &self.history[self.reply_at..]
+    }
+
+    /// The text held back goes to the client: the reply ended, and that text is not a stop string
     fn flush(&mut self) {
         if !self.pending.is_empty() {
-            let _ = self.job.tx.send(Msg::Text(self.pending.clone()));
-            self.text.push_str(&std::mem::take(&mut self.pending));
+            let _ = self.job.tx.send(Msg::Text(std::mem::take(&mut self.pending)));
         }
     }
 
@@ -186,44 +187,32 @@ impl Seq {
             self.flush();
             return;
         }
-        self.generated.push(tok);
         self.history.push(tok);
         if let Some(w) = self.outs.get_mut(tok as usize / 32) {
             *w |= 1 << (tok % 32);
         }
         // the new text: that of the tokens from `from` on, less that of from..read (decoding the whole reply per token
         // cost the GPU up to 1 ms per step)
-        let (prev, cur) = (chat.decode(&self.generated[self.from..self.read]), chat.decode(&self.generated[self.from..]));
+        let reply = self.reply();
+        let (prev, cur) = (chat.decode(&reply[self.from..self.read]), chat.decode(&reply[self.from..]));
         // an incomplete UTF-8 sequence decodes to U+FFFD: wait for the next token
         if !cur.ends_with('\u{FFFD}') && cur.len() > prev.len() && cur.starts_with(&prev) {
-            let full = format!("{}{}{}", self.text, self.pending, &cur[prev.len()..]);
-            (self.from, self.read) = (self.read, self.generated.len());
-            let (mut end, mut hold) = (full.len(), 0);
-            for s in &self.job.stop {
-                // back to a character boundary: the stop string may start inside a multi-byte character
-                let mut from = self.text.len().saturating_sub(s.len());
-                while !full.is_char_boundary(from) {
-                    from -= 1;
-                }
-                if let Some(i) = full[from..].find(s.as_str()) {
-                    end = end.min(from + i);
-                    self.finish = Some("stop");
-                }
-                hold = hold.max(crate::chat::partial_tag(&full[self.text.len()..], s));
-            }
-            if self.finish.is_none() {
-                end -= hold;
-                self.pending = full[end..].to_string();
+            (self.from, self.read) = (self.read, reply.len());
+            self.pending.push_str(&cur[prev.len()..]);
+            // what was sent holds no start of a stop string, since the text that could be one waits here
+            if let Some(end) = self.job.stop.iter().filter_map(|s| self.pending.find(s.as_str())).min() {
+                self.finish = Some("stop");
+                self.pending.truncate(end);
+                self.flush();
             } else {
-                self.pending.clear();
-            }
-            if end > self.text.len() {
-                let _ = self.job.tx.send(Msg::Text(full[self.text.len()..end].to_string()));
-                self.text = full[..end].to_string();
+                let hold = self.job.stop.iter().map(|s| crate::chat::partial_tag(&self.pending, s)).max().unwrap_or(0);
+                let held = self.pending.split_off(self.pending.len() - hold);
+                self.flush();
+                self.pending = held;
             }
         }
         if self.finish.is_none()
-            && (self.generated.len() >= self.job.max_tokens || self.history.len() + 1 >= max_ctx)
+            && (self.reply().len() >= self.job.max_tokens || self.history.len() + 1 >= max_ctx)
         {
             self.finish = Some("length");
             self.flush();
@@ -236,11 +225,7 @@ const ROOM_MARGIN: usize = 1 << 30;
 
 /// A running request gives way: what its slot holds (settled at its accepted end) to the host, the slot released
 fn give_way(m: &mut Box<dyn Engine>, s: &mut Seq, shadow: Option<Image>) -> Result<Image> {
-    if s.dirty {
-        let pos = s.valid - 1;
-        m.run(&[Tok { id: s.history[pos], slot: s.slot, pos: pos as u32 }], &[])?;
-        s.dirty = false;
-    }
+    sessions::settle(m, s.slot, &s.history[..s.valid], s.job.adapter, &mut s.dirty)?;
     let img = sessions::save_image(m, s.slot, s.valid, shadow)?;
     m.release(s.slot)?;
     Ok(img)
@@ -259,106 +244,162 @@ fn mtp_depth(has_draft: bool, default: usize, capacity: usize, drafts: Option<us
     if has_draft { drafts.unwrap_or(default).min(capacity) } else { 0 }
 }
 
-/// `spec`: draft tokens per step at most (0: no speculative decoding)
-fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize,
-          mtp: usize) {
-    // `mtp`: drafts per step from the model's draft layer; an n-gram chain drafts up to `spec`
-    let spec_stats = std::env::var_os("QWENNY_SPEC_STATS").is_some();
-    let mut waiting: VecDeque<Job> = VecDeque::new();
-    let mut active: Vec<Seq> = Vec::new();
-    let mut free: Vec<u32> = (0..m.slots() as u32).rev().collect();
-    // the requests that gave way when device memory ran out, with what their slots held
-    let mut parked: VecDeque<(Seq, u64)> = VecDeque::new();
-    // requests that gave way before their first step (they start again when the device has room for their prompt)
-    let mut held: VecDeque<Job> = VecDeque::new();
-    let mut born = 0u64;
+/// The engine thread's state between steps
+struct Sched {
+    m: Box<dyn Engine>,
+    store: Option<Store>,
+    chat: Arc<Chat>,
+    /// draft tokens per step at most: from an n-gram chain (0: none), from the model's draft layer
+    spec: usize,
+    mtp: usize,
+    spec_stats: bool,
+    waiting: VecDeque<Job>,
+    active: Vec<Seq>,
+    free: Vec<u32>,
+    /// the requests that gave way when device memory ran out, with what their slots held
+    parked: VecDeque<(Seq, u64)>,
+    /// requests that gave way before their first step (they start again when the device has room for their prompt)
+    held: VecDeque<Job>,
+    born: u64,
+}
+
+/// One step, as build_step made it
+struct Step {
+    toks: Vec<Tok>,
+    /// (request, logit row of the step, draft token checked against that row), in the order of the step's logit rows
+    want: Vec<(usize, usize, Option<u32>)>,
+    /// per segment, the tokens committed since the request's last step
+    marks: Vec<Vec<u32>>,
+    /// per request in the step: (request, first index in the step, first position, tokens)
+    segs: Vec<(usize, usize, usize, usize)>,
+    /// each request's (fed, marked) before the step, restored when it cannot run (device memory)
+    undo: Vec<(usize, usize)>,
+    /// a chain's drafts per request at most in this step
+    per_chain: usize,
+}
+
+fn engine(m: Box<dyn Engine>, store: Option<Store>, chat: Arc<Chat>, mut rx: UnboundedReceiver<Job>, spec: usize, mtp: usize) {
+    let free = (0..m.slots() as u32).rev().collect();
+    let mut e = Sched { m, store, chat, spec, mtp, spec_stats: std::env::var_os("QWENNY_SPEC_STATS").is_some(), free,
+                        waiting: VecDeque::new(), active: Vec::new(), parked: VecDeque::new(), held: VecDeque::new(), born: 0 };
     loop {
-        if active.is_empty() && waiting.is_empty() && parked.is_empty() && held.is_empty() {
+        if e.active.is_empty() && e.waiting.is_empty() && e.parked.is_empty() && e.held.is_empty() {
             match rx.blocking_recv() {
-                Some(j) => waiting.push_back(j),
+                Some(j) => e.waiting.push_back(j),
                 None => return,
             }
         }
         while let Ok(j) = rx.try_recv() {
-            waiting.push_back(j);
+            e.waiting.push_back(j);
         }
-        // a request starts (or one that gave way resumes) while nothing else runs, or the device has room for it
-        let room = |m: &Box<dyn Engine>, need: usize| m.cache_room().is_none_or(|r| r >= need + ROOM_MARGIN);
-        if let Some(st) = &mut store {
+        e.admit();
+        if e.active.is_empty() {
+            continue;
+        }
+        let step = e.build_step();
+        let stepped = e.run_step(&step);
+        e.read_decisions(&step);
+        match stepped {
+            Ok(next) => {
+                let accepted = e.commit(&step, &next);
+                e.draft_next(&step, &accepted);
+                e.end_finished();
+            }
+            Err(err) => e.step_failed(&step, err),
+        }
+    }
+}
+
+impl Sched {
+    /// Whether a request may start (or one that gave way resume) next to the running ones: the device has room for it
+    fn room(&self, need: usize) -> bool {
+        self.m.cache_room().is_none_or(|r| r >= need + ROOM_MARGIN)
+    }
+
+    /// Requests into slots: those that gave way first, then those that wait
+    fn admit(&mut self) {
+        if let Some(st) = &mut self.store {
             st.trim();
         }
-        // the requests that gave way come back first (from the store: loaded, or swapped in for an idle sequence)
-        while let Some(&(ref seq, id)) = parked.front() {
+        self.resume_parked();
+        if self.parked.is_empty()
+            && let Some(job) = self.held.front()
+            && (self.active.is_empty() || self.room(self.m.slot_bytes(job.prompt.len())))
+        {
+            self.waiting.push_front(self.held.pop_front().unwrap());
+        }
+        self.start_waiting();
+    }
+
+    /// The requests that gave way come back (from the store: loaded, or swapped in for an idle sequence)
+    fn resume_parked(&mut self) {
+        while let Some(&(ref seq, id)) = self.parked.front() {
             // when its whole prompt fits (else it would give way again at once), or nothing else runs
-            if !(active.is_empty() || room(&m, m.slot_bytes(seq.job.prompt.len().max(seq.valid + 1)))) {
+            if !(self.active.is_empty() || self.room(self.m.slot_bytes(seq.job.prompt.len().max(seq.valid + 1)))) {
                 break;
             }
-            let Some(st) = &mut store else { break };
-            match st.bring_back(&mut m, id, &mut free) {
+            let Some(st) = &mut self.store else { break };
+            match st.bring_back(&mut self.m, id, &mut self.free) {
                 Ok(Some(slot)) => {
-                    let (mut seq, _) = parked.pop_front().unwrap();
-                    if let Err(e) = use_adapter(&mut m, slot, seq.job.adapter) {
+                    let (mut seq, _) = self.parked.pop_front().unwrap();
+                    if let Err(e) = use_adapter(&mut self.m, slot, seq.job.adapter) {
                         let _ = seq.job.tx.send(Msg::Error(format!("engine: {e}")));
-                        free.push(slot);
+                        self.free.push(slot);
                         continue;
                     }
                     eprintln!("cache: a request resumes in slot {slot} at {} tokens", seq.valid);
                     (seq.slot, seq.dirty) = (slot, false);
                     seq.drafts.clear();
                     seq.chain = false;
-                    active.push(seq);
+                    self.active.push(seq);
                 }
                 // nothing runs that would make room: an idle sequence goes for good (does not happen while the
                 // sessions fit as Store::new counted)
-                Ok(None) if active.is_empty() => match st.park_one(&mut m, None, true) {
-                    Ok(Some(slot)) => free.push(slot),
+                Ok(None) if self.active.is_empty() => match st.park_one(&mut self.m, None, true) {
+                    Ok(Some(slot)) => self.free.push(slot),
                     _ => {
-                        let (seq, _) = parked.pop_front().unwrap();
+                        let (seq, _) = self.parked.pop_front().unwrap();
                         let _ = seq.job.tx.send(Msg::Error("engine: no room to resume the request".into()));
                     }
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    let (seq, _) = parked.pop_front().unwrap();
+                    let (seq, _) = self.parked.pop_front().unwrap();
                     eprintln!("engine: a request that gave way could not resume: {e:#}");
                     let _ = seq.job.tx.send(Msg::Error(format!("engine: {e:#}")));
                 }
             }
         }
-        while parked.is_empty() && let Some(job) = held.front() {
-            if !(active.is_empty() || room(&m, m.slot_bytes(job.prompt.len()))) {
-                break;
-            }
-            waiting.push_front(held.pop_front().unwrap());
-            break;
-        }
-        while parked.is_empty() && held.is_empty() && !waiting.is_empty() {
-            let job = waiting.front().unwrap();
+    }
+
+    fn start_waiting(&mut self) {
+        while self.parked.is_empty() && self.held.is_empty() && !self.waiting.is_empty() {
+            let job = self.waiting.front().unwrap();
             // a request that continues a cached session takes it in by itself (Store::take: from its slot, or
             // swapped in from host memory); a new one starts when the device has room, idle sequences moving to
             // host memory as it holds them
-            let continues = store.as_ref().is_some_and(|st| st.continues(&job.prompt, job.adapter));
-            if !(continues || active.is_empty() || room(&m, m.slot_bytes(job.prompt.len()))) {
-                let keep = store.as_ref().and_then(|st| st.slot_for(&job.prompt, job.adapter));
-                match store.as_mut().map(|st| st.park_one(&mut m, keep, false)) {
-                    Some(Ok(Some(slot))) => { free.push(slot); continue }
+            let continues = self.store.as_ref().is_some_and(|st| st.continues(&job.prompt, job.adapter));
+            if !(continues || self.active.is_empty() || self.room(self.m.slot_bytes(job.prompt.len()))) {
+                let keep = self.store.as_ref().and_then(|st| st.slot_for(&job.prompt, job.adapter));
+                match self.store.as_mut().map(|st| st.park_one(&mut self.m, keep, false)) {
+                    Some(Ok(Some(slot))) => { self.free.push(slot); continue }
                     _ => break,
                 }
             }
-            if job.prompt.is_empty() || job.prompt.len() + 1 >= m.max_ctx() {
-                let job = waiting.pop_front().unwrap();
-                let msg = format!("prompt of {} tokens does not fit the context of {}", job.prompt.len(), m.max_ctx());
+            if job.prompt.is_empty() || job.prompt.len() + 1 >= self.m.max_ctx() {
+                let job = self.waiting.pop_front().unwrap();
+                let msg = format!("prompt of {} tokens does not fit the context of {}", job.prompt.len(), self.m.max_ctx());
                 let _ = job.tx.send(Msg::Error(msg));
                 continue;
             }
-            let got = match &mut store {
-                Some(st) => st.take(&mut m, &job.prompt, job.adapter, &mut free, active.len()),
-                None => Ok(free.pop().map(|s| (s, 0, Vec::new()))),
+            let got = match &mut self.store {
+                Some(st) => st.take(&mut self.m, &job.prompt, job.adapter, &mut self.free, self.active.len()),
+                None => Ok(self.free.pop().map(|s| (s, 0, Vec::new()))),
             };
             // the slot's next steps under the request's model (its cached state, if any, is that model's)
             let got = got.and_then(|g| {
                 if let Some((slot, ..)) = &g {
-                    use_adapter(&mut m, *slot, job.adapter)?;
+                    use_adapter(&mut self.m, *slot, job.adapter)?;
                 }
                 Ok(g)
             });
@@ -366,59 +407,63 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 Ok(Some(x)) => x,
                 Ok(None) => break,
                 Err(e) => {
-                    let job = waiting.pop_front().unwrap();
+                    let job = self.waiting.pop_front().unwrap();
                     eprintln!("engine: a request ({} tokens) could not start: {e:#}", job.prompt.len());
                     let _ = job.tx.send(Msg::Error(format!("engine: {e:#}")));
                     continue;
                 }
             };
-            let job = waiting.pop_front().unwrap();
-            let rng = Rng::new(job.params.seed);
-            let history = job.prompt.clone();
-            born += 1;
-            // states saved while the prompt is read: where its first message ends (other conversations with the same
-            // system prompt and tools share up to there) and where its last turn begins
-            let mut snap_at = Vec::new();
-            if let Some(t) = chat.turn_token().filter(|_| store.is_some() && job.decide.is_none() && job.prompt.len() >= SNAP_FROM) {
-                let starts: Vec<usize> = job.prompt.iter().enumerate().filter(|(_, x)| **x == t).map(|(i, _)| i).collect();
-                snap_at.extend(starts.get(1).filter(|&&p| p >= SNAP_FROM));
-                snap_at.extend(starts.last().filter(|&&p| p > 0));
-                snap_at.sort_unstable();
-                snap_at.dedup();
-                snap_at.retain(|&p| p > at);
-            }
-            let mut job = job;
-            let outs = vec![0u32; if job.params.presence_penalty != 0.0 { m.vocab() / 32 } else { 0 }];
-            let p = job.progress.take().map_or(Progress { generated: Vec::new(), outs, text: String::new(), pending: String::new(),
-                                                          from: 0, read: 0, rng }, |p| *p);
-            let Progress { generated, outs, text, pending, from, read, rng } = p;
-            active.push(Seq { job, slot, fed: at, generated, outs, history, text, pending, from, read,
-                              rng, finish: None, marked: at, drafts: Vec::new(), sampled: false, chain: false, valid: at, spec: SpecStats::default(),
-                              dirty: false, snaps, snap_at, born });
+            let job = self.waiting.pop_front().unwrap();
+            self.start(job, slot, at, snaps);
         }
-        if active.is_empty() {
-            continue;
+    }
+
+    /// `job` runs in `slot`, which holds its first `at` tokens
+    fn start(&mut self, mut job: Job, slot: u32, at: usize, snaps: Vec<(usize, Vec<u8>)>) {
+        let history = job.prompt.clone();
+        self.born += 1;
+        // states saved while the prompt is read: where its first message ends (other conversations with the same
+        // system prompt and tools share up to there) and where its last turn begins
+        let mut snap_at = Vec::new();
+        if let Some(t) = self.chat.turn_token().filter(|_| self.store.is_some() && job.decide.is_none() && job.prompt.len() >= SNAP_FROM) {
+            let starts: Vec<usize> = job.prompt.iter().enumerate().filter(|(_, x)| **x == t).map(|(i, _)| i).collect();
+            snap_at.extend(starts.get(1).filter(|&&p| p >= SNAP_FROM));
+            snap_at.extend(starts.last().filter(|&&p| p > 0));
+            snap_at.sort_unstable();
+            snap_at.dedup();
+            snap_at.retain(|&p| p > at);
         }
-        // decode tokens (with drafts) first, then prompt chunks. `want`: (request, logit row of the step, draft
-        // token checked against that row), in the order of the step's logit rows; `marks`: per segment, the tokens
-        // committed since the request's last step
-        // drafts for the decoding requests also while others read prompts (agents: one reads a tool's output while
-        // the others write): next to a prompt chunk they cost a few small draft steps
-        let decoding = active.iter().filter(|s| s.fed == s.job.prompt.len()).count();
+        let Progress { reply_at, outs, pending, from, read, rng } = match job.progress.take() {
+            Some(p) => *p,
+            None => Progress {
+                reply_at: job.prompt.len(),
+                outs: vec![0u32; if job.params.presence_penalty != 0.0 { self.m.vocab() / 32 } else { 0 }],
+                pending: String::new(),
+                from: 0,
+                read: 0,
+                rng: Rng::new(job.params.seed),
+            },
+        };
+        self.active.push(Seq { job, slot, fed: at, history, reply_at, outs, pending, from, read, rng, finish: None, marked: at,
+                               drafts: Vec::new(), sampled: false, chain: false, valid: at, dirty: false, snaps, snap_at,
+                               born: self.born, spec: SpecStats::default() });
+    }
+
+    /// The next step: decode tokens (with drafts) first, then prompt chunks. Drafts for the decoding requests also while
+    /// others read prompts (agents: one reads a tool's output while the others write): next to a prompt chunk they cost
+    /// a few small draft steps
+    fn build_step(&mut self) -> Step {
+        let m = &self.m;
+        let decoding = self.active.iter().filter(|s| s.fed == s.job.prompt.len()).count();
         let (max_tok, max_out) = (m.max_tok(), m.max_out());
         let room_each = if decoding == 0 { 0 } else { m.spec_tok().saturating_sub(decoding) / decoding };
-        let (per, per_chain) = (room_each.min(mtp), room_each.min(spec));
-        // what building the step changes, undone when the step cannot run (device memory)
-        let undo: Vec<(usize, usize)> = active.iter().map(|s| (s.fed, s.marked)).collect();
-        let mut toks = Vec::new();
-        let mut want: Vec<(usize, usize, Option<u32>)> = Vec::new();
-        let mut marks = Vec::new();
-        // per request in the step: (request, first index in the step, first position, tokens)
-        let mut segs = Vec::new();
-        for (i, s) in active.iter_mut().enumerate() {
+        let (per, per_chain) = (room_each.min(self.mtp), room_each.min(self.spec));
+        let undo = self.active.iter().map(|s| (s.fed, s.marked)).collect();
+        let (mut toks, mut want, mut marks, mut segs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, s) in self.active.iter_mut().enumerate() {
             if s.fed == s.job.prompt.len() {
-                let room = s.job.max_tokens.saturating_sub(s.generated.len() + 1).min(m.max_ctx().saturating_sub(s.history.len() + 1));
-                let d: Vec<u32> = if s.chain { chain_draft(&s.history, CHAIN_MIN, per_chain.min(room)).to_vec() }
+                let room = s.job.max_tokens.saturating_sub(s.history.len() - s.reply_at + 1).min(m.max_ctx().saturating_sub(s.history.len() + 1));
+                let d: Vec<u32> = if s.chain { chain_draft(&s.history, per_chain.min(room)).to_vec() }
                                   else { s.drafts.iter().take(per.min(room)).copied().collect() };
                 let pos = s.history.len() - 1;
                 segs.push((i, toks.len(), pos, d.len() + 1));
@@ -430,7 +475,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 s.marked = s.history.len();
             }
         }
-        for (i, s) in active.iter_mut().enumerate() {
+        for (i, s) in self.active.iter_mut().enumerate() {
             let left = s.job.prompt.len() - s.fed;
             if left > 0 && toks.len() < max_tok && want.len() < max_out {
                 let mut n = (max_tok - toks.len()).min(left);
@@ -450,42 +495,46 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 }
             }
         }
-        let rows: Vec<usize> = want.iter().map(|w| w.1).collect();
-        let plain = want.iter().all(|&(i, ..)| active[i].job.params.greedy());
-        let stepped = m.step(&toks, &rows, Some(&marks)).and_then(|_| {
-            if plain {
-                Ok(m.argmax()?.into_iter().zip(&want).map(|(t, w)| (t, w.2 == Some(t))).collect())
-            } else {
-                // the presence penalty's set: the request's outputs, uploaded per step (the sampler also counts the
-                // step's drafts before a row); a row that ends a prompt has none, and its segment's tokens are the
-                // prompt's: no penalty there
-                let mut up: Vec<usize> = want.iter().map(|w| w.0).collect();
-                up.dedup();
-                for &i in &up {
-                    let s = &active[i];
-                    if s.job.params.presence_penalty != 0.0 && !s.generated.is_empty() {
-                        m.set_outputs(s.slot, &s.outs)?;
-                    }
-                }
-                let p: Vec<[f32; 8]> = want.iter().map(|&(i, _, d)| {
-                    let s = &mut active[i];
-                    let mut row = s.job.params.row(&mut s.rng, d);
-                    if s.generated.is_empty() {
-                        row[7] = 0.0;
-                    }
-                    if s.sampled && !s.chain {
-                        sample::mark_sampled(&mut row);
-                    }
-                    row
-                }).collect();
-                m.sample(&p)
+        Step { toks, want, marks, segs, undo, per_chain }
+    }
+
+    /// The step on the device, and per logit row the token and whether its draft was accepted
+    fn run_step(&mut self, step: &Step) -> Result<Vec<(u32, bool)>> {
+        let rows: Vec<usize> = step.want.iter().map(|w| w.1).collect();
+        self.m.step(&step.toks, &rows, Some(&step.marks))?;
+        if step.want.iter().all(|&(i, ..)| self.active[i].job.params.greedy()) {
+            return Ok(self.m.argmax()?.into_iter().zip(&step.want).map(|(t, w)| (t, w.2 == Some(t))).collect());
+        }
+        // the presence penalty's set: the request's outputs, uploaded per step (the sampler also counts the step's drafts
+        // before a row); a row that ends a prompt has none, and its segment's tokens are the prompt's: no penalty there
+        let mut up: Vec<usize> = step.want.iter().map(|w| w.0).collect();
+        up.dedup();
+        for &i in &up {
+            let s = &self.active[i];
+            if s.job.params.presence_penalty != 0.0 && !s.reply().is_empty() {
+                self.m.set_outputs(s.slot, &s.outs)?;
             }
-        });
-        // decisions read their row before anything else touches the logits
-        for (j, &(i, ..)) in want.iter().enumerate() {
-            let s = &mut active[i];
+        }
+        let p: Vec<[f32; 8]> = step.want.iter().map(|&(i, _, d)| {
+            let s = &mut self.active[i];
+            let mut row = s.job.params.row(&mut s.rng, d);
+            if s.reply().is_empty() {
+                row[7] = 0.0;
+            }
+            if s.sampled && !s.chain {
+                sample::mark_sampled(&mut row);
+            }
+            row
+        }).collect();
+        self.m.sample(&p)
+    }
+
+    /// Decisions read their row before anything else touches the logits
+    fn read_decisions(&mut self, step: &Step) {
+        for (j, &(i, ..)) in step.want.iter().enumerate() {
+            let s = &mut self.active[i];
             let Some(cands) = &s.job.decide else { continue };
-            let msg = match m.logits_row(j) {
+            let msg = match self.m.logits_row(j) {
                 Ok(row) => {
                     let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let lse = mx as f64 + row.iter().map(|&x| ((x - mx) as f64).exp()).sum::<f64>().ln();
@@ -498,110 +547,115 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
             let _ = s.job.tx.send(msg);
             s.finish = Some("decision");
         }
-        let next = match stepped {
-            Ok(k) => k,
-            Err(e) if store.is_some() && e.to_string().contains("the cache is full") => {
-                for (s, &(fed, marked)) in active.iter_mut().zip(&undo) {
-                    (s.fed, s.marked) = (fed, marked);
-                }
-                // device memory: sequences waiting in slots go to the host, else the newest request gives way
-                let st = store.as_mut().unwrap();
-                // a sequence in a slot to the host, or, without room there, dropped (read again when continued)
-                let moved = match st.park_one(&mut m, None, false) {
-                    Ok(None) => st.park_one(&mut m, None, true),
-                    p => p,
-                };
-                match moved {
-                    Ok(Some(slot)) => free.push(slot),
-                    Ok(None) if active.len() > 1 => {
-                        let i = (0..active.len()).max_by_key(|&i| active[i].born).unwrap();
-                        let mut seq = active.swap_remove(i);
-                        // nothing in its slot yet (its memory perhaps mapped in part), or no host memory for its image
-                        // (room made first: the copy would otherwise go past the budget): it starts again when its
-                        // prompt fits
-                        // its shadow becomes part of its image (the others' go first when host memory is short)
-                        let own = st.reclaim(seq.slot);
-                        let fits = seq.valid > 0 && st.room_for(m.image_bytes(seq.valid));
-                        if !fits {
-                            eprintln!("cache: a request ({} tokens, {} of them read) waits for device memory",
-                                      seq.job.prompt.len(), seq.valid);
-                            let _ = m.release(seq.slot);
-                            free.push(seq.slot);
-                            // it reads its history again and goes on from there: what it sent stays sent
-                            if !seq.generated.is_empty() {
-                                seq.job.prompt = std::mem::take(&mut seq.history);
-                                seq.job.progress = Some(Box::new(Progress {
-                                    generated: seq.generated, outs: seq.outs, text: seq.text, pending: seq.pending,
-                                    from: seq.from, read: seq.read, rng: seq.rng,
-                                }));
-                            }
-                            held.push_back(seq.job);
-                            continue;
-                        }
-                        match give_way(&mut m, &mut seq, own) {
-                            Ok(img) => {
-                                eprintln!("cache: a request ({} tokens) gives way in slot {}", seq.valid, seq.slot);
-                                free.push(seq.slot);
-                                let id = st.keep_parked(seq.history[..seq.valid].to_vec(), seq.job.adapter, img);
-                                parked.push_back((seq, id));
-                            }
-                            Err(e) => {
-                                eprintln!("engine: a request ({} tokens) could not give way: {e:#}", seq.valid);
-                                let _ = seq.job.tx.send(Msg::Error(format!("engine: {e:#}")));
-                                let _ = m.release(seq.slot);
-                                free.push(seq.slot);
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        let s = active.pop().unwrap();
-                        eprintln!("engine: a request ({} tokens) ends: {e:#}", s.valid);
-                        let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
-                        let _ = m.release(s.slot);
-                        free.push(s.slot);
-                    }
-                    Err(e) => eprintln!("cache: {e}"),
-                }
-                continue;
+    }
+
+    /// The step did not run: device memory is made (the step is built again), or its requests end
+    fn step_failed(&mut self, step: &Step, e: anyhow::Error) {
+        if self.store.is_some() && e.to_string().contains("the cache is full") {
+            for (s, &(fed, marked)) in self.active.iter_mut().zip(&step.undo) {
+                (s.fed, s.marked) = (fed, marked);
+            }
+            self.make_device_room(e);
+        } else {
+            eprintln!("engine: a step of {} tokens failed, its {} requests end: {e:#}", step.toks.len(), self.active.len());
+            for s in self.active.drain(..) {
+                let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
+                let _ = self.m.release(s.slot);
+                self.free.push(s.slot);
+            }
+        }
+    }
+
+    /// Device memory: sequences waiting in slots go to the host, else the newest request gives way
+    fn make_device_room(&mut self, e: anyhow::Error) {
+        let st = self.store.as_mut().unwrap();
+        // a sequence in a slot to the host, or, without room there, dropped (read again when continued)
+        let moved = match st.park_one(&mut self.m, None, false) {
+            Ok(None) => st.park_one(&mut self.m, None, true),
+            p => p,
+        };
+        match moved {
+            Ok(Some(slot)) => self.free.push(slot),
+            Ok(None) if self.active.len() > 1 => self.give_way_newest(),
+            Ok(None) => {
+                let s = self.active.pop().unwrap();
+                eprintln!("engine: a request ({} tokens) ends: {e:#}", s.valid);
+                let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
+                let _ = self.m.release(s.slot);
+                self.free.push(s.slot);
+            }
+            Err(e) => eprintln!("cache: {e}"),
+        }
+    }
+
+    /// The newest request gives way. With nothing in its slot yet (its memory perhaps mapped in part), or no host memory
+    /// for its image (room made first: the copy would otherwise go past the budget), it starts again when its prompt fits
+    fn give_way_newest(&mut self) {
+        let st = self.store.as_mut().unwrap();
+        let i = (0..self.active.len()).max_by_key(|&i| self.active[i].born).unwrap();
+        let mut seq = self.active.swap_remove(i);
+        // its shadow becomes part of its image (the others' go first when host memory is short)
+        let own = st.reclaim(seq.slot);
+        let fits = seq.valid > 0 && st.make_room(self.m.image_bytes(seq.valid), None);
+        if !fits {
+            eprintln!("cache: a request ({} tokens, {} of them read) waits for device memory", seq.job.prompt.len(), seq.valid);
+            let _ = self.m.release(seq.slot);
+            self.free.push(seq.slot);
+            // it reads its history again and goes on from there: what it sent stays sent
+            if seq.history.len() > seq.reply_at {
+                seq.job.prompt = std::mem::take(&mut seq.history);
+                seq.job.progress = Some(Box::new(Progress {
+                    reply_at: seq.reply_at, outs: seq.outs, pending: seq.pending, from: seq.from, read: seq.read, rng: seq.rng,
+                }));
+            }
+            self.held.push_back(seq.job);
+            return;
+        }
+        match give_way(&mut self.m, &mut seq, own) {
+            Ok(img) => {
+                eprintln!("cache: a request ({} tokens) gives way in slot {}", seq.valid, seq.slot);
+                self.free.push(seq.slot);
+                let id = st.keep_parked(seq.history[..seq.valid].to_vec(), seq.job.adapter, img);
+                self.parked.push_back((seq, id));
             }
             Err(e) => {
-                eprintln!("engine: a step of {} tokens failed, its {} requests end: {e:#}", toks.len(), active.len());
-                for s in active.drain(..) {
-                    let _ = s.job.tx.send(Msg::Error(format!("engine: {e:#}")));
-                    let _ = m.release(s.slot);
-                    free.push(s.slot);
-                }
-                continue;
+                eprintln!("engine: a request ({} tokens) could not give way: {e:#}", seq.valid);
+                let _ = seq.job.tx.send(Msg::Error(format!("engine: {e:#}")));
+                let _ = self.m.release(seq.slot);
+                self.free.push(seq.slot);
             }
-        };
-        // per request: accepted drafts, then the token sampled where the first draft failed (or after the last)
-        let mut acc = vec![0usize; active.len()];
-        let (mut made, mut rows_of) = (vec![0usize; active.len()], vec![0usize; active.len()]);
+        }
+    }
+
+    /// The step's tokens into the requests: per request accepted drafts, then the token sampled where the first draft
+    /// failed (or after the last); then what each slot holds. The drafts accepted per request.
+    fn commit(&mut self, step: &Step, next: &[(u32, bool)]) -> Vec<usize> {
+        let max_ctx = self.m.max_ctx();
+        let mut acc = vec![0usize; self.active.len()];
+        let want = &step.want;
         let mut j = 0;
         while j < want.len() {
-            let i = want[j].0;
-            let mut done = false;
+            let (i, first) = (want[j].0, j);
+            let s = &mut self.active[i];
+            let (mut done, mut made) = (false, 0);
             while j < want.len() && want[j].0 == i {
-                rows_of[i] += 1;
-                if !done && active[i].finish.is_none() && active[i].job.decide.is_none() {
+                if !done && s.finish.is_none() && s.job.decide.is_none() {
                     let (tok, accepted) = next[j];
-                    active[i].accept(tok, &chat, m.max_ctx());
+                    s.accept(tok, &self.chat, max_ctx);
                     done = !accepted;
                     acc[i] += accepted as usize;
-                    made[i] += 1;
+                    made += 1;
                 }
                 j += 1;
             }
-        }
-        for i in 0..active.len() {
-            if made[i] > 0 {
-                active[i].spec.step(rows_of[i] - 1, acc[i], made[i]);
+            if made > 0 {
+                s.spec.step(j - first - 1, acc[i], made);
             }
         }
-        // what each slot holds now: a decode segment's first token and its accepted drafts, a prompt chunk; the
-        // state at the end of a long prompt
-        for &(i, _, p0, n) in &segs {
-            let s = &mut active[i];
+        // what each slot holds now: a decode segment's first token and its accepted drafts, a prompt chunk; the state at
+        // the end of a long prompt
+        for &(i, _, p0, n) in &step.segs {
+            let s = &mut self.active[i];
             if p0 >= s.job.prompt.len() {
                 // the slot's state ends after the segment; the history may end before: rejected drafts, an accepted
                 // end-of-sequence draft (not in the history)
@@ -611,7 +665,7 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 (s.valid, s.dirty) = (p0 + n, false);
                 if s.snap_at.first() == Some(&s.fed) {
                     s.snap_at.remove(0);
-                    match m.save_state(s.slot) {
+                    match self.m.save_state(s.slot) {
                         Ok(st) => s.snaps.push((s.fed, st)),
                         Err(e) => eprintln!("cache: {e}"),
                     }
@@ -619,96 +673,116 @@ fn engine(mut m: Box<dyn Engine>, mut store: Option<Store>, chat: Arc<Chat>, mut
                 }
             }
         }
-        // the draft layer over the step's accepted positions (each with the token that followed it), then the drafts
-        // for the next step after each decoding request's last token
-        if mtp > 0 || per_chain > 0 {
-            let (mut dt, mut rows, mut out, mut who) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for &(i, at, p0, n) in &segs {
-                let s = &mut active[i];
-                s.drafts.clear();
-                s.sampled = false;
-                let was_chain = s.chain;
-                s.chain = false;
-                if s.finish.is_some() || s.job.decide.is_some() {
-                    continue;
-                }
-                for q in p0..p0 + n {
-                    if q + 1 >= s.history.len() {
-                        break;
-                    }
-                    dt.push(Tok { id: s.history[q + 1], slot: s.slot, pos: q as u32 });
-                    rows.push(at + q - p0);
-                }
-                let last = dt.last().is_some_and(|t: &Tok| t.slot == s.slot && t.pos as usize + 2 == s.history.len());
-                if s.fed == s.job.prompt.len() && last && s.history.len() + mtp < m.max_ctx() {
-                    let p = &s.job.params;
-                    // A full chain continues; its first miss ends it, and this normal step refreshes the evidence.
-                    s.chain = if was_chain { n > 1 && acc[i] + 1 == n } else {
-                        per_chain > 0 && (p.temperature <= 0.0 || p.top_k == 1)
-                            && suffix_match(&s.history, CHAIN_MIN, CHAIN_MAX).is_some()
-                    };
-                    if !s.chain {
-                        out.push(dt.len() - 1);
-                        who.push(i);
-                    }
-                }
+        acc
+    }
+
+    /// The draft layer over the step's accepted positions (each with the token that followed it), then the drafts for the
+    /// next step after each decoding request's last token
+    fn draft_next(&mut self, step: &Step, acc: &[usize]) {
+        let (mtp, per_chain) = (self.mtp, step.per_chain);
+        if mtp == 0 && per_chain == 0 {
+            return;
+        }
+        let (mut dt, mut rows, mut out, mut who) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &(i, at, p0, n) in &step.segs {
+            let s = &mut self.active[i];
+            s.drafts.clear();
+            s.sampled = false;
+            let was_chain = s.chain;
+            s.chain = false;
+            if s.finish.is_some() || s.job.decide.is_some() {
+                continue;
             }
-            if mtp > 0 && !dt.is_empty() {
-                // a sampled reply's drafts are drawn from the draft layer's distribution under its sampling (the
-                // presence penalty's set as of now)
-                let mut sampling = Vec::with_capacity(who.len());
-                for &i in &who {
-                    let s = &mut active[i];
-                    let p = &s.job.params;
-                    sampling.push(p.sampling().then(|| {
-                        let u = (0..mtp).map(|_| s.rng.next_f32()).collect();
-                        DraftSampling { row: p.draft_row(!s.generated.is_empty()), u }
-                    }));
-                    if p.sampling() && p.presence_penalty != 0.0 && !s.generated.is_empty() {
-                        let _ = m.set_outputs(s.slot, &s.outs);
-                    }
+            for q in p0..p0 + n {
+                if q + 1 >= s.history.len() {
+                    break;
                 }
-                match m.draft(&dt, &rows, &out, mtp, &sampling) {
-                    Ok(d) => {
-                        for ((d, &i), q) in d.into_iter().zip(&who).zip(&sampling) {
-                            active[i].drafts = d;
-                            active[i].sampled = q.is_some();
-                        }
-                    }
-                    Err(e) => eprintln!("draft layer: {e}"),
+                dt.push(Tok { id: s.history[q + 1], slot: s.slot, pos: q as u32 });
+                rows.push(at + q - p0);
+            }
+            let last = dt.last().is_some_and(|t: &Tok| t.slot == s.slot && t.pos as usize + 2 == s.history.len());
+            if s.fed == s.job.prompt.len() && last && s.history.len() + mtp < self.m.max_ctx() {
+                let p = &s.job.params;
+                // A full chain continues; its first miss ends it, and this normal step refreshes the evidence.
+                s.chain = if was_chain { n > 1 && acc[i] + 1 == n } else {
+                    per_chain > 0 && (p.temperature <= 0.0 || p.top_k == 1) && suffix_match(&s.history).is_some()
+                };
+                if !s.chain {
+                    out.push(dt.len() - 1);
+                    who.push(i);
                 }
             }
         }
+        if mtp == 0 || dt.is_empty() {
+            return;
+        }
+        // a sampled reply's drafts are drawn from the draft layer's distribution under its sampling (the presence
+        // penalty's set as of now)
+        let mut sampling = Vec::with_capacity(who.len());
+        for &i in &who {
+            let s = &mut self.active[i];
+            let replying = !s.reply().is_empty();
+            let p = &s.job.params;
+            sampling.push(p.sampling().then(|| {
+                let u = (0..mtp).map(|_| s.rng.next_f32()).collect();
+                DraftSampling { row: p.draft_row(replying), u }
+            }));
+            if p.sampling() && p.presence_penalty != 0.0 && replying {
+                let _ = self.m.set_outputs(s.slot, &s.outs);
+            }
+        }
+        match self.m.draft(&dt, &rows, &out, mtp, &sampling) {
+            Ok(d) => {
+                for ((d, &i), q) in d.into_iter().zip(&who).zip(&sampling) {
+                    self.active[i].drafts = d;
+                    self.active[i].sampled = q.is_some();
+                }
+            }
+            Err(e) => eprintln!("draft layer: {e}"),
+        }
+    }
+
+    /// Requests that are done or whose client left: what their slots hold stays cached, or the slots go back
+    fn end_finished(&mut self) {
         let mut i = 0;
-        while i < active.len() {
-            let s = &active[i];
-            if s.finish.is_some() || s.job.tx.is_closed() {
-                let s = active.swap_remove(i);
-                if spec_stats {
-                    eprintln!("{}", s.spec.line());
-                }
-                let keep = s.job.decide.is_none() && s.finish != Some("error") && s.valid > 0;
-                match &mut store {
-                    Some(st) if keep => {
-                        let snaps = s.snaps.into_iter().filter(|p| p.0 <= s.valid).collect();
-                        st.put(s.slot, Held { tokens: s.history[..s.valid].to_vec(), adapter: s.job.adapter, dirty: s.dirty, snaps });
-                    }
-                    _ => {
-                        if let Err(e) = m.release(s.slot) {
-                            eprintln!("engine: releasing slot {}: {e}", s.slot);
-                        }
-                        free.push(s.slot);
-                    }
-                }
-                if let Some(finish) = s.finish.filter(|f| *f != "error" && *f != "decision") {
-                    let _ = s.job.tx.send(Msg::Done { finish, prompt_tokens: s.job.prompt.len(),
-                                                      completion_tokens: s.generated.len() });
-                }
-            } else {
+        while i < self.active.len() {
+            let s = &self.active[i];
+            if s.finish.is_none() && !s.job.tx.is_closed() {
                 i += 1;
+                continue;
+            }
+            let s = self.active.swap_remove(i);
+            if self.spec_stats {
+                eprintln!("{}", s.spec.line());
+            }
+            match &mut self.store {
+                Some(st) if s.job.decide.is_none() && s.valid > 0 => {
+                    let snaps = s.snaps.into_iter().filter(|p| p.0 <= s.valid).collect();
+                    st.put(s.slot, Held { tokens: s.history[..s.valid].to_vec(), adapter: s.job.adapter, dirty: s.dirty, snaps });
+                }
+                _ => {
+                    if let Err(e) = self.m.release(s.slot) {
+                        eprintln!("engine: releasing slot {}: {e}", s.slot);
+                    }
+                    self.free.push(s.slot);
+                }
+            }
+            if let Some(finish) = s.finish.filter(|f| *f != "decision") {
+                let _ = s.job.tx.send(Msg::Done { finish, prompt_tokens: s.reply_at, completion_tokens: s.history.len() - s.reply_at });
             }
         }
     }
+}
+
+/// How a loaded LoRA adapter is served
+#[derive(Clone)]
+pub enum AdapterUse {
+    /// no adapter is loaded
+    None,
+    /// under this name (`"model"` of a request), beside the base model
+    Named(String),
+    /// always: the one served model is the base with the adapter applied, whatever a request names
+    Always,
 }
 
 pub struct App {
@@ -716,12 +790,7 @@ pub struct App {
     pub jobs: UnboundedSender<Job>,
     pub name: String,
     pub max_ctx: usize,
-    /// the name the LoRA adapter is served under IN ADDITION to the base, if dual (`"model"` of a request; the base
-    /// is `name`); None when there is no adapter or it is applied to the single served model (adapter_default)
-    pub adapter: Option<String>,
-    /// the loaded adapter is always applied to the one served model (`name`); any requested "model" maps to it and
-    /// no pristine base is selectable
-    pub adapter_default: bool,
+    pub adapter: AdapterUse,
     /// named decision tasks (question, options, threshold, ...) for the page and for requests with "preset"
     pub presets: Json,
     /// pages from the chat (`POST /v1/artifacts`), newest last
@@ -764,18 +833,15 @@ async fn get_artifact(State(app): State<Arc<App>>, Path(id): Path<String>) -> Re
 }
 
 impl App {
-    /// The model a request names (`"model"`): whether to use the adapter, and the name to answer with. With
-    /// `adapter_default` there is one model (the base with the adapter always applied), served under `name`, and any
-    /// requested model maps to it. Otherwise: without an adapter any name is the base; with a dual adapter a name
-    /// that is neither the base nor the adapter is an error.
+    /// The model a request names (`"model"`): whether to use the adapter, and the name to answer with. Without an adapter
+    /// or with one always applied any name is the one served model; a named adapter makes a name that is neither it nor
+    /// the base an error.
     pub fn model(&self, body: &Json) -> Result<(bool, String)> {
         let asked = body.get("model").and_then(Json::as_str);
-        if self.adapter_default {
-            return Ok((true, self.name.clone()));
-        }
         match (&self.adapter, asked) {
-            (Some(a), Some(m)) if m == a => Ok((true, a.clone())),
-            (Some(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
+            (AdapterUse::Always, _) => Ok((true, self.name.clone())),
+            (AdapterUse::Named(a), Some(m)) if m == a => Ok((true, a.clone())),
+            (AdapterUse::Named(a), Some(m)) if m != self.name => bail!("no model {m:?}: this server serves {:?} and {a:?}", self.name),
             _ => Ok((false, self.name.clone())),
         }
     }
@@ -785,16 +851,33 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn bad_request(msg: String) -> Response {
-    (StatusCode::BAD_REQUEST, AxJson(json!({"error": {"message": msg, "type": "invalid_request_error"}})))
-        .into_response()
+/// An error in the form OpenAI's API has
+fn api_error(status: StatusCode, kind: &str, msg: &str) -> Response {
+    (status, AxJson(json!({"error": {"message": msg, "type": kind}}))).into_response()
 }
 
-/// Sampling parameters the request leaves out. Qwen: the model card's general ones, which depend on thinking (the prompt
-/// opened a think block), with its presence penalty of 1.5 (against endless thinking: the card's advice for both modes).
+pub fn bad_request(msg: String) -> Response {
+    api_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg)
+}
+
+fn unauthorized(msg: &str) -> Response {
+    api_error(StatusCode::UNAUTHORIZED, "invalid_api_key", msg)
+}
+
+fn db_error(e: anyhow::Error) -> Response {
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &format!("{e:#}"))
+}
+
+/// A reply's token counts
+fn usage(prompt_tokens: usize, completion_tokens: usize) -> Json {
+    json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+}
+
+/// Sampling parameters the request leaves out: the model card's general ones, which depend on thinking (the prompt opened
+/// a think block), with its presence penalty of 1.5 (against endless thinking: the card's advice for both modes).
 fn sampling_defaults(thinking: bool) -> Params {
-    let (temperature, top_p, top_k, presence_penalty) = if thinking { (1.0, 0.95, 20, 1.5) } else { (0.7, 0.8, 20, 1.5) };
-    Params { temperature, top_p, top_k, repetition_penalty: 1.0, presence_penalty, seed: 0 }
+    let (temperature, top_p, top_k) = if thinking { (1.0, 0.95, 20) } else { (0.7, 0.8, 20) };
+    Params { temperature, top_p, top_k, repetition_penalty: 1.0, presence_penalty: 1.5, seed: 0 }
 }
 
 /// A rendered, tokenized request; `thinking`: the prompt opened a think block, so output starts as reasoning.
@@ -865,7 +948,7 @@ fn prepare(app: &App, body: &Json) -> Result<Prepared> {
                    decide: None, adapter, tx },
         model,
         rx,
-        parser: app.chat.parser(thinking, tools),
+        parser: OutputParser::new(thinking, tools),
         thinking,
         stream: body.get("stream").and_then(Json::as_bool).unwrap_or(false),
         include_usage: body.pointer("/stream_options/include_usage").and_then(Json::as_bool).unwrap_or(false),
@@ -895,10 +978,10 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
 
     if !stream {
         let mut pieces = Vec::new();
-        let (finish, usage) = loop {
+        let (finish, counts) = loop {
             match rx.recv().await {
                 Some(Msg::Text(t)) => parser.push(&t, &mut pieces),
-                Some(Msg::Done { finish, prompt_tokens, completion_tokens }) => break (finish, (prompt_tokens, completion_tokens)),
+                Some(Msg::Done { finish, prompt_tokens, completion_tokens }) => break (finish, usage(prompt_tokens, completion_tokens)),
                 Some(Msg::Error(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
                 None | Some(Msg::Decision { .. }) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped the request").into_response()
@@ -931,8 +1014,7 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
         }
         return AxJson(json!({
             "id": format!("chatcmpl-{id}"), "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {"prompt_tokens": usage.0, "completion_tokens": usage.1, "total_tokens": usage.0 + usage.1}
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": counts
         }))
         .into_response();
     }
@@ -979,9 +1061,7 @@ async fn chat_completions(State(app): State<Arc<App>>, AxJson(body): AxJson<Json
                     if include_usage {
                         let _ = etx.send(Event::default().data(json!({
                             "id": format!("chatcmpl-{id}"), "object": "chat.completion.chunk", "created": created,
-                            "model": model, "choices": [],
-                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                                      "total_tokens": prompt_tokens + completion_tokens}
+                            "model": model, "choices": [], "usage": usage(prompt_tokens, completion_tokens)
                         }).to_string()));
                     }
                     break;
@@ -1002,12 +1082,7 @@ pub struct ServeOpts {
     pub host: String,
     pub port: u16,
     pub name: String,
-    /// the name a loaded LoRA adapter is served under IN ADDITION to the base (dual mode); None when there is no
-    /// adapter, or when it is applied to the one served model (adapter_default)
-    pub adapter: Option<String>,
-    /// the loaded adapter is applied to the single served model (served under `name`, no separate pristine base);
-    /// set when --adapter has no explicit name=
-    pub adapter_default: bool,
+    pub adapter: AdapterUse,
     /// Drafts per step at most (speculative decoding; 0: off). None: the draft layer's default, DEFAULT_DRAFTS for chains
     pub drafts: Option<usize>,
     /// the sessions (--slots) asked for, each promised the whole context; None: as many as fit
@@ -1037,10 +1112,6 @@ fn logged_in(app: &App, h: &axum::http::HeaderMap) -> bool {
     cookie(h, auth::COOKIE).is_some_and(|t| app.auth.session(t).unwrap_or(false))
 }
 
-fn unauthorized(msg: &str) -> Response {
-    (StatusCode::UNAUTHORIZED, AxJson(json!({"error": {"message": msg, "type": "invalid_api_key"}}))).into_response()
-}
-
 /// Who may do what (auth.rs). Without a password the web page is open; with one, the page and /auth/* need its login.
 /// The API (/v1/...) takes the page, and anyone else unless it requires a key (`Authorization: Bearer <key>`).
 /// /health, the login page and logging in stay open.
@@ -1060,7 +1131,7 @@ async fn gate(State(app): State<Arc<App>>, req: axum::extract::Request, next: ax
             false => unauthorized("this server requires an API key: Authorization: Bearer <key>"),
         };
     }
-    if req.method() == axum::http::Method::GET && matches!(path, "/" | "/decide") {
+    if req.method() == axum::http::Method::GET && path == "/" {
         return axum::response::Redirect::to("/login").into_response();
     }
     unauthorized("log in first")
@@ -1071,45 +1142,40 @@ fn page_allowed(app: &App, h: &axum::http::HeaderMap) -> bool {
     !app.auth.has_password().unwrap_or(true) || logged_in(app, h)
 }
 
-/// The endpoints that change access: the page (logged in, when a password is set)
-fn need_login(app: &App, h: &axum::http::HeaderMap) -> Option<Response> {
-    (!page_allowed(app, h)).then(|| unauthorized("log in first"))
-}
-
 fn session_cookie(token: &str, max_age: i64) -> String {
     format!("{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}", auth::COOKIE)
-}
-
-fn db_error(e: anyhow::Error) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, AxJson(json!({"error": {"message": format!("{e:#}")}}))).into_response()
 }
 
 fn logged_in_reply(token: String) -> Response {
     ([(header::SET_COOKIE, session_cookie(&token, auth::SESSION_SECS))], AxJson(json!({"ok": true}))).into_response()
 }
 
+/// Run `f` on the database off the async threads: password hashes take a while
+async fn with_auth<T: Send + 'static>(app: &App, f: impl FnOnce(&Auth) -> Result<T> + Send + 'static) -> Result<T> {
+    let a = app.auth.clone();
+    tokio::task::spawn_blocking(move || f(&a)).await?
+}
+
 /// POST /auth/login {"password"}: the session cookie (a wrong password waits a second: no fast guessing)
 async fn auth_login(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
-    let (a, pw) = (app.auth.clone(), b["password"].as_str().unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.login(&pw)).await {
-        Ok(Ok(Some(token))) => logged_in_reply(token),
-        Ok(Ok(None)) => {
+    let pw = b["password"].as_str().unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.login(&pw)).await {
+        Ok(Some(token)) => logged_in_reply(token),
+        Ok(None) => {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             unauthorized("wrong password")
         }
-        Ok(Err(e)) => db_error(e),
-        Err(e) => db_error(e.into()),
+        Err(e) => db_error(e),
     }
 }
 
 /// POST /auth/setup {"password"}: set the first password (while none is set); logged in with it
 async fn auth_setup(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
-    let (a, pw) = (app.auth.clone(), b["password"].as_str().unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.setup(&pw)).await {
-        Ok(Ok(Some(token))) => logged_in_reply(token),
-        Ok(Ok(None)) => unauthorized("a password is set already: log in"),
-        Ok(Err(e)) => bad_request(format!("{e:#}")),
-        Err(e) => db_error(e.into()),
+    let pw = b["password"].as_str().unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.setup(&pw)).await {
+        Ok(Some(token)) => logged_in_reply(token),
+        Ok(None) => unauthorized("a password is set already: log in"),
+        Err(e) => bad_request(format!("{e:#}")),
     }
 }
 
@@ -1140,10 +1206,7 @@ async fn auth_state(State(app): State<Arc<App>>, h: axum::http::HeaderMap) -> Re
 }
 
 /// POST /auth/require-key {"on": bool}
-async fn auth_require_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
+async fn auth_require_key(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
     let on = b["on"].as_bool().unwrap_or(false);
     if on && !app.auth.has_password().unwrap_or(false) {
         return bad_request("set a password first: without one, anyone who can open this page can make a key".into());
@@ -1155,10 +1218,7 @@ async fn auth_require_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap,
 }
 
 /// POST /auth/keys {"name"}: a new API key, returned once
-async fn auth_new_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
+async fn auth_new_key(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
     match app.auth.new_key(b["name"].as_str().unwrap_or("")) {
         Ok((id, key)) => AxJson(json!({"id": id, "key": key})).into_response(),
         Err(e) => bad_request(format!("{e:#}")),
@@ -1166,43 +1226,32 @@ async fn auth_new_key(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJ
 }
 
 /// DELETE /auth/keys/{id}
-async fn auth_revoke(State(app): State<Arc<App>>, h: axum::http::HeaderMap, Path(id): Path<i64>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
+async fn auth_revoke(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Response {
     match app.auth.revoke(id) {
         Ok(true) => AxJson(json!({"ok": true})).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, AxJson(json!({"error": {"message": "no such key"}}))).into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "no such key"),
         Err(e) => db_error(e),
     }
 }
 
 /// POST /auth/password-remove {"old"}: the page is open again
-async fn auth_password_remove(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
-    let (a, old) = (app.auth.clone(), b["old"].as_str().unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.remove_password(&old)).await {
-        Ok(Ok(true)) => ([(header::SET_COOKIE, session_cookie("", 0))], AxJson(json!({"ok": true}))).into_response(),
-        Ok(Ok(false)) => unauthorized("the password is wrong"),
-        Ok(Err(e)) => db_error(e),
-        Err(e) => db_error(e.into()),
+async fn auth_password_remove(State(app): State<Arc<App>>, AxJson(b): AxJson<Json>) -> Response {
+    let old = b["old"].as_str().unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.remove_password(&old)).await {
+        Ok(true) => ([(header::SET_COOKIE, session_cookie("", 0))], AxJson(json!({"ok": true}))).into_response(),
+        Ok(false) => unauthorized("the password is wrong"),
+        Err(e) => db_error(e),
     }
 }
 
 /// POST /auth/password {"old", "new"}: other logins end, this one stays
 async fn auth_password(State(app): State<Arc<App>>, h: axum::http::HeaderMap, AxJson(b): AxJson<Json>) -> Response {
-    if let Some(r) = need_login(&app, &h) {
-        return r;
-    }
     let (old, new) = (b["old"].as_str().unwrap_or("").to_string(), b["new"].as_str().unwrap_or("").to_string());
-    let (a, keep) = (app.auth.clone(), cookie(&h, auth::COOKIE).unwrap_or("").to_string());
-    match tokio::task::spawn_blocking(move || a.change_password(&old, &new, &keep)).await {
-        Ok(Ok(true)) => AxJson(json!({"ok": true})).into_response(),
-        Ok(Ok(false)) => unauthorized("the current password is wrong"),
-        Ok(Err(e)) => bad_request(format!("{e:#}")),
-        Err(e) => db_error(e.into()),
+    let keep = cookie(&h, auth::COOKIE).unwrap_or("").to_string();
+    match with_auth(&app, move |a| a.change_password(&old, &new, &keep)).await {
+        Ok(true) => AxJson(json!({"ok": true})).into_response(),
+        Ok(false) => unauthorized("the current password is wrong"),
+        Err(e) => bad_request(format!("{e:#}")),
     }
 }
 
@@ -1246,10 +1295,12 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     let chat = Arc::new(chat);
     let (jobs, max_ctx) = start_engine(load, chat.clone(), opts.drafts, opts.sessions, opts.fit_ctx)?;
     let app = Arc::new(App { chat, jobs, name: opts.name.clone(), max_ctx, adapter: opts.adapter.clone(),
-                             adapter_default: opts.adapter_default,
                              presets: opts.presets.clone(), artifacts: Mutex::default(), auth: auth.clone() });
     // the base model first (the page shows the first), then the adapter
-    let names: Vec<String> = std::iter::once(opts.name.clone()).chain(opts.adapter.clone()).collect();
+    let mut names = vec![opts.name.clone()];
+    if let AdapterUse::Named(a) = &opts.adapter {
+        names.push(a.clone());
+    }
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/decisions", post(crate::decide::decisions))
@@ -1272,7 +1323,6 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
         router = router
             .route("/", get(|| async { Html(include_str!("ui.html")) }))
             .route("/login", get(|| async { Html(include_str!("login.html")) }))
-            .route("/decide", get(|| async { axum::response::Redirect::to("/#decide") }))
             .route("/v1/artifacts", post(put_artifact))
             .route("/artifacts/{id}", get(get_artifact));
     }
@@ -1281,8 +1331,11 @@ pub fn serve(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static, ch
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await?;
         println!("serving {}{} on http://{}:{} (context {max_ctx}{}{})", opts.name,
-                 if opts.adapter_default { " (adapter applied)".to_string() }
-                 else { opts.adapter.as_ref().map_or(String::new(), |a| format!(" and its adapter {a}")) }, opts.host, opts.port,
+                 match &opts.adapter {
+                     AdapterUse::None => String::new(),
+                     AdapterUse::Named(a) => format!(" and its adapter {a}"),
+                     AdapterUse::Always => " (adapter applied)".to_string(),
+                 }, opts.host, opts.port,
                  if opts.ui { ", web page at /" } else { "" },
                  if auth.require_key()? { ", the API requires a key" } else { "" });
         axum::serve(listener, router).await?;
@@ -1318,13 +1371,17 @@ mod tests {
     fn chains_continue_the_longest_latest_match() {
         // no earlier occurrence of 8 tokens: no chain
         let h: Vec<u32> = (0..40).collect();
-        assert_eq!(suffix_match(&h, 8, 32), None);
+        assert_eq!(suffix_match(&h), None);
         // the last 10 tokens occurred at 5..15: continue at 15
         let mut h: Vec<u32> = (100..140).collect();
         h.extend(105..115);
-        assert_eq!(suffix_match(&h, 8, 32), Some(15));
-        assert_eq!(chain_draft(&h, 8, 4), &[115, 116, 117, 118]);
-        assert_eq!(chain_draft(&h, 11, 4), &[] as &[u32]);
+        assert_eq!(suffix_match(&h), Some(15));
+        assert_eq!(chain_draft(&h, 4), &[115, 116, 117, 118]);
+        assert_eq!(chain_draft(&h, 0), &[] as &[u32]);
+        // 7 tokens are too few
+        let mut h: Vec<u32> = (100..140).collect();
+        h.extend(105..112);
+        assert_eq!(chain_draft(&h, 4), &[] as &[u32]);
         // a longer match wins over a later shorter one; among equal ones the latest
         let a: Vec<u32> = (1..=12).collect();
         let mut h = a.clone();
@@ -1332,17 +1389,17 @@ mod tests {
         h.extend(&a[4..]);
         h.push(60);
         h.extend(&a);
-        assert_eq!(suffix_match(&h, 8, 32), Some(12));
+        assert_eq!(suffix_match(&h), Some(12));
         let mut h = a.clone();
         h.push(50);
         h.extend(&a);
         h.push(60);
         h.extend(&a);
-        assert_eq!(suffix_match(&h, 8, 32), Some(25));
+        assert_eq!(suffix_match(&h), Some(25));
         // a match ending at the last token has no continuation and is not one; the drafts stop at the history's end
         let h = vec![7u32; 9];
-        assert_eq!(suffix_match(&h, 8, 32), Some(8));
-        assert_eq!(chain_draft(&h, 8, 4), &[7]);
+        assert_eq!(suffix_match(&h), Some(8));
+        assert_eq!(chain_draft(&h, 4), &[7]);
     }
 
     #[derive(Default)]
@@ -1357,10 +1414,16 @@ mod tests {
         prompt: std::cell::Cell<usize>,
         rows: Vec<usize>,
         drafts: Option<Arc<DraftStats>>,
+        slots: usize,
+        /// the cache is full once, when two slots decode; set then
+        full_once: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl Engine for Scripted {
-        fn slots(&self) -> usize { 1 }
+        fn slots(&self) -> usize { self.slots }
+        // no host memory for an image; the slots take no device memory
+        fn image_bytes(&self, _: usize) -> usize { 1 << 60 }
+        fn slot_bytes(&self, _: usize) -> usize { 0 }
         fn max_ctx(&self) -> usize { 4096 }
         fn max_tok(&self) -> usize { 512 }
         fn max_out(&self) -> usize { 8 }
@@ -1369,6 +1432,10 @@ mod tests {
         fn step(&mut self, toks: &[Tok], out: &[usize], _: Option<&[Vec<u32>]>) -> Result<()> {
             if self.prompt.get() == 0 {
                 self.prompt.set(toks.last().map_or(0, |t| t.pos as usize + 1));
+            }
+            let decoding = |slot: u32| toks.iter().any(|t| t.slot == slot && t.pos as usize > self.prompt.get());
+            if let Some(full) = &self.full_once && decoding(0) && decoding(1) && !full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                bail!("the cache is full");
             }
             self.rows = out.iter().map(|&r| (toks[r].pos as usize + 1).saturating_sub(self.prompt.get())).collect();
             Ok(())
@@ -1403,12 +1470,12 @@ mod tests {
         let (jobs, rx) = unbounded_channel();
         let engine_chat = chat.clone();
         std::thread::spawn(move || {
-            let m = Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts };
+            let m = Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts, slots: 1, full_once: None };
             let mtp = mtp_depth(m.has_draft(), m.draft_tokens(), m.draft_capacity(), Some(spec));
             engine(Box::new(m), None, engine_chat, rx, spec, mtp)
         });
         let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
-        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: None, adapter_default: false,
+        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: AdapterUse::None,
                                  presets: json!([]), artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db).unwrap()) });
         // the scripted engine only takes the argmax: greedy, and no presence penalty (Qwen's default would sample)
         body["temperature"] = json!(0);
@@ -1419,6 +1486,44 @@ mod tests {
             let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
             String::from_utf8(bytes.to_vec()).unwrap()
         })
+    }
+
+    /// A request that gives way with no host memory for its image reads its history again and goes on: the client gets
+    /// the reply once and whole, and the usage counts the prompt once.
+    #[test]
+    fn giving_way_without_host_room_keeps_what_was_sent() {
+        let Some(dir) = test_models::dir(test_models::QWEN) else { return };
+        let chat = Arc::new(Chat::load(&dir).unwrap());
+        let reply = "One two three four five six seven eight nine ten eleven twelve.";
+        let mut script = chat.encode(reply).unwrap();
+        script.push(248046);
+        let (jobs, rx) = unbounded_channel();
+        let full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // the engine starts when both requests wait, so that both run
+        let (start, started) = std::sync::mpsc::channel();
+        let (engine_chat, full_once) = (chat.clone(), Some(full.clone()));
+        std::thread::spawn(move || {
+            started.recv().unwrap();
+            let m: Box<dyn Engine> = Box::new(Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts: None, slots: 2, full_once });
+            let store = Store::new(&m, Some(2)).unwrap();
+            engine(m, Some(store), engine_chat, rx, 0, 0)
+        });
+        let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));
+        let app = Arc::new(App { chat, jobs, name: "t".into(), max_ctx: 4096, adapter: AdapterUse::None,
+                                 presets: json!([]), artifacts: Mutex::default(), auth: Arc::new(Auth::open(&db).unwrap()) });
+        let body = json!({"messages": [{"role": "user", "content": "Count."}], "temperature": 0, "presence_penalty": 0,
+                          "chat_template_kwargs": {"enable_thinking": false}});
+        let ask = || async {
+            let r = chat_completions(State(app.clone()), AxJson(body.clone())).await;
+            serde_json::from_slice::<Json>(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (a, b, _) = rt.block_on(async { tokio::join!(ask(), ask(), async { start.send(()).unwrap() }) });
+        assert!(full.load(std::sync::atomic::Ordering::Relaxed), "the step that fails did not run");
+        for r in [&a, &b] {
+            assert_eq!(r["choices"][0]["message"]["content"], reply, "{r}");
+        }
+        assert_eq!(a["usage"], b["usage"]);
     }
 
     /// A context chain accepts the same reply as the target script, updates the drafter's context, and skips its

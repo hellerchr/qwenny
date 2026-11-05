@@ -277,7 +277,7 @@ fn main() -> Result<()> {
             let native = native_ctx(&model).unwrap_or(32768);
             let (ctx, slots, int8) = (opts.get("ctx", native)?, opts.get("slots", 16)?, opts.int8);
             let so = server::ServeOpts { host: opts.get("host", "0.0.0.0".to_string())?, port: opts.get("port", 18023)?,
-                                         name: opts.get("name", "qwenny".to_string())?, adapter: None, adapter_default: false,
+                                         name: opts.get("name", "qwenny".to_string())?, adapter: server::AdapterUse::None,
                                          drafts: opts.path("drafts").map(|_| opts.get("drafts", 0)).transpose()?,
                                          sessions: opts.path("slots").map(|_| slots), ui: flags.iter().any(|f| *f == "--ui"),
                                          presets: match opts.get("decisions", String::new())? {
@@ -296,8 +296,12 @@ fn main() -> Result<()> {
             ensure!(name.as_ref().is_none_or(|n| *n != so.name), "the adapter's name is the base model's (--name): give it \
                      another with --adapter=<name>=<dir>");
             // no explicit name= : apply the adapter to the one served model (no separate pristine base)
-            let adapter_default = adapter.is_some() && name.is_none();
-            let so = server::ServeOpts { adapter: name, adapter_default, ..so };
+            let adapter_use = match name {
+                Some(n) => server::AdapterUse::Named(n),
+                None if adapter.is_some() => server::AdapterUse::Always,
+                None => server::AdapterUse::None,
+            };
+            let so = server::ServeOpts { adapter: adapter_use, ..so };
             server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
         }
         #[cfg(has_cuda)]
