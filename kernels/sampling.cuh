@@ -153,7 +153,7 @@ __device__ __forceinline__ int kept(Val val, const unsigned long long* cand, int
     __syncthreads();
     if (tid == 0) sv[2] = k;
     __syncthreads();
-    if (top_p < 1.f && tid < k && cum / total >= top_p && (tid == 0 || cum - p < top_p * total)) atomicMin(&sv[2], tid + 1);
+    if (top_p < 1.f && tid < k && cum / total >= top_p) atomicMin(&sv[2], tid + 1);
     __syncthreads();
     int keep = sv[2];
     if (tid == keep - 1) sh[1] = cum;
@@ -176,8 +176,7 @@ __device__ __forceinline__ float q_of(const int* qid, const float* qp, int n, in
 
 // One block of 1024 threads per logit row, in vLLM's order: repetition penalty (tokens seen in the row's slot, and
 // the step's tokens of the row's sequence up to the row's own), presence penalty (subtracted for the tokens the
-// request generated: the slot's outputs set, and the step's drafts before the row), temperature, top-k (0: the 1024
-// most likely), top-p, then a draw with the host's uniform numbers. params[row]: temperature, top_k, top_p,
+// request generated: the slot's outputs set, and the step's drafts before the row), temperature, top-k, top-p, then a draw with the host's uniform numbers. params[row]: temperature, top_k, top_p,
 // repetition penalty, u1, u2, draft (-1: none; d <= -2: the draft -d - 2, drawn by draft_sample), presence penalty
 // (0 for rows that end a prompt: no output yet). Greedy rows (temperature 0 or top_k 1) take the argmax of the
 // penalized logits.
@@ -220,7 +219,12 @@ extern "C" __global__ void __launch_bounds__(1024)
         return v;
     };
     bool greedy = temp <= 0.f || top_k == 1;
-    int k = greedy ? 1 : (top_k > 0 ? min(top_k, VOCAB) : 1024);
+    // more candidates than a block sorts (top_k 0: the whole vocabulary): the host's row (Step::sample)
+    if (!greedy && (top_k == 0 || top_k > QCAP)) {
+        if (tid == 0) out_acc[j] = -1;
+        return;
+    }
+    int k = greedy ? 1 : min(top_k, VOCAB);
     int cnt = top_cands(val, VOCAB, k, hist, cand, sh, sv);
     auto token = [&](int r) { return cand_index(cand[r]); };
     if (greedy) {
@@ -253,7 +257,7 @@ extern "C" __global__ void __launch_bounds__(1024)
         if (tid == 0) { sv[0] = 0xffffffffu; sv[1] = 0; }
         __syncthreads();
         float target = u2 * sh[3];
-        if (r > 0.f && cr >= target && cr - r < target) atomicMin(&sv[0], tid);
+        if (r > 0.f && cr >= target) atomicMin(&sv[0], tid);
         if (r > 0.f) atomicMax(&sv[1], tid);
         __syncthreads();
         if (tid == 0) {
@@ -275,7 +279,7 @@ extern "C" __global__ void __launch_bounds__(1024)
     bool live = tid < keep && (unsigned)tid != at_d;
     if (tid == 0) sv[2] = keep - 1;
     __syncthreads();
-    if (live && c2 >= target && (c2 - p < target || tid == 0)) atomicMin(&sv[2], tid);
+    if (live && c2 >= target) atomicMin(&sv[2], tid);
     __syncthreads();
     if (tid == 0) {
         int r = sv[2];
@@ -328,7 +332,7 @@ extern "C" __global__ void __launch_bounds__(1024)
     float target = u * mass;
     if (tid == 0) sv[2] = keep - 1;
     __syncthreads();
-    if (tid < keep && cum >= target && (cum - p < target || tid == 0)) atomicMin(&sv[2], tid);
+    if (tid < keep && cum >= target) atomicMin(&sv[2], tid);
     __syncthreads();
     int x = tid < keep ? id(cand_index(cand[tid])) : 0x7fffffff;
     float prob = tid < keep ? p / mass : 0.f;

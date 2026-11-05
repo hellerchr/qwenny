@@ -3,6 +3,7 @@
 //! (kernels/sampling.cuh) and the CUDA graph cache. The model (qwen/) adds its layers, caches and the kernels of its
 //! own module, which instantiates the shared ones.
 use crate::engine::Tok;
+use crate::sample;
 use crate::checkpoint::{Checkpoint, Quant};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, sys};
@@ -878,7 +879,8 @@ impl Step {
         Ok(s.clone_dtoh(&self.logits.slice(j * self.vocab..(j + 1) * self.vocab))?)
     }
 
-    /// Sample the next token of each output row of the last step on the GPU. Per row: temperature, top_k, top_p,
+    /// Sample the next token of each output row of the last step on the GPU (a row with more candidates than a block
+    /// sorts: on the host, from the same state). Per row: temperature, top_k, top_p,
     /// repetition penalty, two uniform draws in [0, 1), a draft token (-1: none) and the presence penalty (the slot's
     /// outputs, set_outputs). Returns per row the token and, with a draft, whether the draft was accepted (the token
     /// is then the draft).
@@ -895,7 +897,32 @@ impl Step {
         }
         let toks = s.clone_dtoh(&self.sampled.slice(0..n))?;
         let acc = s.clone_dtoh(&self.accepted.slice(0..n))?;
-        Ok(toks.into_iter().zip(acc).map(|(t, a)| (t as u32, a != 0)).collect())
+        (0..n).map(|j| if acc[j] < 0 { self.sample_on_host(s, j, &params[j]) } else { Ok((toks[j] as u32, acc[j] != 0)) }).collect()
+    }
+
+    /// `sample_rows` for row `j` on the host, from the logits and penalty sets on the device
+    fn sample_on_host(&self, s: &Arc<CudaStream>, j: usize, row: &[f32; 8]) -> Result<(u32, bool)> {
+        let one = |b: &CudaSlice<i32>, i: usize| -> Result<usize> { Ok(s.clone_dtoh(&b.slice(i..i + 1))?[0] as usize) };
+        let (tok, first) = (one(&self.out_rows, j)?, one(&self.row_first, j)?);
+        let slot = one(&self.tok_slot, tok)?;
+        let step: Vec<u32> = s.clone_dtoh(&self.ids.slice(first + 1..tok + 1))?.into_iter().map(|t| t as u32).collect();
+        let w = self.vocab / 32;
+        let (seen, outs) = (self.seen(s, slot)?, s.clone_dtoh(&self.outs.slice(slot * w..(slot + 1) * w))?);
+        let has = |set: &[u32], t: u32| step.contains(&t) || set[t as usize / 32] >> (t % 32) & 1 == 1;
+        let (seen, generated) = (|t| has(&seen, t), |t| has(&outs, t));
+        let logits = self.logits_row(s, j)?;
+        let mut row = *row;
+        if row[6] <= -2.0 {
+            row[6] = -row[6] - 2.0;
+            let t = tok - first;
+            if t < QD {
+                let (q, drawn) = self.draft_q(s, slot, t)?;
+                if drawn == row[6] as u32 && !q.is_empty() {
+                    return Ok(sample::sample_row_q(&logits, seen, generated, &row, &q));
+                }
+            }
+        }
+        Ok(sample::sample_row(&logits, seen, generated, &row))
     }
 
     /// Sampled drafts: per output row of the last step (a draft step whose logits are `width` wide in rows of `ld`,

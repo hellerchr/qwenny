@@ -674,7 +674,7 @@ pub fn samplecheck(opts: &Opts, dir: &str) -> Result<()> {
     // with a draft: the accept-or-resample result must follow the same distribution as plain sampling
     m.run(&toks, &rows)?;
     let lg = m.logits_row(0)?;
-    for &(temp, k, p, rep, pres) in &[(1.0, 0, 1.0, 1.0, 0.0), (0.8, 20, 0.9, 1.1, 0.0), (1.5, 50, 1.0, 1.3, 0.0), (1.0, 20, 0.95, 1.0, 1.5)] {
+    for &(temp, k, p, rep, pres) in &[(1.0, 1024, 1.0, 1.0, 0.0), (0.8, 20, 0.9, 1.1, 0.0), (1.5, 50, 1.0, 1.3, 0.0), (1.0, 20, 0.95, 1.0, 1.5)] {
         let params = sample::Params { temperature: temp, top_k: k, top_p: p, repetition_penalty: rep, presence_penalty: pres, seed: 0 };
         // target: the host reference's distribution, estimated with many draws
         let mut want: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();

@@ -92,7 +92,7 @@ take what is free after loading, less 512 MiB for CUDA graphs and the driver (a 
 **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`. Request fields: `model`,
 `messages`,
 `tools`, `chat_template_kwargs`, `enable_thinking`, `reasoning_effort` (or `reasoning.effort`), `max_tokens`,
-`temperature`, `top_p`, `top_k` (at most 1024), `repetition_penalty`, `presence_penalty`, `seed`, `stop`, `stream`,
+`temperature`, `top_p`, `top_k` (0: the whole vocabulary), `repetition_penalty`, `presence_penalty`, `seed`, `stop`, `stream`,
 `stream_options.include_usage`, `ignore_eos`.
 
 - `model`: with an adapter loaded, its name runs the request (chat or decision) with the adapter and `--name` (or no
