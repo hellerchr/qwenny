@@ -428,7 +428,7 @@ pub fn capture(_opts: &Opts, _dir: &str, _prompts: &str, _out: &str) -> Result<(
 /// counts, dims) for the offline direction/gate math in numpy. State is reset (`release`) between prompts.
 #[cfg(has_cuda)]
 pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     let k: usize = opts.get("last", 4)?;
     ensure!(k >= 1, "--last must be >= 1");
     let ctx = opts.get("ctx", 4096)?;
@@ -455,9 +455,7 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
 
     let mut group_names: Vec<String> = Vec::new();
     let mut group_ids: Vec<u32> = Vec::new();
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut tensors: Vec<(String, Vec<f32>)> = Vec::new();
-    let mut rms0: Vec<f32> = Vec::new();
     let mut tail_ids: Vec<i32> = Vec::new();
     let mut n_tokens: Vec<i32> = Vec::new();
     let mut tail0: Option<Vec<i32>> = None;
@@ -483,18 +481,6 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
             group_names.len() - 1
         });
         group_ids.push(gid as u32);
-        *counts.entry(group.clone()).or_default() += 1;
-        if idx == 0 {
-            // RMS at every (suffix position, layer) of prompt 0, laid out rms0[pos * nl + layer]
-            rms0 = vec![0f32; k * nl];
-            for pos in 0..k {
-                for layer in 0..nl {
-                    let row = &caps[layer * k * h + pos * h..layer * k * h + (pos + 1) * h];
-                    rms0[pos * nl + layer] =
-                        (row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / h as f64).sqrt() as f32;
-                }
-            }
-        }
         m.release(0)?;
         tensors.push((format!("p{idx}"), caps));
     }
@@ -531,14 +517,6 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
         .collect::<Result<_>>()?;
     safetensors::serialize_to_file(views, Some(meta), Path::new(out))?;
 
-    for (g, c) in &counts {
-        println!("group {g}: {c} prompts");
-    }
-    for pos in 0..k {
-        let rms_line: Vec<String> =
-            (0..nl).step_by(8).map(|layer| format!("L{layer}={:.1}", rms0[pos * nl + layer])).collect();
-        println!("prompt 0 residual RMS (suffix pos {pos} of {k}) by layer: {}", rms_line.join(" "));
-    }
     println!("wrote {out}: {} prompts x [{nl}][{k}][{h}] f32", rows.len());
     Ok(())
 }

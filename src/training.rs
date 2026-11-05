@@ -4,6 +4,7 @@
 use crate::cuda::learn::mem_gib;
 use crate::cuda::qwen::train::Trainer;
 use crate::chat::Chat;
+use crate::lora;
 use anyhow::{Context, Result, bail, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::{Value as Json, json};
@@ -186,11 +187,6 @@ pub fn shuffled(n: usize, rng: &mut u64) -> Vec<usize> {
     order
 }
 
-/// little-endian f32 bytes as floats
-pub fn f32s(b: &[u8]) -> Vec<f32> {
-    b.as_chunks().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
-}
-
 pub fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
@@ -200,24 +196,10 @@ pub fn save_adapter(tr: &Trainer, out: &Path, base: &Path) -> Result<()> {
     fs::create_dir_all(out)?;
     let params = tr.l.read_params(false)?;
     let tensors = tr.l.tensor_shapes();
-    let mut views = Vec::new();
-    for (n, r, c) in &tensors {
-        views.push((n.clone(), safetensors::tensor::TensorView::new(Dtype::F32, vec![*r, *c], f32_bytes(&params[n]))?));
-    }
-    safetensors::serialize_to_file(views, None, &out.join("adapter_model.safetensors"))?;
-    // "...layers.3.self_attn.q_proj.lora_A.weight" -> "q_proj"
-    let mut targets: Vec<&str> = tensors.iter().filter_map(|(n, ..)| n.strip_suffix(".lora_A.weight")?.rsplit('.').next()).collect();
-    targets.sort();
-    targets.dedup();
+    lora::save_tensors(&out.join("adapter_model.safetensors"),
+                       tensors.iter().map(|(n, r, c)| (n.clone(), Dtype::F32, vec![*r, *c], f32_bytes(&params[n]))))?;
     let o = &tr.l.o;
-    let cfg = json!({
-        "peft_type": "LORA", "task_type": "CAUSAL_LM", "base_model_name_or_path": crate::hub::name(base),
-        "r": o.rank, "lora_alpha": o.alpha, "lora_dropout": o.dropout, "target_modules": targets,
-        "bias": "none", "fan_in_fan_out": false, "inference_mode": true, "init_lora_weights": true, "use_dora": false,
-        "use_rslora": false, "modules_to_save": null, "rank_pattern": {}, "alpha_pattern": {},
-    });
-    fs::write(out.join("adapter_config.json"), serde_json::to_string_pretty(&cfg)?)?;
-    Ok(())
+    lora::write_config(out, &crate::hub::name(base), o.rank, o.alpha, o.dropout, tensors.iter().map(|t| t.0.as_str()))
 }
 
 pub fn pack<'a>(examples: impl Iterator<Item = &'a Example>, limit: usize) -> Vec<Micro> {
@@ -332,31 +314,17 @@ pub(crate) fn trainer_name(name: &str) -> String {
 }
 
 pub fn read_init_adapter(dir: &Path) -> Result<InitAdapter> {
-    let cfg: Json = serde_json::from_str(&fs::read_to_string(dir.join("adapter_config.json"))
-        .with_context(|| format!("--init-adapter: {}/adapter_config.json", dir.display()))?)?;
-    ensure!(cfg["peft_type"].as_str().is_none_or(|t| t == "LORA"), "--init-adapter: {} is not a LoRA", dir.display());
-    ensure!(cfg["use_rslora"].as_bool() != Some(true) && cfg["use_dora"].as_bool() != Some(true),
-            "--init-adapter: an rsLoRA/DoRA adapter");
-    let empty = |k: &str| cfg[k].is_null() || cfg[k].as_object().is_some_and(|o| o.is_empty());
-    ensure!(empty("rank_pattern") && empty("alpha_pattern"), "--init-adapter: an adapter with a rank_pattern or alpha_pattern");
-    let rank = cfg["r"].as_u64().context("adapter_config.json: r")? as usize;
-    let alpha = cfg["lora_alpha"].as_f64().context("adapter_config.json: lora_alpha")? as f32;
+    let c = lora::read_config(dir).context("--init-adapter")?;
     let bytes = fs::read(dir.join("adapter_model.safetensors")).with_context(|| format!("{}/adapter_model.safetensors", dir.display()))?;
     let st = SafeTensors::deserialize(&bytes)?;
     let mut tensors = HashMap::new();
     for name in st.names() {
         if name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight") {
-            let t = st.tensor(name)?;
-            let v = match t.dtype() {
-                Dtype::F32 => f32s(t.data()),
-                Dtype::BF16 => t.data().as_chunks().0.iter().map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16)).collect(),
-                d => bail!("--init-adapter: {name} is {d:?}"),
-            };
-            tensors.insert(trainer_name(name), v);
+            tensors.insert(trainer_name(name), lora::floats(&st, name)?.0);
         }
     }
     ensure!(!tensors.is_empty(), "--init-adapter: no LoRA tensors in {}", dir.display());
-    Ok(InitAdapter { rank, alpha, tensors })
+    Ok(InitAdapter { rank: c.r, alpha: c.alpha as f32, tensors })
 }
 
 /// Writes `init` (by the trainer's names) over the trainer's LoRA: every tensor of it must be one the trainer has,
@@ -538,7 +506,7 @@ pub fn train(model: &Path, data: &Path, out: Option<&Path>, o: Opts, to: TrainOp
 pub(crate) fn ref_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     let t = st.tensor(name).with_context(|| format!("reference tensor {name}"))?;
     ensure!(t.dtype() == Dtype::F32, "{name} is {:?}", t.dtype());
-    Ok(f32s(t.data()))
+    Ok(lora::f32s(t.data()))
 }
 
 pub(crate) fn ref_i32(st: &SafeTensors, name: &str) -> Result<Vec<i32>> {
