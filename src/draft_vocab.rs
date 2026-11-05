@@ -35,7 +35,7 @@ struct Rows {
 impl Rows {
     /// Rows for `ids` (with their scores; none: 0), a multiple of 16 of them at most `cap`
     fn new(vocab: usize, ids: Vec<u32>, score: Vec<f32>, cap: usize) -> Result<Self> {
-        ensure!(ids.len() % 16 == 0 && ids.len() <= cap && cap % 16 == 0, "{} rows (at most {cap})", ids.len());
+        ensure!(ids.len().is_multiple_of(16) && ids.len() <= cap && cap.is_multiple_of(16), "{} rows (at most {cap})", ids.len());
         let mut row_of = vec![NONE; vocab];
         for (r, &t) in ids.iter().enumerate() {
             ensure!((t as usize) < vocab && row_of[t as usize] == NONE, "token {t} twice or beyond the vocabulary");
@@ -159,7 +159,8 @@ impl Adaptive {
             }
         }
         let whole = ids.len() / 16 * 16;
-        (ids.truncate(whole), score.truncate(whole));
+        ids.truncate(whole);
+        score.truncate(whole);
         ensure!(!ids.is_empty(), "a draft vocabulary of less than one tile");
         Ok(Adaptive { rows: Rows::new(vocab, ids, score, MAX_ROWS)?, path, dirty: false, saved: Instant::now() })
     }
@@ -238,8 +239,8 @@ pub fn draft_ids(dir: &Path, vocab: usize) -> Result<Option<Vec<u32>>> {
             let v = b.get(data..data + size).with_context(|| format!("{}: a truncated entry", path.display()))?;
             let mut seen = vec![false; vocab];
             let mut ids = Vec::with_capacity(size / 8);
-            for c in v.chunks_exact(8) {
-                let id = i64::from_le_bytes(c.try_into().unwrap());
+            for c in v.as_chunks::<8>().0 {
+                let id = i64::from_le_bytes(*c);
                 ensure!(id >= 0 && (id as usize) < vocab, "{}: token id {id} beyond the vocabulary", path.display());
                 if !std::mem::replace(&mut seen[id as usize], true) {
                     ids.push(id as u32);
@@ -348,7 +349,7 @@ mod tests {
     /// A zip archive as PyTorch writes one tensor: a stored entry `archive/data/0` with `ids` as int64
     fn pt_file(ids: &[i64]) -> Vec<u8> {
         let (name, data): (&[u8], Vec<u8>) = (b"archive/data/0", ids.iter().flat_map(|i| i.to_le_bytes()).collect());
-        let mut local = vec![0u8; 30];
+        let mut local = [0u8; 30];
         local[..4].copy_from_slice(b"PK\x03\x04");
         local[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
         let mut central = vec![0u8; 46];

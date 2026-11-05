@@ -210,7 +210,7 @@ pub struct Store {
 }
 
 /// The longest context (a multiple of 1,024, at most `max`) of which one session fits in the engine's cache room
-pub fn fitting_ctx(m: &Box<dyn Engine>, max: usize) -> usize {
+pub fn fitting_ctx(m: &dyn Engine, max: usize) -> usize {
     let room = m.cache_room().unwrap_or(0);
     (1..=max / 1024).rev().map(|k| k * 1024).find(|&c| m.slot_bytes(c) <= room).unwrap_or(0)
 }
@@ -232,7 +232,7 @@ const HOST_FLOOR: usize = 1 << 30;
 impl Store {
     /// The cache of `m`'s sessions: `want` of them at most (None: one per slot), sharing device and host memory by what
     /// they hold; an error when one session of the engine's whole context does not fit on the device
-    pub fn new(m: &Box<dyn Engine>, want: Option<usize>) -> Result<Self> {
+    pub fn new(m: &dyn Engine, want: Option<usize>) -> Result<Self> {
         let budget = mem_available().map_or(0, |b| b.saturating_sub(HOST_RESERVE));
         let (gib, ctx, room) = (|b: usize| b as f64 / 1073741824.0, m.max_ctx(), m.cache_room().unwrap_or(0));
         ensure!(m.slot_bytes(ctx) <= room, "a session of {ctx} tokens does not fit: {:.1} GiB in a slot, the device has {:.1} \

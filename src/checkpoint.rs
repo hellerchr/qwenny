@@ -153,8 +153,11 @@ fn packed_scheme(qc: &Json) -> Result<Scheme> {
     Ok(Scheme::Packed { bits, group })
 }
 
+/// Reads the float at the front of a byte slice
+type FloatAt = fn(&[u8]) -> f32;
+
 /// Bytes per value of a tensor stored as floats, and the value at the front of a slice as f32
-fn float_format(dtype: Dtype) -> Option<(usize, fn(&[u8]) -> f32)> {
+fn float_format(dtype: Dtype) -> Option<(usize, FloatAt)> {
     match dtype {
         Dtype::BF16 => Some((2, |c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))),
         Dtype::F16 => Some((2, |c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())),
@@ -304,7 +307,7 @@ impl Checkpoint {
         }
         let (dtype, shape, data) = self.raw(name).with_context(|| format!("tensor {name}"))?;
         let v = match dtype {
-            Dtype::BF16 => data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+            Dtype::BF16 => data.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect(),
             _ => self.floats(name)?.0.into_iter().map(|x| half::bf16::from_f32(x).to_bits()).collect(),
         };
         Ok((v, shape.to_vec()))
@@ -331,7 +334,7 @@ impl Checkpoint {
     fn words(&self, name: &str) -> Result<(Vec<u32>, Vec<usize>)> {
         let (dtype, shape, data) = self.raw(name).with_context(|| format!("tensor {name}"))?;
         ensure!(matches!(dtype, Dtype::U32 | Dtype::I32) && shape.len() == 2, "{name} is {dtype:?} {shape:?}, expected packed 32-bit words");
-        Ok((data.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(), shape.to_vec()))
+        Ok((data.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect(), shape.to_vec()))
     }
 
     fn mlx_matrix(&self, base: &str, bits: usize, group: usize) -> Result<Quant> {
@@ -347,7 +350,7 @@ impl Checkpoint {
     /// The columns `{base}.weight_shape` gives a packed matrix of `rows` rows, if it is stored
     fn packed_cols(&self, base: &str, rows: usize) -> Result<Option<usize>> {
         let Some((Dtype::I64, _, d)) = self.raw(&format!("{base}.weight_shape")) else { return Ok(None) };
-        let s: Vec<i64> = d.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+        let s: Vec<i64> = d.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c)).collect();
         ensure!(s.len() == 2 && s[0] as usize == rows, "{base}.weight_shape {s:?} for {rows} packed rows");
         Ok(Some(s[1] as usize))
     }

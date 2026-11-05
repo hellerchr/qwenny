@@ -123,7 +123,7 @@ impl Mat {
     /// Pack `src` [rows][cols] (bf16 bits or f32) as int8 or f16; `silu`: see row_order.
     pub fn new<V: Val>(s: &Arc<CudaStream>, src: &[V], cols: usize, silu: bool, int8: bool) -> Result<Self> {
         let rows = src.len() / cols;
-        ensure!(rows % 16 == 0 && cols % 256 == 0 && rows * cols == src.len(), "matrix of {rows} x {cols}");
+        ensure!(rows.is_multiple_of(16) && cols.is_multiple_of(256) && rows * cols == src.len(), "matrix of {rows} x {cols}");
         let (w, sc) = pack(src, cols, &row_order(rows, silu), int8);
         Mat::upload(s, &w, &sc, rows, cols, if int8 { Wt::I8 } else { Wt::F16 })
     }
@@ -133,7 +133,7 @@ impl Mat {
     /// (`zeros`: its zero points, Quant::zero_points)
     pub fn marlin_rows(s: &Arc<CudaStream>, q: &Quant, zeros: &[u8], rows: &[usize], cap: usize) -> Result<Self> {
         ensure!(q.bits == 4, "Marlin packs int4 matrices, not {}-bit ones", q.bits);
-        ensure!(rows.len() % 16 == 0 && cap % 256 == 0 && rows.len() <= cap && !rows.is_empty(),
+        ensure!(rows.len().is_multiple_of(16) && cap.is_multiple_of(256) && rows.len() <= cap && !rows.is_empty(),
                 "{} rows (room for {cap})", rows.len());
         let sym = zeros.iter().all(|&z| z == 8);
         let order: Vec<usize> = rows.iter().copied().chain(std::iter::repeat(rows[0])).take(cap).collect();
@@ -148,7 +148,7 @@ impl Mat {
     /// columns, rows a multiple of 256 (Marlin's 256-output tiles of steps over 16 tokens), columns of 128; `silu`: see
     /// row_order.
     pub fn marlin(s: &Arc<CudaStream>, q: &Quant, silu: bool) -> Result<Option<Self>> {
-        let fits = q.bits == 4 && q.group % QG == 0 && q.rows % 256 == 0 && q.cols % 128 == 0;
+        let fits = q.bits == 4 && q.group.is_multiple_of(QG) && q.rows.is_multiple_of(256) && q.cols.is_multiple_of(128);
         let Some(zeros) = fits.then(|| q.zero_points()).flatten() else { return Ok(None) };
         Mat::marlin_rows(s, q, &zeros, &row_order(q.rows, silu), q.rows).map(Some)
     }
@@ -156,7 +156,7 @@ impl Mat {
     /// A stored symmetric int8 matrix as it is (compressed-tensors: value + 128, a scale per row and group of a multiple
     /// of 128 columns; the int8 kernels' format); `silu`: see row_order.
     pub fn int8(s: &Arc<CudaStream>, q: &Quant, silu: bool) -> Result<Option<Self>> {
-        let fits = q.bits == 8 && q.group % QG == 0 && q.rows % 16 == 0 && q.cols % Wt::I8.stage_cols() == 0;
+        let fits = q.bits == 8 && q.group.is_multiple_of(QG) && q.rows.is_multiple_of(16) && q.cols.is_multiple_of(Wt::I8.stage_cols());
         if !fits || q.zero_points().is_none_or(|z| z.iter().any(|&z| z != 128)) {
             return Ok(None);
         }
@@ -382,7 +382,7 @@ fn split_for(tiles: usize, cols: usize, wt: Wt, kd: usize) -> usize {
     const UNITS: usize = 1024;
     let chunks = cols / wt.stage_cols();
     let want = UNITS.div_ceil(tiles).max(cols.div_ceil(kd));
-    (1..=chunks).find(|d| chunks % d == 0 && *d >= want).unwrap_or(chunks)
+    (1..=chunks).find(|d| chunks.is_multiple_of(*d) && *d >= want).unwrap_or(chunks)
 }
 
 /// Marlin's tile configurations (kernels/marlin.cuh MARLIN_SET): 16-token, 16-output and 16-column blocks. Steps of
@@ -518,6 +518,7 @@ impl Gemm {
     /// the rest (a partial 16-token block in it) in a second; steps of up to 16 tokens with the 128 x 128 tiles.
     /// Plain: y f32 [n][rows] (one part); Silu: f16 [n][rows / 2].
     /// Argmax: y f32 [n][rows] and the running argmax over the `valid` rows in `keys`.
+    #[allow(clippy::too_many_arguments)] // a kernel launch: stream, shape, weights, in/out buffers, epilogue, keys
     fn marlin<X: DeviceRepr, Y: DeviceRepr>(&self, s: &Arc<CudaStream>, n: usize, w: &Mat, x: &CudaSlice<X>,
                                            y: &CudaSlice<Y>, epi: Epi, keys: &CudaSlice<u64>) -> Result<()> {
         let mk = &self.mk;
@@ -1008,7 +1009,7 @@ impl<K: Hash + Eq + Clone> Graphs<K> {
         let tick = c.tick;
         if let Some(g) = c.graphs.get_mut(&key) {
             g.1 = tick;
-            return Ok(g.0.launch().context("replaying a CUDA graph")?);
+            return g.0.launch().context("replaying a CUDA graph");
         }
         self.make_room(s, &mut c)?;
         let captured = (|| -> Result<CudaGraph> {

@@ -71,7 +71,7 @@ impl Linear {
         let (scales, offsets, group) = if [32, 64, 128].contains(&q.group) {
             (q.scales.clone(), q.offsets.clone(), q.group)
         } else {
-            ensure!(q.group % 128 == 0, "groups of {}: MLX takes 32, 64, 128 or multiples of 128", q.group);
+            ensure!(q.group.is_multiple_of(128), "groups of {}: MLX takes 32, 64, 128 or multiples of 128", q.group);
             let rep = |v: &[f32]| v.iter().flat_map(|&x| std::iter::repeat_n(x, q.group / 128)).collect::<Vec<_>>();
             (rep(&q.scales), rep(&q.offsets), 128)
         };
@@ -205,14 +205,17 @@ const FULL_CHUNK: i32 = super::model::MAX_TOK as i32;
 
 /// A function of arrays, also compiled (mlx's compile: one graph, element-wise operations fused; on Metal in its safe
 /// math mode, through NVRTC without fast math: the operations stay exact, rounding may differ by fused multiply-adds).
+type ArrayFn = dyn Fn(&[Array]) -> MResult<Vec<Array>>;
+type ArrayFnMut = dyn FnMut(&[Array]) -> MResult<Vec<Array>>;
+
 pub struct Fused {
-    plain: std::rc::Rc<dyn Fn(&[Array]) -> MResult<Vec<Array>>>,
-    compiled: Box<dyn FnMut(&[Array]) -> MResult<Vec<Array>>>,
+    plain: std::rc::Rc<ArrayFn>,
+    compiled: Box<ArrayFnMut>,
 }
 
 impl Fused {
     pub fn new(f: impl Fn(&[Array]) -> MResult<Vec<Array>> + 'static) -> Self {
-        let plain: std::rc::Rc<dyn Fn(&[Array]) -> MResult<Vec<Array>>> = std::rc::Rc::new(f);
+        let plain: std::rc::Rc<ArrayFn> = std::rc::Rc::new(f);
         let p = plain.clone();
         let mut c = mlx_rs::transforms::compile::compile(move |a: &[Array]| p(a), false);
         Fused { plain, compiled: Box::new(move |a: &[Array]| c(a)) }
@@ -545,6 +548,7 @@ impl Weights {
         let head = if ck.is_quant(&head_base) || head_base != embed_base {
             Some(lin(&[format!("{head_base}.weight")])?)
         } else { None };
+        #[allow(clippy::collapsible_if)] // draft_ids reads files and may fail: only when MTP has a 4-bit head to draw from
         if let (Some(m), Some(source @ Linear::Quant { bits: 4, .. })) = (&mut mtp, &head) {
             if let Some(seed) = draft_ids(dir, d.vocab)? {
                 let adaptive = Adaptive::load(dir, d.vocab, &seed)?;

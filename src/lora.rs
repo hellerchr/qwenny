@@ -5,6 +5,9 @@ use safetensors::{Dtype, SafeTensors};
 use serde_json::{Value as Json, json};
 use std::{collections::HashMap, fs, path::{Path, PathBuf}};
 
+/// A matrix of a composed adapter: name, output rows, input cols, the adapters (index + kept slots) that touch it
+type PlanEntry<'a> = (&'a String, usize, usize, Vec<(usize, Vec<usize>)>);
+
 /// LoRA ranks the serving kernel has (src/cuda/qwen/lora.rs RANKS); a composed adapter pads to one of these.
 const RANKS: [usize; 4] = [8, 16, 32, 64];
 
@@ -152,7 +155,7 @@ impl Adapter {
         names.sort();
         names.dedup();
         // per matrix: output rows, input cols, the adapters (index + kept slots) that touch it; and the largest sum
-        let mut plan: Vec<(&String, usize, usize, Vec<(usize, Vec<usize>)>)> = Vec::new();
+        let mut plan: Vec<PlanEntry<'_>> = Vec::new();
         let mut max_sum = 0usize;
         for name in names {
             let (mut rows, mut cols, mut blocks, mut sum) = (None, None, Vec::new(), 0usize);
@@ -299,9 +302,9 @@ fn writer_a(ck: &crate::checkpoint::Checkpoint, base: &str, r: &[f32]) -> Result
             let hs: Vec<_> = (0..rows).step_by(per).map(|r0| {
                 s.spawn(move || {
                     let (mut acc, mut buf) = (vec![0f32; cols], vec![0f32; cols]);
-                    for row in r0..(r0 + per).min(rows) {
+                    let end = (r0 + per).min(rows);
+                    for (row, &rr) in (r0..end).zip(&r[r0..end]) {
                         row_f32(row, &mut buf);
-                        let rr = r[row];
                         for (a, &b) in acc.iter_mut().zip(&buf) { *a += rr * b; }
                     }
                     acc

@@ -17,6 +17,9 @@ use crate::training::{Micro, Opts, f32_bytes};
 use anyhow::{Context, Result, bail, ensure};
 use std::{fs, path::Path};
 
+/// Per-row loss weights from the caller, given the micro-batch's per-row losses
+type Weigh<'a> = dyn FnMut(&[f32]) -> Result<Vec<f32>> + 'a;
+
 mod int8;
 
 /// The PTX of a model size: bf16, f32 and f16 builds (build.rs)
@@ -634,7 +637,7 @@ impl Trainer {
         Ok(())
     }
 
-    fn run(&self, mb: &Micro, train: bool, scale: f32, weigh: Option<&mut dyn FnMut(&[f32]) -> Result<Vec<f32>>>, step: u64,
+    fn run(&self, mb: &Micro, train: bool, scale: f32, weigh: Option<&mut Weigh<'_>>, step: u64,
            micro: usize) -> Result<(Vec<f32>, usize)> {
         self.upload(mb)?;
         let (l, t, h, es) = (&self.l, mb.tokens(), self.d.h, self.l.es as u64);

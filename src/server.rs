@@ -455,7 +455,7 @@ impl Sched {
         let m = &self.m;
         let decoding = self.active.iter().filter(|s| s.fed == s.job.prompt.len()).count();
         let (max_tok, max_out) = (m.max_tok(), m.max_out());
-        let room_each = if decoding == 0 { 0 } else { m.spec_tok().saturating_sub(decoding) / decoding };
+        let room_each = m.spec_tok().saturating_sub(decoding).checked_div(decoding).unwrap_or(0);
         let (per, per_chain) = (room_each.min(self.mtp), room_each.min(self.spec));
         let undo = self.active.iter().map(|s| (s.fed, s.marked)).collect();
         let (mut toks, mut want, mut marks, mut segs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1264,13 +1264,13 @@ fn start_engine(load: impl FnOnce() -> Result<Box<dyn Engine>> + Send + 'static,
         // finished sequences kept for the requests that continue them (engines that can save slots)
         let ready = load().and_then(|mut m| {
             if fit_ctx && m.cache_room().is_some() {
-                let c = sessions::fitting_ctx(&m, m.max_ctx());
+                let c = sessions::fitting_ctx(&*m, m.max_ctx());
                 m.limit_ctx(c);
             }
             let capacity = m.draft_capacity().min(m.spec_tok().saturating_sub(1)).min(m.max_out().saturating_sub(1));
             let mtp = mtp_depth(m.has_draft(), m.draft_tokens(), capacity, drafts);
             m.warmup(mtp)?;
-            let store = if m.can_save() { Some(Store::new(&m, sessions)?) } else { None };
+            let store = if m.can_save() { Some(Store::new(&*m, sessions)?) } else { None };
             Ok((m, store, mtp))
         });
         match ready {
@@ -1549,7 +1549,7 @@ mod tests {
         std::thread::spawn(move || {
             started.recv().unwrap();
             let m: Box<dyn Engine> = Box::new(Scripted { script, prompt: Default::default(), rows: Vec::new(), drafts: None, slots: 2, full_once });
-            let store = Store::new(&m, Some(2)).unwrap();
+            let store = Store::new(&*m, Some(2)).unwrap();
             engine(m, Some(store), engine_chat, rx, 0, 0)
         });
         let db = std::env::temp_dir().join(format!("qwenny-test-{}-{:?}.db", std::process::id(), std::thread::current().id()));

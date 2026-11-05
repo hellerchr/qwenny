@@ -216,6 +216,7 @@ struct Asked {
     row: Json,
 }
 
+#[allow(clippy::result_large_err)] // the Err is the axum Response handed straight back to the client
 async fn decision_reply(mut rx: UnboundedReceiver<Msg>) -> Result<(Vec<f32>, f64, usize), Response> {
     match rx.recv().await {
         Some(Msg::Decision { logits, label_mass, prompt_tokens }) => Ok((logits, label_mass, prompt_tokens)),

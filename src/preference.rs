@@ -404,7 +404,7 @@ mod tests {
     fn large_margins_stay_finite() {
         let po = PrefOpts { beta: 1.0, nll: 0.0 };
         let (_, dpo, _) = pair_terms(&po, (0.0, -2000.0), (0.0, 0.0), 1);
-        assert!(dpo >= 0.0 && dpo < 1e-300);
+        assert!((0.0..1e-300).contains(&dpo));
         let (_, dpo, _) = pair_terms(&po, (-2000.0, 0.0), (0.0, 0.0), 1);
         assert!((dpo - 2000.0).abs() < 1e-9);
     }

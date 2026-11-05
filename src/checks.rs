@@ -9,12 +9,15 @@ fn read(path: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {path}"))
 }
 
+/// One step of a pass: (slot, first position, count) per segment
+type Step = Vec<(u32, usize, usize)>;
+
 fn ints(st: &SafeTensors, name: &str) -> Result<Vec<u32>> {
-    Ok(st.tensor(name)?.data().chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap()) as u32).collect())
+    Ok(st.tensor(name)?.data().as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c) as u32).collect())
 }
 
 fn floats(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
-    Ok(st.tensor(name)?.data().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    Ok(st.tensor(name)?.data().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
 /// The prompts of a reference: those with an `ids_<p>` tensor
@@ -280,7 +283,7 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
         let scale = want.iter().fold(0f32, |a, &b| a.max(b.abs()));
         let (h, max_tok) = (xn.len() / n, m.max_tok());
         // steps: lists of (slot, first position, count)
-        let mut passes: Vec<(&str, Vec<Vec<(u32, usize, usize)>>)> = Vec::new();
+        let mut passes: Vec<(&str, Vec<Step>)> = Vec::new();
         let tail = 4.min(n - 1);
         let mut a: Vec<_> = (0..n - tail).step_by(max_tok).map(|s| vec![(0, s, max_tok.min(n - tail - s))]).collect();
         a.extend((n - tail..n).map(|s| vec![(0, s, 1)]));
@@ -789,7 +792,7 @@ pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
 /// continue with exactly the logits they have when they never leave a slot, or it fails
 pub fn swapcheck(opts: &Opts, dir: &str) -> Result<()> {
     let len: usize = opts.get("len", 131072)?;
-    ensure!(len % 64 == 0, "--len: a multiple of 64");
+    ensure!(len.is_multiple_of(64), "--len: a multiple of 64");
     let tail = 256;
     let mut m = opts.load_at(dir, len + 1024, 3)?;
     let seq = |k: usize| -> Vec<u32> { (0..len + tail).map(|i| 1000 + ((i * 7919 + k * 104729) % 20000) as u32).collect() };
@@ -802,7 +805,7 @@ pub fn swapcheck(opts: &Opts, dir: &str) -> Result<()> {
         refs.push(feed(m.as_mut(), ids, len, len + tail, 0)?);
         m.release(0)?;
     }
-    let mut st = sessions::Store::new(&m, None)?;
+    let mut st = sessions::Store::new(&*m, None)?;
     feed(m.as_mut(), &a, 0, len, 0)?;
     st.put(0, held(&a));
     feed(m.as_mut(), &b, 0, len, 1)?;
@@ -982,12 +985,12 @@ pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
                     pos[s].iter().map(|&q| q as usize).filter(|&q| q >= p0 && q < p0 + c).take(max_out / 2).collect()
                 };
                 want.truncate(max_out / 2);
-                for q in p0..p0 + c {
+                for (q, &id) in (p0..).zip(&hist[p0..p0 + c]) {
                     if want.contains(&q) {
                         rows.push(toks.len());
                         which.push((s, q));
                     }
-                    toks.push(Tok { id: hist[q], slot: s as u32, pos: q as u32 });
+                    toks.push(Tok { id, slot: s as u32, pos: q as u32 });
                 }
             }
             m.run(&toks, &rows)?;

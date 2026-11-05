@@ -473,6 +473,7 @@ impl Embed {
     }
 
     /// out[t] = the embedding of ids[t] for n tokens (f32 [n][H]); clears the first nk argmax keys
+    #[allow(clippy::too_many_arguments)] // a kernel launch: stream, kernels, in/out buffers, keys, counts
     fn launch(&self, s: &Arc<CudaStream>, k: &Kernels, ids: &CudaSlice<i32>, out: &CudaSlice<f32>,
               keys: &CudaSlice<u64>, nk: i32, n: usize) -> Result<()> {
         unsafe {
@@ -822,7 +823,7 @@ impl Engine for Model {
                 o = &o[n..];
             }
         }
-        let words: Vec<u32> = o.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let words: Vec<u32> = o.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
         self.x.st.set_seen(&s, slot, &words)?;
         Ok(true)
     }

@@ -28,6 +28,9 @@ const KEEP: usize = 16;
 /// segments up to this length run token by token (decode, drafts); longer ones chunked (delta::chunked)
 const SEQ_MAX: usize = 16;
 
+/// A sampled draft distribution (token, probability) and the token it ends in
+type DraftDist = (Vec<(u32, f32)>, u32);
+
 struct Segment {
     a: usize,
     b: usize,
@@ -97,7 +100,7 @@ fn delta_arrays(delta: &[Vec<DeltaState>]) -> impl Iterator<Item = &Array> {
 /// Rows `rows` of x
 fn take_rows(x: &Array, rows: impl Iterator<Item = usize>) -> MResult<Array> {
     let rows: Vec<i32> = rows.map(|r| r as i32).collect();
-    x.take_axis(&Array::from_slice(&rows, &[rows.len() as i32]), 0)
+    x.take_axis(Array::from_slice(&rows, &[rows.len() as i32]), 0)
 }
 
 pub struct Model {
@@ -121,7 +124,7 @@ pub struct Model {
     /// Target residual stream of the last step (all rows, for teacher-forced MTP cache fills).
     hidden: Option<Array>,
     /// Sampled draft distributions, by slot and chain index; kept until target verification.
-    draft_dist: Vec<Vec<(Vec<(u32, f32)>, u32)>>,
+    draft_dist: Vec<Vec<DraftDist>>,
     draft_end: Vec<usize>,
     /// per logit row: (slot, first token of its segment, its token)
     rows: Vec<(usize, usize, usize)>,
@@ -372,13 +375,13 @@ impl w::Mix for Cache<'_> {
         let mut parts = Vec::with_capacity(self.segs.len());
         for g in self.segs {
             let (a, b, len) = (g.a as i32, g.b as i32, (g.b - g.a) as i32);
-            let heads = |x: &Array| ops::swap_axes(&x.index(a..b), 0, 1);
+            let heads = |x: &Array| ops::swap_axes(x.index(a..b), 0, 1);
             let (p0, end) = (g.pos0 as i32, (g.pos0 + len as usize) as i32);
             let c = &mut self.kv[g.slot][ai];
-            c.k.try_index_mut((.., p0..end, ..), &heads(&kq)?)?;
-            c.ks.try_index_mut((.., p0..end, ..), &heads(&ks)?)?;
-            c.v.try_index_mut((.., p0..end, ..), &heads(&vq)?)?;
-            c.vs.try_index_mut((.., p0..end, ..), &heads(&vs)?)?;
+            c.k.try_index_mut((.., p0..end, ..), &heads(kq)?)?;
+            c.ks.try_index_mut((.., p0..end, ..), &heads(ks)?)?;
+            c.v.try_index_mut((.., p0..end, ..), &heads(vq)?)?;
+            c.vs.try_index_mut((.., p0..end, ..), &heads(vs)?)?;
             // Dequantize the cache to f16 (int8 q * f32 scale) and run attention in f16 with f32 accumulation, as
             // CUDA's tensor-core attention product. f16 inputs take MLX's fused flash-attention kernel; f32 inputs
             // fall back to a path that materializes the [len][end] scores.
