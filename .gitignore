@@ -1,2 +1,5 @@
 target/
 __pycache__/
+AGENTS.md
+CLAUDE.md
+.claude/
