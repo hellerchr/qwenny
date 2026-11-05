@@ -330,7 +330,7 @@ impl Stack {
             cv: z(if d.lv_heads > 0 { MAX_TOK * deltanet::cv_width(&d) } else { 1 })?,
         };
         let st = Step::new(&s, &m, slots, max_ctx, VOCAB, attn::segments(d.nh / NKV))?;
-        let x = Stack { mm: Gemm::load(&s, &m, true, d.h)?, lk: lora::Kernels::load(&m)?, scales: z(slots)?, k, st, d,
+        let x = Stack { mm: Gemm::load(&s, &m, d.h)?, lk: lora::Kernels::load(&m)?, scales: z(slots)?, k, st, d,
                         layers, b, s, pool };
         x.set_budget()?;
         Ok((x, w))

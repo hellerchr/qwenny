@@ -84,7 +84,7 @@ pub fn load(s: &Arc<CudaStream>, ad: &Adapter, stacks: &[Stacked], cols: usize, 
     let m = (a.len() / cols).next_multiple_of(16);
     ensure!(m <= MAXM, "{m} LoRA rows on one input (at most {MAXM})");
     a.resize(m * cols, 0.0);
-    let a = Mat::f16(s, &a, cols).context("LoRA A")?;
+    let a = Mat::new(s, &a, cols, false, false).context("LoRA A")?;
     let mut bs = Vec::new();
     for (st, o) in stacks.iter().zip(&offs) {
         if o.iter().all(|&x| x < 0) {
