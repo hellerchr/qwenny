@@ -8,7 +8,8 @@ built for running the 27B model with a 250k-token context on one 24 GB GPU.
   model's distribution, and checks compare the results with PyTorch / Transformers / PEFT references.
 - int4 weights (symmetric or with zero points) run on Marlin kernels; the KV cache is int8; decode steps replay as
   CUDA graphs; the checkpoint's MTP layer drafts four tokens per step by default.
-- One binary: `serve` (API and web page), `train` (LoRA), `merge`, `bench`, `password` and the checks.
+- One binary: `serve` (API and web page), `train` (LoRA), `merge`, `bench`, `abliterate` (a LoRA that removes
+  refusals), `password` and the checks.
 
 ## Quick start
 
@@ -23,7 +24,7 @@ curl -s localhost:18023/v1/chat/completions -H 'Content-Type: application/json' 
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 200}'
 ```
 
-`qwenny --help` lists the commands and options. `--model=<directory or Hugging Face id>` (default
+`qwenny --help` lists the commands; `qwenny help <command>` gives its arguments, options and defaults. `--model=<directory or Hugging Face id>` (default
 `Qwen/Qwen3.5-4B`, downloaded once to the Hugging Face cache; `HF_HOME`, `HF_TOKEN` and `HF_HUB_OFFLINE` apply),
 `--adapter=[<name>=]<dir>` (a PEFT LoRA, served unmerged: see Server) and `--bf16` (16-bit weights instead of int8;
 pre-quantized checkpoints keep their format) go with every command that loads a model.
@@ -218,7 +219,7 @@ one and checks its replies over HTTP (thinking, streaming, tools, continued conv
 ## Layout
 
 ```
-src/main.rs                     command line
+src/main.rs, src/cli.rs         command line: the commands and their options; parsing and help from them
 src/engine.rs                   the engine interface of both backends
 src/server.rs, src/sessions.rs  API server, scheduling, speculative decoding; slots and host swap
 src/auth.rs                     the page's password and the API keys (SQLite)
@@ -251,4 +252,5 @@ No license has been chosen yet. `kernels/marlin.cuh` keeps Marlin's Apache 2.0 n
 ## Linting
 
 `scripts/lint.sh` runs `cargo fmt --all --check` (`rustfmt.toml`), then `cargo clippy --all-targets --all-features -- -D
-warnings`.
+warnings`, then the command line's tests: every command, argument and option is described, the help fits 120
+columns, and every declared option is read.

@@ -1,9 +1,11 @@
-//! `qwenny abliterate <harmful.jsonl> <harmless.jsonl> <out dir>`: find the direction behind the model's refusals and
-//! bake its removal into a LoRA. Every layer's difference of means is a candidate; the candidates are compared by what
-//! the edited model answers on prompts held out of the means. An edit passes when its answers to harmful prompts lose
-//! the refusal phrases (the measure published abliterations use) and harmless prompts are answered as well as by the
-//! base model. The report also gives what the unedited model judges really answered, on whole answers: an edit can drop
-//! the phrases and still decline in other words, or stop refusing by saying nothing useful.
+//! `qwenny abliterate <harmful.jsonl> <harmless.jsonl> <out dir>`: find the directions behind the model's refusals
+//! and bake their removal into a LoRA (`qwenny help abliterate` says how). Each middle layer's difference of means is
+//! taken out of what that layer writes; the candidates differ in what else they keep, and are compared by what the
+//! edited model answers on prompts held out of the means. An edit passes when its answers to harmful prompts lose the
+//! refusal phrases (the measure published abliterations use), harmless prompts are answered as well as by the base
+//! model, and the base model's own answers stay likely (KL). The report also gives what the unedited model judges
+//! really answered, on whole answers: an edit can drop the phrases and still decline in other words, or stop refusing
+//! by saying nothing useful.
 use crate::chat::Chat;
 use crate::cuda::qwen::Model;
 use crate::engine::{self, Engine, Tok};
@@ -578,6 +580,24 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, s: &Settin
 mod tests {
     use super::*;
     use crate::chat::test_models;
+
+    /// `qwenny help abliterate` states the numbers the run goes by
+    #[test]
+    fn the_help_states_the_pass_bar() {
+        let about = crate::APP.commands.iter().find(|c| c.name == "abliterate").unwrap().about;
+        for (what, n) in [
+            ("no refusal phrase", format!("at least {MIN_NO_PHRASE} of")),
+            ("harmless answered", format!("at most {MAX_HARMLESS_LOSS} fewer")),
+            ("KL", format!("at most {MAX_KL} nats")),
+            ("prompts left", format!("{MIN_DERIVE} + {MIN_HELD} per set")),
+            ("screen", format!("answer {SCREEN_PROMPTS} held-out")),
+            ("retry", format!("{STRONGER} times stronger")),
+            ("topics", format!("the {} or {} directions", TOPICS[0], TOPICS[1])),
+        ] {
+            assert!(about.contains(&n), "the help's {what} is not \"{n}\"");
+        }
+        assert_eq!((RETRIED, FINALISTS), (2, 2), "the help says \"the two best\" for both");
+    }
 
     #[test]
     fn prompts_split_the_same_way_and_drop_repeats() {

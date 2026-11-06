@@ -93,7 +93,7 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
     let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     let write: Option<String> = opts.opt("write")?;
-    let limit = if write.is_some() { None } else { Some(opts.limit()?) };
+    let limit = if write.is_some() { None } else { Some(opts.get::<f32>("limit")?) };
     let mut m = opts.load(dir)?;
     let (chunk, vocab) = (chunk.clamp(1, m.max_out()), m.vocab());
     // name, shape, little-endian bytes (i32 or f32)
@@ -213,7 +213,7 @@ pub fn check(opts: &Opts, dir: &str, reference: &str, chunk: usize) -> Result<()
 pub fn mtpcheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
     let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
-    let mut m = opts.load(dir)?;
+    let mut m = opts.load_at(dir, 4096, 1)?;
     ensure!(m.has_draft(), "{dir}: no draft layer (MTP)");
     let vocab = m.vocab();
     // the target and the MTP over ids[..end], chunk by chunk; returns the MTP's argmax per position (and logits per
@@ -293,8 +293,8 @@ const DRAFT: u32 = 0x100;
 pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Result<()> {
     let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
-    let limit = opts.limit()?;
-    let mut m = crate::cuda::qwen::LayerCheck::load(Path::new(dir), layer, opts.int8)?;
+    let limit: f32 = opts.get("limit")?;
+    let mut m = crate::cuda::qwen::LayerCheck::load(Path::new(dir), layer, opts.int8())?;
     let mut worsts = Vec::new();
     for p in prompts(&r) {
         let n = ints(&r, &format!("ids_{p}"))?.len();
@@ -390,8 +390,8 @@ pub fn layercheck(opts: &Opts, dir: &str, reference: &str, layer: usize) -> Resu
 /// Decode `n` tokens one at a time after a short prompt; no host round trip per token. With --adapter: all of it for
 /// the base model's requests (the adapter loaded), then for the adapter's.
 pub fn bench(opts: &Opts, dir: &str, n: usize) -> Result<()> {
-    let slots = opts.get("slots", 1)?;
-    let mut m = opts.load_at(dir, opts.opt("ctx")?.unwrap_or(opts.get("pos", 0usize)? + 4096), slots)?;
+    let slots = opts.get("slots")?;
+    let mut m = opts.load_at(dir, opts.opt("ctx")?.unwrap_or(opts.get::<usize>("pos")? + 4096), slots)?;
     for adapter in if m.has_adapter() { vec![false, true] } else { vec![false] } {
         if m.has_adapter() {
             println!("-- {} requests (an adapter loaded)", if adapter { "adapter" } else { "base model" });
@@ -419,7 +419,7 @@ fn fill(m: &mut dyn Engine, slot: u32, len: usize, id: impl Fn(usize) -> u32, la
 
 fn bench_steps(opts: &Opts, m: &mut dyn Engine, n: usize) -> Result<()> {
     // --pos=P: decode after a P-token context (fed in steps), not after 8 tokens
-    let p0 = opts.get("pos", 0u32)?;
+    let p0 = opts.get::<u32>("pos")?;
     if p0 > 0 {
         let dt = timed(m, |m| fill(m, 0, p0 as usize, |i| 1000 + i as u32 % 1000, false))?;
         println!("context of {p0}: {:.0} tok/s ({dt:.1} s)", p0 as f64 / dt);
@@ -528,9 +528,9 @@ fn bench_steps(opts: &Opts, m: &mut dyn Engine, n: usize) -> Result<()> {
 #[cfg(has_cuda)]
 pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     use std::collections::HashMap;
-    let k: usize = opts.get("last", 4)?;
+    let k: usize = opts.get("last")?;
     ensure!(k >= 1, "--last must be >= 1");
-    let ctx = opts.get("ctx", 4096)?;
+    let ctx = opts.get("ctx")?;
     let chat = chat::Chat::load(Path::new(dir))?;
     let kwargs = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
     // prompts.jsonl is project input (not raw/ untrusted), parsed as plain JSON per line
@@ -549,7 +549,7 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
     ensure!(!rows.is_empty(), "no prompts in {prompts}");
 
     let adapter = opts.adapter()?;
-    let mut m = crate::cuda::qwen::Model::load(Path::new(dir), ctx, 1, opts.int8, adapter.as_ref().map(|a| &a.1))?;
+    let mut m = crate::cuda::qwen::Model::load(Path::new(dir), ctx, 1, opts.int8(), adapter.as_ref().map(|a| &a.1))?;
     if adapter.is_some() {
         m.set_adapter(0, true)?;
     }
@@ -629,7 +629,7 @@ pub fn capture(opts: &Opts, dir: &str, prompts: &str, out: &str) -> Result<()> {
         meta.insert("adapter_matrices".into(), ad.len().to_string());
     }
     meta.insert("model_dir".into(), dir.to_string());
-    meta.insert("int8".into(), opts.int8.to_string());
+    meta.insert("int8".into(), opts.int8().to_string());
     meta.insert("template_hash".into(), format!("{template_hash:016x}"));
     let views: Vec<_> = out_vec
         .iter()
@@ -940,7 +940,7 @@ pub fn speccheck(opts: &Opts, dir: &str) -> Result<()> {
 /// c takes the device's room, a comes back while b moves out chunk by chunk (Store::swap_in), then b comes back: both
 /// continue with exactly the logits they have when they never leave a slot, or it fails
 pub fn swapcheck(opts: &Opts, dir: &str) -> Result<()> {
-    let len: usize = opts.get("len", 131072)?;
+    let len: usize = opts.get("len")?;
     ensure!(len.is_multiple_of(64), "--len: a multiple of 64");
     let tail = 256;
     let mut m = opts.load_at(dir, len + 1024, 3)?;
@@ -1049,7 +1049,7 @@ pub fn cachecheck(opts: &Opts, dir: &str) -> Result<()> {
 /// last 64 positions should agree up to rounding: it fails when the largest |logit diff| is not below --limit (an
 /// argmax may flip where two logits nearly tie: the 4B has one at 1,500 tokens, 0.026 apart).
 pub fn longcheck(opts: &Opts, dir: &str) -> Result<()> {
-    let limit = opts.limit()?;
+    let limit: f32 = opts.get("limit")?;
     let mut m = opts.load_at(dir, 8192, 2)?;
     let (mut diffs, mut agrees) = (Vec::new(), Vec::new());
     for len in [600usize, 1500, 4000] {
@@ -1097,7 +1097,7 @@ pub fn longcheck(opts: &Opts, dir: &str) -> Result<()> {
 /// and the logits at the reference's positions are compared with Transformers + PEFT (adapter) or Transformers (base):
 /// it fails when a row of a mixed run differs, or a mean |logit diff| is not below --limit.
 pub fn adaptercheck(opts: &Opts, dir: &str, reference: &str) -> Result<()> {
-    let limit = opts.limit()?;
+    let limit: f32 = opts.get("limit")?;
     let bytes = read(reference)?;
     let r = SafeTensors::deserialize(&bytes)?;
     ensure!(opts.path("adapter").is_some(), "adaptercheck: --adapter=<dir> (the reference's adapter)");

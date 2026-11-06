@@ -4,6 +4,7 @@ mod auth;
 mod chat;
 mod checkpoint;
 mod checks;
+mod cli;
 #[cfg(has_cuda)]
 mod cuda;
 mod decide;
@@ -21,75 +22,10 @@ mod sessions;
 #[cfg(has_cuda)]
 mod training;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+use cli::{App, Command, Group, Opt, Opts, arg, opt, optional, switch};
 use engine::Engine;
-use std::{env, path::Path};
-
-const HELP: &str = "qwenny: serve Qwen models and fine-tune them with LoRA.
-
-  qwenny serve --model=Qwen/Qwen3.5-4B    OpenAI-compatible server and chat page, http://localhost:18023/
-  qwenny train <data> [out dir]           LoRA fine-tune (data: a dir with train.jsonl and optionally dev.jsonl, or one
-                                          .jsonl; out: runs/<data>-N); rows with \"chosen\" and \"rejected\":
-                                          preference training (DPO + NLL, RPO)
-  qwenny merge <adapter dir> <out dir>    write the model with a LoRA merged in
-  qwenny bench [tokens]                   decode (1 and more streams), verify steps and prompt speed
-  qwenny password                         set the web page's password (asked for; it is also chosen on the page's first
-                                          visit)
-  qwenny help checks                      the checks and research commands
-
---model is a directory or a Hugging Face id, downloaded once (default Qwen/Qwen3.5-4B; also Qwen3.5-9B, Qwen3.8-27B
-and compressed-tensors int4/int8 checkpoints).
-options of serve, bench and the checks that load a model:
-  --adapter=[<name>=]<dir>[,<dir>...]  a LoRA, served unmerged. Without <name>=: applied to the one served model (--name),
-                                       no separate base. With <name>=: serve answers \"model\": <name> with it and --name
-                                       without it (the base). Several comma-separated dirs compose (stack) into one
-                                       adapter: their deltas add, each keeping its own scale, combined rank <= 64
-  --bf16                               16-bit weights instead of int8
-  --backend=cuda|mlx                   default: CUDA when built in, else MLX
-  --cache-mem=<GiB>                    device memory the slots' caches take at most (default: all that is free)
-serve: --host=0.0.0.0 --port=18023 --name=qwenny
-  --ctx=<tokens>        default: the model's native context, or what one session can hold on the GPU if less
-  --slots=16            sessions at most; they share GPU and host memory by what they hold
-  --drafts=<n>          speculative drafts per step, 0: off (default: the draft layer's own, 7 for n-gram chains)
-  --decisions=<presets.json>[,more.json]   named decision tasks for /v1/decisions and the Decide tab
-  --db=<file>           the password and API keys (default ~/.local/share/qwenny/qwenny.db)
-  --stats               log tokens per step and acceptance per draft position for each request
-bench: --pos=0 (context before decoding) --slots=1 --ctx=<pos + 4096>
-train: the defaults are the tested recipe: --epochs=3 (at most: the adapter of the lowest dev loss is kept, training
-  stops after 2 measurements without a new low) --batch=8 --lr=2e-4 --rank=16 --alpha=32 --dropout=0.05 --max-len=4096
-  --precision=f16 (the big products accumulated in f16; bf16; f32: the check build)
-  --init-adapter=<dir> (start from a PEFT adapter, its rank and alpha)
-  preference rows: --beta=0.1 --nll=1.0 (the chosen response's NLL weight) --lr=5e-6 --dropout=0
---key value works like --key=value";
-
-const HELP_CHECKS: &str = "checks: tools/checks.sh runs them against their references (tools/make_*.py make those).
-Each ends in one summary line and exits non-zero when it fails. They take --model=, and --bf16 where it applies.
-  qwenny check <reference.safetensors> [chunk]  logits vs. Transformers (tools/make_reference.py) or vLLM's top-k
-                                                log-probabilities (tools/make_reference_vllm.py); --limit=<max mean
-                                                |diff|>; --write=<file> writes this engine's logits as a reference
-  qwenny layercheck <reference.safetensors>     one layer's mixer vs. the reference (--layer=N; Qwen: 0 DeltaNet, 3
-                                                attention; --limit=<max |diff|>)
-  qwenny mtpcheck <reference.safetensors>       the draft layer (MTP) vs. tools/make_reference_mtp.py (reported only)
-  qwenny adaptercheck <reference.safetensors>   a LoRA (--adapter) and the base model in the same steps vs. each alone
-                                                and vs. tools/make_reference_lora.py (--limit=<max mean |diff|>)
-  qwenny tokcheck <reference.safetensors> <dev.jsonl>   prompt tokens vs. the reference
-  qwenny chatcheck <tokref.json>                chat template and tokenizer vs. Transformers (tools/make_tokref.py)
-  qwenny samplecheck                            GPU sampler vs. the host reference
-  qwenny speccheck                              steps with drafts vs. one token per step
-  qwenny longcheck                              long context: decode steps vs. prompt chunks (--limit=<max |diff|>)
-  qwenny cachecheck, swapcheck                  slots saved, loaded and swapped to host memory continue identically
-                                                (swapcheck: --len=<tokens>)
-  qwenny traincheck <grads reference>           loss, gradients, AdamW step vs. PEFT (--precision, --packed)
-  qwenny datacheck <data dir> <data reference>  token ids and loss masks vs. Unsloth's
-  qwenny dpocheck <dpo reference>               preference training: RPO loss, log-probabilities, gradients vs. PyTorch
-                                                + PEFT (tools/make_dpo_reference.py; --precision, --packed)
-research commands (not checks):
-  qwenny capture <prompts.jsonl> <out.safetensors>   residual activations per prompt and layer (--last=K suffix rows)
-  qwenny bake-direction <direction.safetensors> <out_adapter_dir>   abliteration adapter from a direction (--alpha=1.0)
-  qwenny abliterate <harmful.jsonl> <harmless.jsonl> <out dir>   find the refusal direction, test each candidate layer on
-                                                held-out prompts, write the adapter that passes (--alpha=1.0;
-                                                --evaluate=<adapter dir>: measure that adapter the same way;
-                                                --thinking: also measure and rank the finalists with thinking on)";
+use std::path::{Path, PathBuf};
 
 /// --stats: log speculative decoding per request
 static SPEC_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -97,22 +33,445 @@ static SPEC_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 #[cfg(has_cuda)]
 static CACHE_MEM_GIB: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
-/// Command-line options: `--flag` or `--key=value`.
-struct Opts {
-    int8: bool,
-    /// training precision: f16 (default), bf16, f32 (the check build)
-    precision: String,
-    values: Vec<(String, String)>,
-    switches: Vec<String>,
+/// A command's `run` on CUDA builds; elsewhere an error, the command having no other backend yet
+macro_rules! cuda {
+    ($run:expr) => {{
+        #[cfg(has_cuda)]
+        let run: cli::Run = $run;
+        #[cfg(not(has_cuda))]
+        let run: cli::Run = |o| anyhow::bail!("{}: CUDA backend only so far", o.cmd.name);
+        run
+    }};
 }
 
+const MODEL: Opt = opt(
+    "model",
+    "<dir or id>",
+    hub::DEFAULT_MODEL,
+    "a model directory or a Hugging Face id, downloaded once to the Hugging Face cache (HF_HOME, HF_TOKEN and \
+     HF_HUB_OFFLINE apply): Qwen3.5-4B, Qwen3.5-9B, Qwen3.8-27B and their compressed-tensors int4/int8 checkpoints",
+);
+const BF16: Opt = switch("bf16", "16-bit weights instead of int8 (pre-quantized checkpoints keep their format)");
+const BACKEND: Opt = opt("backend", "cuda|mlx", "", "default: CUDA when built in, else MLX");
+const CACHE_MEM: Opt =
+    opt("cache-mem", "<GiB>", "", "device memory the slots' caches take at most (default: all that is free)");
+const ADAPTER: Opt = opt(
+    "adapter",
+    "[<name>=]<dir>[,<dir>...]",
+    "",
+    "a PEFT LoRA, applied unmerged. Several comma-separated dirs compose into one: their deltas add, each with its own \
+     scale, combined rank <= 64. serve with <name>= answers \"model\": <name> with it and --name without it; without \
+     <name>= every request gets it. The default: none",
+);
+const CTX: Opt = opt("ctx", "<tokens>", "4096", "context of each slot");
+const SLOTS: Opt = opt("slots", "<n>", "1", "sequences held at once");
+/// What every check on a loaded engine takes
+const GPU: &[Opt] = &[MODEL, BF16, BACKEND, CACHE_MEM];
+/// ... and those that load it with an adapter and a context of their choosing
+const LOAD: &[Opt] = &[MODEL, BF16, BACKEND, CACHE_MEM, ADAPTER, CTX, SLOTS];
+const LORA: &[Opt] = &[
+    MODEL,
+    opt("rank", "<r>", "16", "LoRA rank"),
+    opt("alpha", "<a>", "32", "LoRA alpha: the update is scaled by alpha / rank"),
+    opt("dropout", "<p>", "0.05", "dropout on the LoRA input; preference training: 0 unless given"),
+    opt("precision", "f16|bf16|f32", "f16", "what the big products accumulate in; f32: the check build"),
+];
+const PACKED: Opt = switch("packed", "every sequence in one micro-batch; without it, one sequence per micro-batch");
+const fn limit(measure: &'static str) -> Opt {
+    opt("limit", "<x>", "", measure)
+}
+
+static APP: App = App {
+    name: "qwenny",
+    about: "qwenny: serve Qwen models and fine-tune them with LoRA",
+    notes: "qwenny help <command> (or qwenny <command> --help): its arguments, options and defaults.\nOptions are \
+            --key=value or --key value. --model, a directory or a Hugging Face id, is downloaded once.",
+    checks: "checks: tools/checks.sh runs them against their references (tools/make_*.py make those). Each ends in \
+             one summary line and exits non-zero when it fails. qwenny help <check>: its arguments and options.",
+    commands: &[
+        Command {
+            name: "serve",
+            group: Group::Main,
+            summary: "OpenAI-compatible API and chat page, on http://localhost:18023/",
+            about: "The API: /v1/chat/completions, /v1/models, and /v1/decisions (an answer chosen among options; \
+                    --decisions names tasks for it). The page talks to the base model or, with --adapter=<name>=<dir>, \
+                    to either.",
+            args: &[],
+            opts: &[
+                &[MODEL, BF16, BACKEND, CACHE_MEM, ADAPTER],
+                &[
+                    opt("host", "<address>", "0.0.0.0", "the address to listen on"),
+                    opt("port", "<port>", "18023", "the port to listen on"),
+                    opt("name", "<name>", "qwenny", "the model's name (\"model\" in requests and /v1/models)"),
+                    opt(
+                        "ctx",
+                        "<tokens>",
+                        "",
+                        "a session's context at most (default: the model's native context, or what one session can \
+                         hold on the GPU if less)",
+                    ),
+                    opt("slots", "<n>", "16", "sessions at most; they share GPU and host memory by what they hold"),
+                    opt(
+                        "drafts",
+                        "<n>",
+                        "",
+                        "speculative drafts per step, 0: off (default: the draft layer's own, 7 for n-gram chains)",
+                    ),
+                    opt(
+                        "decisions",
+                        "<presets.json>[,<more.json>]",
+                        "",
+                        "named decision tasks for /v1/decisions and the Decide tab; without it, none",
+                    ),
+                    opt("db", "<file>", "", "the password and API keys (default: ~/.local/share/qwenny/qwenny.db)"),
+                    switch("stats", "log tokens per step and acceptance per draft position for each request"),
+                ],
+            ],
+            run: serve,
+        },
+        Command {
+            name: "train",
+            group: Group::Main,
+            summary: "LoRA fine-tune; rows with \"chosen\" and \"rejected\": preference training (DPO + NLL, RPO)",
+            about: "A row is {\"messages\": [{\"role\": \"user\", \"content\": ...}, {\"role\": \"assistant\", \
+                    \"content\": ...}]}, the loss on the assistant's replies; a preference row is {\"messages\": \
+                    [<prompt>], \"chosen\": {<assistant message>}, \"rejected\": {<assistant message>}}. Without \
+                    dev.jsonl, a dev set is held out of the rows (the same one every run).\nThe out dir gets adapter/ \
+                    (the lowest dev loss), dev.jsonl, train_log.jsonl and summary.json. The defaults are the tested \
+                    recipe.",
+            args: &[
+                arg("data", "a directory with train.jsonl and optionally dev.jsonl, or one .jsonl file"),
+                optional("out dir", "where the run goes (default: runs/<data>-N)"),
+            ],
+            opts: &[
+                LORA,
+                &[
+                    opt("epochs", "<n>", "3", "at most: training stops after 2 dev measurements without a new low"),
+                    opt("batch", "<rows>", "8", "rows per optimizer step"),
+                    opt("lr", "<rate>", "2e-4", "learning rate; preference training: 5e-6 unless given"),
+                    opt("max-len", "<tokens>", "4096", "tokens per row at most; longer rows are cut"),
+                    opt(
+                        "init-adapter",
+                        "<dir>",
+                        "",
+                        "a PEFT adapter to start from, with its rank and alpha; without it, a new one",
+                    ),
+                    opt("beta", "<b>", "0.1", "preference training: DPO's beta"),
+                    opt("nll", "<w>", "1.0", "preference training: the weight of the chosen reply's NLL"),
+                ],
+            ],
+            run: cuda!(train),
+        },
+        Command {
+            name: "merge",
+            group: Group::Main,
+            summary: "write the model with a LoRA merged in",
+            about: "",
+            args: &[
+                arg("adapter dir", "a PEFT LoRA (adapter_config.json and adapter_model.safetensors)"),
+                arg("out dir", "the model's directory, copied, with the adapter merged into model.safetensors"),
+            ],
+            opts: &[&[MODEL]],
+            run: |o| lora::merge(&o.model()?, o.arg_path(0), o.arg_path(1)),
+        },
+        Command {
+            name: "bench",
+            group: Group::Main,
+            summary: "decode speed with 1 and more streams, verify steps and prompt speed",
+            about: "",
+            args: &[optional("tokens", "tokens decoded per measurement (default: 256)")],
+            opts: &[
+                &[MODEL, BF16, BACKEND, CACHE_MEM, ADAPTER],
+                &[
+                    opt("pos", "<tokens>", "0", "context before decoding"),
+                    opt("ctx", "<tokens>", "", "context of each slot (default: --pos + 4096)"),
+                    opt("slots", "<n>", "1", "streams at most"),
+                ],
+            ],
+            run: |o| checks::bench(o, &o.model_str()?, o.args.first().map_or(Ok(256), |c| c.parse())?),
+        },
+        Command {
+            name: "abliterate",
+            group: Group::Main,
+            summary: "find what makes the model refuse and write a LoRA that removes it, keeping what it knows",
+            about: "The search is automatic:\n\
+                    1. Both sets are kept to what the base model refuses (harmful) and answers (harmless). One in \
+                    four prompts of each is held out (by its hash: the same ones every run); 32 + 8 per set must be \
+                    left, so give 50 or more.\n\
+                    2. Each middle layer gets its own refusal direction (the difference of the means at the last \
+                    prompt token), taken out of what the layer writes (a rank-1 LoRA on out_proj, o_proj and \
+                    down_proj). The candidates take it out whole, or without the 8 or 32 directions the harmless \
+                    prompts spread along most (their topics, so what the model knows of them stays).\n\
+                    3. The candidates answer 32 held-out harmful prompts; the two best are tried again 1.5 times \
+                    stronger; the two best of all answer every held-out prompt (with --thinking also with thinking).\n\
+                    An edit passes when at least 0.8 of its harmful answers have no refusal phrase, it answers at most \
+                    0.02 fewer harmless prompts than the base model (the base model judges what was answered, on \
+                    whole answers), and its KL on the base model's own harmless answers is at most 0.1 nats per \
+                    token. The best passing one is written to <out dir>/adapter: serve it with \
+                    --adapter=abliterated=<out dir>/adapter. When none passes it is an error, and no adapter is \
+                    written.\n\
+                    <out dir> also gets report.txt, the base model's answers (base-*.jsonl) and every candidate's \
+                    adapter and answers (candidates/). About half an hour for the 27B; longer with --thinking.",
+            args: &[
+                arg("harmful.jsonl", "prompts the model refuses and should answer: one {\"text\": ...} per line"),
+                arg("harmless.jsonl", "prompts it answers, the contrast and what the edit must not change"),
+                arg("out dir", "the adapter, the report and every answer"),
+            ],
+            opts: &[
+                &[MODEL, BF16, CACHE_MEM],
+                &[
+                    opt("alpha", "<x>", "1.0", "the edit's strength: 1 takes the direction out whole"),
+                    opt(
+                        "evaluate",
+                        "<adapter dir>",
+                        "",
+                        "measure this adapter as the finalists are, instead of searching (its answers go to evaluated/ in \
+                         the out dir); without it, the search",
+                    ),
+                    switch(
+                        "thinking",
+                        "also answer every held-out harmful prompt with thinking on, and rank the finalists by both \
+                         (long: the thoughts are generated); for a model served with thinking",
+                    ),
+                ],
+            ],
+            run: cuda!(|o| {
+                let settings = abliterate::Settings {
+                    alpha: o.get("alpha")?,
+                    int8: o.int8(),
+                    thinking: o.switch("thinking"),
+                    evaluate: o.path("evaluate"),
+                };
+                abliterate::run(&o.model()?, o.arg_path(0), o.arg_path(1), o.arg_path(2), &settings)
+            }),
+        },
+        Command {
+            name: "password",
+            group: Group::Main,
+            summary: "set the web page's password (it is also chosen on the page's first visit)",
+            about: "Asked for twice on a terminal, without echo; else read as one line of stdin. Every login ends.",
+            args: &[],
+            opts: &[&[opt("db", "<file>", "", "the password and API keys (default: ~/.local/share/qwenny/qwenny.db)")]],
+            run: password,
+        },
+        Command {
+            name: "capture",
+            group: Group::Research,
+            summary: "residual activations per prompt and layer, at the prompts' last tokens",
+            about: "The prompts are rendered as one user message without thinking, and their last --last tokens must \
+                    be the same (the chat template's). The file holds p<i> [layers, last, hidden] per prompt, \
+                    group_ids, tail_ids and n_tokens, and the groups' names in its metadata.",
+            args: &[
+                arg("prompts.jsonl", "one {\"group\": ..., \"text\": ...} per line"),
+                arg("out.safetensors", "the activations"),
+            ],
+            opts: &[
+                &[MODEL, BF16, CACHE_MEM, ADAPTER, CTX],
+                &[opt("last", "<k>", "4", "the rows per prompt: its last k tokens")],
+            ],
+            run: cuda!(|o| checks::capture(o, &o.model_str()?, o.arg(0), o.arg(1))),
+        },
+        Command {
+            name: "bake-direction",
+            group: Group::Research,
+            summary: "an abliteration adapter from a direction: it is taken out of every layer's residual writes",
+            about: "For every matrix W writing to the residual stream, a rank-1 LoRA A = rᵀW, B = -r: served, W x + \
+                    alpha B A x = (W - alpha r rᵀ W) x.",
+            args: &[
+                arg("direction.safetensors", "the direction: a vector \"r\" of the model's hidden size"),
+                arg("out adapter dir", "the PEFT adapter"),
+            ],
+            opts: &[&[MODEL, opt("alpha", "<x>", "1.0", "the strength: 1 takes the direction out whole")]],
+            run: |o| lora::bake_direction(&o.model()?, o.arg_path(0), o.arg_path(1), o.get("alpha")?),
+        },
+        Command {
+            name: "check",
+            group: Group::Check,
+            summary: "logits vs. Transformers' or vLLM's",
+            about: "",
+            args: &[
+                arg(
+                    "reference.safetensors",
+                    "from tools/make_reference.py (Transformers' logits) or tools/make_reference_vllm.py (vLLM's \
+                     top-k log-probabilities)",
+                ),
+                optional("chunk", "prompt tokens per step (default: 1)"),
+            ],
+            opts: &[
+                LOAD,
+                &[
+                    opt(
+                        "write",
+                        "<file>",
+                        "",
+                        "write this engine's logits there as a reference instead; without it, the comparison",
+                    ),
+                    limit("required without --write: the check fails when the mean |diff| is not below it"),
+                ],
+            ],
+            run: |o| checks::check(o, &o.model_str()?, o.arg(0), o.args.get(1).map_or(Ok(1), |c| c.parse())?),
+        },
+        Command {
+            name: "layercheck",
+            group: Group::Check,
+            summary: "one layer's mixer vs. the reference",
+            about: "",
+            args: &[arg("reference.safetensors", "from tools/make_reference.py")],
+            opts: &[
+                &[MODEL, BF16],
+                &[
+                    opt("layer", "<n>", "0", "the layer; Qwen: 0 is DeltaNet, 3 attention"),
+                    limit("required: the check fails when the largest |diff| is not below it"),
+                ],
+            ],
+            run: cuda!(|o| checks::layercheck(o, &o.model_str()?, o.arg(0), o.get("layer")?)),
+        },
+        Command {
+            name: "mtpcheck",
+            group: Group::Check,
+            summary: "the draft layer (MTP) vs. tools/make_reference_mtp.py (reported only)",
+            about: "",
+            args: &[arg("reference.safetensors", "from tools/make_reference_mtp.py")],
+            opts: &[GPU],
+            run: |o| checks::mtpcheck(o, &o.model_str()?, o.arg(0)),
+        },
+        Command {
+            name: "adaptercheck",
+            group: Group::Check,
+            summary: "a LoRA and the base model in the same steps vs. each alone and vs. the reference",
+            about: "",
+            args: &[arg("reference.safetensors", "from tools/make_reference_lora.py")],
+            opts: &[
+                GPU,
+                &[
+                    opt("adapter", "<dir>", "", "required: the reference's adapter"),
+                    limit("required: the check fails when the mean |diff| is not below it"),
+                ],
+            ],
+            run: |o| checks::adaptercheck(o, &o.model_str()?, o.arg(0)),
+        },
+        Command {
+            name: "tokcheck",
+            group: Group::Check,
+            summary: "prompt tokens vs. the reference",
+            about: "",
+            args: &[
+                arg("reference.safetensors", "from tools/make_reference.py"),
+                arg("dev.jsonl", "the rows the reference tokenized"),
+            ],
+            opts: &[&[MODEL]],
+            run: |o| checks::tokcheck(&o.model_str()?, o.arg(0), o.arg(1)),
+        },
+        Command {
+            name: "chatcheck",
+            group: Group::Check,
+            summary: "chat template and tokenizer vs. Transformers",
+            about: "",
+            args: &[arg("tokref.json", "from tools/make_tokref.py")],
+            opts: &[&[MODEL]],
+            run: |o| {
+                ensure!(o.arg_path(0).is_file(), "{} is not a file; make one with tools/make_tokref.py", o.arg(0));
+                ensure!(chat::Chat::load(&o.model()?)?.check(o.arg_path(0))?, "the prompts differ from Transformers'");
+                Ok(())
+            },
+        },
+        Command {
+            name: "samplecheck",
+            group: Group::Check,
+            summary: "the GPU sampler vs. the host reference",
+            about: "",
+            args: &[],
+            opts: &[GPU],
+            run: |o| checks::samplecheck(o, &o.model_str()?),
+        },
+        Command {
+            name: "speccheck",
+            group: Group::Check,
+            summary: "steps with drafts vs. one token per step",
+            about: "",
+            args: &[],
+            opts: &[GPU],
+            run: |o| checks::speccheck(o, &o.model_str()?),
+        },
+        Command {
+            name: "longcheck",
+            group: Group::Check,
+            summary: "long context: decode steps vs. prompt chunks",
+            about: "",
+            args: &[],
+            opts: &[GPU, &[limit("required: the check fails when the largest |diff| is not below it")]],
+            run: |o| checks::longcheck(o, &o.model_str()?),
+        },
+        Command {
+            name: "cachecheck",
+            group: Group::Check,
+            summary: "slots saved and loaded continue identically",
+            about: "",
+            args: &[],
+            opts: &[GPU],
+            run: |o| checks::cachecheck(o, &o.model_str()?),
+        },
+        Command {
+            name: "swapcheck",
+            group: Group::Check,
+            summary: "slots swapped to host memory and back continue identically",
+            about: "",
+            args: &[],
+            opts: &[GPU, &[opt("len", "<tokens>", "131072", "the swapped sessions' length")]],
+            run: |o| checks::swapcheck(o, &o.model_str()?),
+        },
+        Command {
+            name: "traincheck",
+            group: Group::Check,
+            summary: "loss, per-token NLL, LoRA gradients and one AdamW step vs. PEFT",
+            about: "",
+            args: &[arg("grads reference", "from tools/make_train_reference.py grads")],
+            opts: &[LORA, &[PACKED]],
+            run: cuda!(|o| training::traincheck(&o.model()?, o.arg_path(0), o.lora()?, o.switch("packed"))),
+        },
+        Command {
+            name: "datacheck",
+            group: Group::Check,
+            summary: "token ids and loss masks vs. Unsloth's",
+            about: "",
+            args: &[
+                arg("data dir", "the training data the reference was made from"),
+                arg("data reference", "from tools/make_train_reference.py data"),
+            ],
+            opts: &[&[MODEL]],
+            run: cuda!(|o| training::datacheck(&o.model()?, o.arg_path(0), o.arg_path(1))),
+        },
+        Command {
+            name: "dpocheck",
+            group: Group::Check,
+            summary: "preference training: RPO loss, log-probabilities and gradients vs. PyTorch + PEFT",
+            about: "",
+            args: &[arg("dpo reference", "from tools/make_dpo_reference.py")],
+            opts: &[LORA, &[PACKED]],
+            run: cuda!(|o| preference::dpocheck(&o.model()?, o.arg_path(0), o.lora()?, o.switch("packed"))),
+        },
+    ],
+};
+
 impl Opts {
+    /// --model: a directory or a Hugging Face id, downloaded once
+    fn model(&self) -> Result<PathBuf> {
+        hub::resolve(&self.get::<String>("model")?)
+    }
+
+    fn model_str(&self) -> Result<String> {
+        Ok(self.model()?.to_str().context("the model's path is not UTF-8")?.to_string())
+    }
+
+    fn int8(&self) -> bool {
+        !self.switch("bf16")
+    }
+
     /// The model with --ctx, --slots and --adapter (every slot with the adapter)
     fn load(&self, dir: &str) -> Result<Box<dyn Engine>> {
         let adapter = self.adapter()?;
-        let slots = self.get("slots", 1)?;
-        let mut m =
-            engine::load(Path::new(dir), self.get("ctx", 4096)?, slots, self.int8, adapter.as_ref().map(|a| &a.1))?;
+        let slots = self.get("slots")?;
+        let mut m = engine::load(Path::new(dir), self.get("ctx")?, slots, self.int8(), adapter.as_ref().map(|a| &a.1))?;
         if adapter.is_some() {
             for s in 0..slots as u32 {
                 m.set_adapter(s, true)?;
@@ -123,47 +482,24 @@ impl Opts {
 
     /// The model with a given context and slots and --adapter loaded (the slots on the base model until set_adapter)
     fn load_at(&self, dir: &str, ctx: usize, slots: usize) -> Result<Box<dyn Engine>> {
-        engine::load(Path::new(dir), ctx, slots, self.int8, self.adapter()?.as_ref().map(|a| &a.1))
+        engine::load(Path::new(dir), ctx, slots, self.int8(), self.adapter()?.as_ref().map(|a| &a.1))
     }
 
-    fn has(&self, key: &str) -> bool {
-        self.values.iter().any(|(k, _)| k == key)
-    }
-
-    fn path(&self, key: &str) -> Option<std::path::PathBuf> {
-        self.values.iter().find(|(k, _)| k == key).map(|(_, v)| v.into())
-    }
-
-    fn switch(&self, name: &str) -> bool {
-        self.switches.iter().any(|s| s == name)
-    }
-
-    /// --adapter=[<name>=]<dir>[,<dir>...]: a LoRA (served unmerged). Several comma-separated dirs COMPOSE (stack)
-    /// into one adapter (lora::Adapter::compose). WITHOUT <name>= the adapter(s) are applied to the one served model
-    /// (the --name default) with no separate pristine base; WITH <name>= the base is served under --name and the
-    /// adapted model additionally under <name>, both selectable. Returns the explicit name (None: applied to the
-    /// default model) and the adapter. Repeating --adapter for several DISTINCT served adapters is not supported yet.
+    /// --adapter=[<name>=]<dir>[,<dir>...]: the name it is served under (None: applied to the one served model) and
+    /// the adapter, its dirs composed (lora::Adapter::compose)
     fn adapter(&self) -> Result<Option<(Option<String>, lora::Adapter)>> {
-        let vals: Vec<&str> = self.values.iter().filter(|(k, _)| k == "adapter").map(|(_, v)| v.as_str()).collect();
-        let v = match vals.as_slice() {
-            [] => return Ok(None),
-            [v] => *v,
-            _ => bail!(
-                "serving several distinct named adapters at once is not supported yet; compose several into \
-                        one with --adapter=<name>=<dir1>,<dir2>,..."
-            ),
-        };
-        // [<name>=]<dir>[,<dir>...]: a leading <name>= only when it is not itself a path or a comma-list
+        let Some(v) = self.given("adapter") else { return Ok(None) };
+        // a leading <name>= only when it is not itself a path or a comma-list
         let (name, rest) = match v.split_once('=') {
             Some((n, d)) if !n.is_empty() && !n.contains('/') && !n.contains(',') && !Path::new(v).exists() => {
                 (Some(n.to_string()), d)
             }
             _ => (None, v),
         };
-        let dirs: Vec<std::path::PathBuf> = rest
+        let dirs: Vec<PathBuf> = rest
             .split(',')
             .filter(|s| !s.is_empty())
-            .map(|d| std::fs::canonicalize(tilde(d)).with_context(|| format!("--adapter: {d}")))
+            .map(|d| std::fs::canonicalize(cli::tilde(d)).with_context(|| format!("--adapter: {d}")))
             .collect::<Result<_>>()?;
         ensure!(!dirs.is_empty(), "--adapter: no directory given");
         Ok(Some((name, lora::Adapter::compose_dirs(&dirs)?)))
@@ -171,178 +507,31 @@ impl Opts {
 
     #[cfg(has_cuda)]
     fn lora(&self) -> Result<training::Opts> {
+        let precision: String = self.get("precision")?;
         Ok(training::Opts {
-            rank: self.get("rank", 16)?,
-            alpha: self.get("alpha", 32.0)?,
-            dropout: self.get("dropout", 0.05)?,
+            rank: self.get("rank")?,
+            alpha: self.get("alpha")?,
+            dropout: self.get("dropout")?,
             micro_tokens: 4096,
-            f32: self.precision == "f32",
-            f16: self.precision == "f16",
+            f32: precision == "f32",
+            f16: precision == "f16",
             layers: 0,
         })
     }
-
-    #[cfg(has_cuda)]
-    fn train_opts(&self) -> Result<training::TrainOpts> {
-        Ok(training::TrainOpts {
-            epochs: self.get("epochs", 3)?,
-            batch: self.get("batch", 8)?,
-            lr: self.get("lr", 2e-4)?,
-            max_len: self.get("max-len", 4096)?,
-            init: self.path("init-adapter"),
-        })
-    }
-
-    fn get<T: std::str::FromStr>(&self, key: &str, default: T) -> Result<T> {
-        Ok(self.opt(key)?.unwrap_or(default))
-    }
-
-    /// The value of --key, None when it is not given
-    fn opt<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>> {
-        match self.values.iter().find(|(k, _)| k == key) {
-            Some((_, v)) => v.parse().map(Some).map_err(|_| anyhow::anyhow!("bad value for --{key}: {v}")),
-            None => Ok(None),
-        }
-    }
-
-    /// --limit=<x>: the pass criterion of a check, which fails when its measure is not below it; the checks' limits
-    /// live in tools/checks.sh
-    fn limit(&self) -> Result<f32> {
-        self.opt("limit")?.context("--limit=<number> is required: the check fails when its measure is not below it")
-    }
 }
-
-/// `~/x` as `$HOME/x` (the shell leaves a ~ alone after `=`)
-fn tilde(p: &str) -> String {
-    match (p.strip_prefix("~/"), env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
-        _ => p.to_string(),
-    }
-}
-
-/// Options that take no value; every other `--key` takes one (`--key=value` or `--key value`).
-const SWITCHES: [&str; 4] = ["bf16", "packed", "stats", "thinking"];
-
-/// Options, switches and positional arguments (after the command) of every command, checked before anything runs.
-/// Every command takes --model (a directory or a Hugging Face id; default Qwen/Qwen3.5-4B).
-fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::RangeInclusive<usize>)> {
-    const GPU: [&str; 2] = ["model", "cache-mem"];
-    const LOAD: [&str; 5] = ["model", "cache-mem", "adapter", "ctx", "slots"];
-    let (bf16, with) = (vec!["bf16"], |base: &[&'static str], more: &[&'static str]| [base, more].concat());
-    let lora = ["model", "rank", "alpha", "dropout", "precision"];
-    Some(match cmd {
-        "serve" => (with(&LOAD, &["host", "port", "name", "drafts", "decisions", "db"]), vec!["bf16", "stats"], 0..=0),
-        "password" => (vec!["db"], vec![], 0..=0),
-        "train" => (with(&lora, &["epochs", "batch", "lr", "max-len", "init-adapter", "beta", "nll"]), vec![], 1..=2),
-        "merge" => (vec!["model"], vec![], 2..=2),
-        "bench" => (with(&LOAD, &["pos"]), bf16, 0..=1),
-        "check" => (with(&LOAD, &["write", "limit"]), bf16, 1..=2),
-        "layercheck" => (vec!["model", "layer", "limit"], bf16, 1..=1),
-        "capture" => (with(&LOAD, &["last"]), bf16, 2..=2),
-        "bake-direction" => (vec!["model", "alpha"], vec![], 2..=2),
-        "abliterate" => (vec!["model", "cache-mem", "alpha", "evaluate"], vec!["bf16", "thinking"], 3..=3),
-        "mtpcheck" => (with(&GPU, &[]), bf16, 1..=1),
-        "adaptercheck" => (with(&GPU, &["adapter", "limit"]), bf16, 1..=1),
-        "tokcheck" | "datacheck" => (vec!["model"], vec![], 2..=2),
-        "chatcheck" => (vec!["model"], vec![], 1..=1),
-        "speccheck" | "samplecheck" | "cachecheck" => (with(&GPU, &[]), bf16, 0..=0),
-        "longcheck" => (with(&GPU, &["limit"]), bf16, 0..=0),
-        "swapcheck" => (with(&GPU, &["len"]), bf16, 0..=0),
-        "traincheck" | "dpocheck" => (lora.to_vec(), vec!["packed"], 1..=1),
-        _ => return None,
-    })
-}
-
-/// " (did you mean --x?)" for the closest name within two edits, else ""
-fn did_you_mean<'a>(k: &str, names: impl Iterator<Item = &'a &'static str>) -> String {
-    let dist = |a: &str, b: &str| {
-        let b: Vec<char> = b.chars().collect();
-        let mut row: Vec<usize> = (0..=b.len()).collect();
-        for (i, ca) in a.chars().enumerate() {
-            let mut prev = row[0];
-            row[0] = i + 1;
-            for j in 0..b.len() {
-                let cur = row[j + 1];
-                row[j + 1] = (prev + (ca != b[j]) as usize).min(row[j] + 1).min(cur + 1);
-                prev = cur;
-            }
-        }
-        row[b.len()]
-    };
-    names
-        .map(|n| (dist(k, n), n))
-        .filter(|(d, _)| *d <= 2)
-        .min()
-        .map_or(String::new(), |(_, n)| format!(" (did you mean --{n}?)"))
-}
-
-const SEE_HELP: &str = "qwenny --help lists the commands and options";
 
 fn main() -> Result<()> {
-    let all: Vec<String> = env::args().skip(1).collect();
-    if all.is_empty() || all.iter().any(|a| a == "--help" || a == "-h") || all[0] == "help" {
-        // not println!: `qwenny --help | head` must not panic on the closed pipe
-        use std::io::Write;
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            if all.get(1).is_some_and(|a| a == "checks") { HELP_CHECKS } else { HELP }
-        );
-        return Ok(());
-    }
-    let (mut args, mut flags, mut values) = (Vec::new(), Vec::new(), Vec::new());
-    let mut it = all.iter();
-    while let Some(a) = it.next() {
-        let Some(f) = a.strip_prefix("--") else {
-            args.push(a);
-            continue;
-        };
-        match f.split_once('=') {
-            Some((k, v)) => values.push((k.to_string(), tilde(v))),
-            None if SWITCHES.contains(&f) => flags.push(a),
-            None => match it.clone().next() {
-                Some(v) if !v.starts_with("--") => values.push((f.to_string(), it.next().unwrap().clone())),
-                _ => flags.push(a),
-            },
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let o = match cli::parse(&APP, &argv)? {
+        cli::Parsed::Help(text) => {
+            // not println!: `qwenny --help | head` must not panic on the closed pipe
+            use std::io::Write;
+            let _ = writeln!(std::io::stdout(), "{text}");
+            return Ok(());
         }
-    }
-    let Some(cmd) = args.first().map(|s| s.as_str()) else { bail!("no command given: {SEE_HELP}") };
-    let Some((mut keys, switches, positional)) = strict(cmd) else { bail!("no command {cmd}: {SEE_HELP}") };
-    keys.push("backend");
-    for (k, _) in &values {
-        ensure!(
-            keys.contains(&k.as_str()),
-            "{cmd} has no option --{k}{}",
-            did_you_mean(k, keys.iter().chain(switches.iter()))
-        );
-    }
-    for f in &flags {
-        ensure!(!keys.contains(&&f[2..]), "{f} needs a value: {f}=<value>");
-        ensure!(
-            switches.contains(&&f[2..]),
-            "{cmd} has no option {f}{}",
-            did_you_mean(&f[2..], keys.iter().chain(switches.iter()))
-        );
-    }
-    let a: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
-    ensure!(a.len() >= *positional.start(), "{cmd}: missing arguments ({SEE_HELP})");
-    if let Some(dir) = a.iter().find(|x| Path::new(x).join("config.json").exists()) {
-        ensure!(a.len() <= *positional.end(), "{cmd}: {dir} is a model: give it as --model={dir}");
-    }
-    ensure!(a.len() <= *positional.end(), "{cmd}: unexpected arguments {:?} ({SEE_HELP})", &a[*positional.end()..]);
-    if cmd == "train" {
-        ensure!(Path::new(a[0]).exists(), "{}: no such file or directory", a[0]);
-    }
-    let mut opts = Opts {
-        int8: !flags.iter().any(|f| *f == "--bf16"),
-        precision: String::new(),
-        values,
-        switches: flags.iter().map(|f| f[2..].to_string()).collect(),
+        cli::Parsed::Run(o) => o,
     };
-    opts.precision = opts.get("precision", "f16".to_string())?;
-    ensure!(["f16", "bf16", "f32"].contains(&opts.precision.as_str()), "--precision is f16, bf16 or f32");
-    SPEC_STATS.store(opts.switch("stats"), std::sync::atomic::Ordering::Relaxed);
-    if let Some(gib) = opts.opt::<f64>("cache-mem")? {
+    if let Some(gib) = o.opt::<f64>("cache-mem")? {
         ensure!(gib > 0.0, "--cache-mem=<GiB of device memory>, e.g. 4");
         #[cfg(has_cuda)]
         CACHE_MEM_GIB.set(gib).ok();
@@ -351,135 +540,93 @@ fn main() -> Result<()> {
     #[cfg(has_mlx)]
     // SAFETY: startup, before any thread
     unsafe {
-        env::set_var("MLX_ENABLE_TF32", "0")
+        std::env::set_var("MLX_ENABLE_TF32", "0")
     };
-    // Do not call engine::backend() eagerly as opts.get's default: that initializes the OnceLock before set_backend.
-    let selected = match opts.values.iter().find(|(k, _)| k == "backend") {
-        Some((_, b)) => b.clone(),
-        None => engine::backend().name().to_string(),
-    };
-    engine::set_backend(engine::Backend::parse(&selected)?);
-    if cmd == "password" {
-        return password(&opts);
+    if let Some(b) = o.given("backend") {
+        engine::set_backend(engine::Backend::parse(b)?);
     }
-    // the model: a directory or a Hugging Face id, downloaded once
-    let model = hub::resolve(&opts.get("model", hub::DEFAULT_MODEL.to_string())?)?;
-    let (m, p) = (model.to_str().context("model path is not UTF-8")?, |i: usize| Path::new(a[i]));
-    match cmd {
-        "serve" => {
-            let (adapter, name) = match opts.adapter()? {
-                Some((n, a)) => (Some(a), n),
-                None => (None, None),
-            };
-            let base = opts.get("name", "qwenny".to_string())?;
-            ensure!(
-                name.as_ref().is_none_or(|n| *n != base),
-                "the adapter's name is the base model's (--name): give it \
-                     another with --adapter=<name>=<dir>"
-            );
-            // no explicit name= : apply the adapter to the one served model (no separate pristine base)
-            let adapter_use = match name {
-                Some(n) => server::AdapterUse::Named(n),
-                None if adapter.is_some() => server::AdapterUse::Always,
-                None => server::AdapterUse::None,
-            };
-            let chat = chat::Chat::load(&model)?;
-            // no --ctx: the model's native context, lowered to what one session can hold on the device (server.rs)
-            let native = native_ctx(&model).unwrap_or(32768);
-            let (ctx, slots, int8) = (opts.get("ctx", native)?, opts.get("slots", 16)?, opts.int8);
-            // several files, comma-separated: their presets one after the other
-            let presets = opts
-                .get("decisions", String::new())?
-                .split(',')
-                .filter(|f| !f.is_empty())
-                .map(|f| {
-                    Ok(serde_json::from_str::<Vec<serde_json::Value>>(
-                        &std::fs::read_to_string(f).with_context(|| f.to_string())?,
-                    )?)
-                })
-                .collect::<Result<Vec<_>>>()?
-                .concat();
-            let so = server::ServeOpts {
-                host: opts.get("host", "0.0.0.0".to_string())?,
-                port: opts.get("port", 18023)?,
-                name: base,
-                adapter: adapter_use,
-                drafts: opts.opt("drafts")?,
-                sessions: opts.opt("slots")?,
-                presets: serde_json::Value::Array(presets),
-                db: opts.path("db").unwrap_or_else(auth::default_path),
-                fit_ctx: !opts.has("ctx"),
-            };
-            server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
+    (o.cmd.run)(&o)
+}
+
+fn serve(o: &Opts) -> Result<()> {
+    SPEC_STATS.store(o.switch("stats"), std::sync::atomic::Ordering::Relaxed);
+    let model = o.model()?;
+    let (adapter, name) = match o.adapter()? {
+        Some((n, a)) => (Some(a), n),
+        None => (None, None),
+    };
+    let base: String = o.get("name")?;
+    ensure!(
+        name.as_ref().is_none_or(|n| *n != base),
+        "the adapter's name is the base model's (--name): give it another with --adapter=<name>=<dir>"
+    );
+    // no explicit name= : apply the adapter to the one served model (no separate pristine base)
+    let adapter_use = match name {
+        Some(n) => server::AdapterUse::Named(n),
+        None if adapter.is_some() => server::AdapterUse::Always,
+        None => server::AdapterUse::None,
+    };
+    let chat = chat::Chat::load(&model)?;
+    // no --ctx: the model's native context, lowered to what one session can hold on the device (server.rs)
+    let ctx = o.opt("ctx")?.unwrap_or(native_ctx(&model).unwrap_or(32768));
+    let (slots, int8) = (o.get("slots")?, o.int8());
+    // several files, comma-separated: their presets one after the other
+    let presets = o
+        .given("decisions")
+        .unwrap_or("")
+        .split(',')
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            Ok(serde_json::from_str::<Vec<serde_json::Value>>(
+                &std::fs::read_to_string(f).with_context(|| f.to_string())?,
+            )?)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .concat();
+    let so = server::ServeOpts {
+        host: o.get("host")?,
+        port: o.get("port")?,
+        name: base,
+        adapter: adapter_use,
+        drafts: o.opt("drafts")?,
+        sessions: o.opt("slots")?,
+        presets: serde_json::Value::Array(presets),
+        db: o.path("db").unwrap_or_else(auth::default_path),
+        fit_ctx: !o.has("ctx"),
+    };
+    server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
+}
+
+#[cfg(has_cuda)]
+fn train(o: &Opts) -> Result<()> {
+    let data = o.arg_path(0);
+    ensure!(data.exists(), "{}: no such file or directory", data.display());
+    let mut lo = o.lora()?;
+    let mut to = training::TrainOpts {
+        epochs: o.get("epochs")?,
+        batch: o.get("batch")?,
+        lr: o.get("lr")?,
+        max_len: o.get("max-len")?,
+        init: o.path("init-adapter"),
+    };
+    let (model, out) = (o.model()?, o.args.get(1).map(Path::new));
+    if preference::is_preference(data)? {
+        // preference defaults: dropout off (TRL's DPOConfig.disable_dropout: the implicit reward compares the
+        // policy with the reference, both without dropout), lr 5e-6 (alignment-handbook's QLoRA DPO recipe)
+        if !o.has("dropout") {
+            lo.dropout = 0.0;
         }
-        #[cfg(has_cuda)]
-        "train" => {
-            let (mut lo, mut to) = (opts.lora()?, opts.train_opts()?);
-            if preference::is_preference(p(0))? {
-                // preference defaults: dropout off (TRL's DPOConfig.disable_dropout: the implicit reward compares the
-                // policy with the reference, both without dropout), lr 5e-6 (alignment-handbook's QLoRA DPO recipe)
-                if !opts.has("dropout") {
-                    lo.dropout = 0.0;
-                }
-                if !opts.has("lr") {
-                    to.lr = 5e-6;
-                }
-                let po = preference::PrefOpts { beta: opts.get("beta", 0.1)?, nll: opts.get("nll", 1.0)? };
-                preference::train(&model, p(0), a.get(1).map(Path::new), lo, to, po)
-            } else {
-                ensure!(
-                    !opts.has("beta") && !opts.has("nll"),
-                    "--beta and --nll are options of \
-                         preference training (rows with \"chosen\" and \"rejected\")"
-                );
-                training::train(&model, p(0), a.get(1).map(Path::new), lo, to)
-            }
+        if !o.has("lr") {
+            to.lr = 5e-6;
         }
-        "merge" => lora::merge(&model, p(0), p(1)),
-        "bench" => checks::bench(&opts, m, a.first().map_or(Ok(256), |c| c.parse())?),
-        "check" => checks::check(&opts, m, a[0], a.get(1).map_or(Ok(1), |c| c.parse())?),
-        #[cfg(has_cuda)]
-        "layercheck" => checks::layercheck(&opts, m, a[0], opts.get("layer", 0)?),
-        #[cfg(has_cuda)]
-        "capture" => checks::capture(&opts, m, a[0], a[1]),
-        "bake-direction" => lora::bake_direction(&model, p(0), p(1), opts.get("alpha", 1.0f32)?),
-        #[cfg(has_cuda)]
-        "abliterate" => {
-            let settings = abliterate::Settings {
-                alpha: opts.get("alpha", 1.0f32)?,
-                int8: opts.int8,
-                thinking: opts.switch("thinking"),
-                evaluate: opts.path("evaluate"),
-            };
-            abliterate::run(&model, p(0), p(1), p(2), &settings)
-        }
-        "mtpcheck" => checks::mtpcheck(&opts, m, a[0]),
-        "adaptercheck" => checks::adaptercheck(&opts, m, a[0]),
-        "tokcheck" => checks::tokcheck(m, a[0], a[1]),
-        "chatcheck" => {
-            ensure!(Path::new(a[0]).is_file(), "chatcheck: {} is not a file; make one with tools/make_tokref.py", a[0]);
-            ensure!(
-                chat::Chat::load(&model)?.check(Path::new(a[0]))?,
-                "chatcheck: the prompts differ from Transformers'"
-            );
-            Ok(())
-        }
-        "samplecheck" => checks::samplecheck(&opts, m),
-        "speccheck" => checks::speccheck(&opts, m),
-        "longcheck" => checks::longcheck(&opts, m),
-        "cachecheck" => checks::cachecheck(&opts, m),
-        "swapcheck" => checks::swapcheck(&opts, m),
-        #[cfg(has_cuda)]
-        "traincheck" => training::traincheck(&model, p(0), opts.lora()?, opts.switch("packed")),
-        #[cfg(has_cuda)]
-        "datacheck" => training::datacheck(&model, p(0), p(1)),
-        #[cfg(has_cuda)]
-        "dpocheck" => preference::dpocheck(&model, p(0), opts.lora()?, opts.switch("packed")),
-        #[cfg(not(has_cuda))]
-        "train" | "traincheck" | "datacheck" | "dpocheck" | "layercheck" | "capture" => {
-            bail!("{cmd}: CUDA backend only so far")
-        }
-        _ => unreachable!("{cmd}: in `strict`, not here"),
+        let po = preference::PrefOpts { beta: o.get("beta")?, nll: o.get("nll")? };
+        preference::train(&model, data, out, lo, to, po)
+    } else {
+        ensure!(
+            !o.has("beta") && !o.has("nll"),
+            "--beta and --nll are options of preference training (rows with \"chosen\" and \"rejected\")"
+        );
+        training::train(&model, data, out, lo, to)
     }
 }
 
