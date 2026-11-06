@@ -21,11 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # no build cache: a cached MLX build would skip making mlx.metallib, which ships beside the binary
       - name: Metal toolchain
         run: xcrun -f metal || xcodebuild -downloadComponent MetalToolchain
       - name: Build
         run: cargo build --release --no-default-features
+      # the unit tests, the Metal kernels' among them, on the runner's GPU
+      - name: Tests
+        run: cargo test --release --no-default-features
       - name: Package
         run: |
           name=qwenny-macos-arm64
@@ -35,10 +38,20 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256")
           echo "NAME=$name" >> "$GITHUB_ENV"
-      # the Metal kernels' tests, where the runner's virtual GPU allows them
-      - name: Tests (Metal)
-        continue-on-error: true
-        run: cargo test --release --no-default-features
+      # as on a user's Mac: the build's metallib path gone, mlx.metallib only beside the binary (the test binary, whose
+      # Metal kernel tests load it)
+      - name: Metallib beside the binary
+        run: |
+          exe=$(cargo test --release --no-default-features --no-run --message-format=json \
+                | jq -r 'select(.profile.test == true and .target.kind == ["bin"]) | .executable')
+          mkdir colocated
+          cp "$exe" colocated/qwenny-tests
+          mv "$MLX_RS_METAL_PATH" "$MLX_RS_METAL_PATH.gone"
+          # no metallib anywhere: the Metal tests must fail, else this check proves nothing
+          if colocated/qwenny-tests mlx::metal > /dev/null 2>&1; then echo "the tests ran without a metallib"; exit 1; fi
+          cp "dist/$NAME/mlx.metallib" colocated/
+          colocated/qwenny-tests mlx::
+          mv "$MLX_RS_METAL_PATH.gone" "$MLX_RS_METAL_PATH"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
