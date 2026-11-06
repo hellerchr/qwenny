@@ -61,7 +61,19 @@ n-gram chains on deterministic requests.
 
 ## MLX on Apple Silicon
 
-Build without CUDA's default feature on macOS:
+A ready build for Apple Silicon (macOS 14 or later) is on the releases page; MLX is its default backend:
+
+```bash
+curl -L https://github.com/hellerchr/qwenny/releases/latest/download/qwenny-macos-arm64.tar.gz | tar xz
+qwenny-macos-arm64/qwenny serve --model=Qwen/Qwen3.5-4B --ctx=8192 --slots=1
+```
+
+Keep `mlx.metallib` beside `qwenny` (MLX loads it from the binary's folder). The binary is not notarized: downloaded
+with `curl` it runs as is; downloaded with a browser, macOS blocks it until
+`xattr -dr com.apple.quarantine qwenny-macos-arm64`. A tag `v*` builds and publishes it
+(`.github/workflows/macos.yml`; a manual run of the workflow keeps it as the run's artifact).
+
+Or build it on macOS, without CUDA's default feature:
 
 ```bash
 cargo build --release --no-default-features
