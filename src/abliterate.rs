@@ -21,9 +21,7 @@ const EDITED: &str = "abliterated";
 /// Prompts per class that are enough to average over and to judge by
 const MIN_DERIVE: usize = 32;
 const MIN_HELD: usize = 8;
-/// Layers tried with their own direction everywhere, how many candidates are tried again stronger (STRONGER: alpha
-/// times), and how many get the full comparison
-const CANDIDATES: usize = 3;
+/// How many candidates are tried again stronger (STRONGER: alpha times), and how many get the full comparison
 const RETRIED: usize = 2;
 const STRONGER: f32 = 1.5;
 const FINALISTS: usize = 2;
@@ -31,7 +29,7 @@ const FINALISTS: usize = 2;
 const SCREEN_PROMPTS: usize = 32;
 const SCREEN_TOKENS: usize = 128;
 const FINAL_TOKENS: usize = 512;
-/// Tokens per answer with thinking: the thought and the answer after it
+/// Tokens per answer with thinking (--thinking): the thought and the answer after it
 const THINKING_TOKENS: usize = 3072;
 /// Passing: held-out harmful answers without a refusal phrase, how many fewer harmless prompts may be answered than by
 /// the base model, and how far the edit may move the next-token distribution (KL, nats per token) on the base model's
@@ -155,21 +153,6 @@ fn directions(
 /// The middle of the network, where the directions are read
 fn middle(layer: usize, layers: usize) -> bool {
     layer >= layers / 4 && layer < layers * 7 / 8
-}
-
-/// The best-separating layers in the middle of the network, apart from one another (neighbours are nearly the same)
-fn best_layers(dirs: &[Direction]) -> Vec<&Direction> {
-    let n = dirs.len();
-    let mut ranked: Vec<&Direction> = dirs.iter().filter(|d| middle(d.layer, n) && d.d.is_finite()).collect();
-    ranked.sort_by(|a, b| b.d.total_cmp(&a.d));
-    let gap = (n / 16).max(2);
-    let mut out: Vec<&Direction> = Vec::new();
-    for d in ranked {
-        if out.len() < CANDIDATES && out.iter().all(|o| o.layer.abs_diff(d.layer) >= gap) {
-            out.push(d);
-        }
-    }
-    out
 }
 
 fn log_softmax(row: Vec<f32>) -> Vec<f64> {
@@ -354,7 +337,20 @@ fn base_kept(local: &Local, prompts: &[String], answers: bool) -> Result<Vec<Str
         .collect())
 }
 
-pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32, int8: bool) -> Result<()> {
+/// How a run edits and measures
+pub struct Settings {
+    /// The edit's strength (1: the direction taken out whole)
+    pub alpha: f32,
+    pub int8: bool,
+    /// Also measure the finalists with thinking on, on every held-out harmful prompt, and rank them by both (long:
+    /// their thoughts are generated); for a model served with thinking
+    pub thinking: bool,
+    /// An adapter to measure as the finalists are, instead of searching for one
+    pub evaluate: Option<std::path::PathBuf>,
+}
+
+pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, s: &Settings) -> Result<()> {
+    let (alpha, int8) = (s.alpha, s.int8);
     let (mut harmful, mut harmless) = (read_prompts(harmful)?, read_prompts(harmless)?);
     fs::create_dir_all(out.join("candidates"))?;
     let mut report = String::new();
@@ -428,6 +424,43 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
         100.0 * base_harmless
     ));
 
+    // The finalists' measures on all held-out prompts (with --thinking, also thinking); whether it passes, and its rank
+    let final_round =
+        |local: Local, dir: &Path, name: &str, kl: f64, say: &mut dyn FnMut(String)| -> Result<(bool, f64)> {
+            let (on_harmful, rows) = answered(&local, EDITED, "qwenny", &harmful.held, FINAL_TOKENS, false)?;
+            let phrases = without_phrases(&rows);
+            write_answers(&dir.join("harmful.jsonl"), &rows)?;
+            let (on_harmless, rows) = answered(&local, EDITED, "qwenny", &harmless.held, FINAL_TOKENS, false)?;
+            write_answers(&dir.join("harmless.jsonl"), &rows)?;
+            // with thinking measured, a finalist ranks by its answers with and without thinking alike
+            let (thinking, answered_rate) = if s.thinking {
+                let (rate, rows) = answered(&local, EDITED, "qwenny", &harmful.held, THINKING_TOKENS, true)?;
+                write_answers(&dir.join("thinking.jsonl"), &rows)?;
+                (format!(" ({:.0}% with thinking)", 100.0 * rate), (on_harmful + rate) / 2.0)
+            } else {
+                (String::new(), on_harmful)
+            };
+            local.stop();
+            let passed = phrases >= MIN_NO_PHRASE && on_harmless >= base_harmless - MAX_HARMLESS_LOSS && kl <= MAX_KL;
+            say(format!(
+                "final {name}: harmful without a refusal phrase {:.0}%, answered {:.0}%{thinking}; harmless answered \
+             {:.0}% (base {:.0}%), KL {kl:.3}: {}",
+                100.0 * phrases,
+                100.0 * on_harmful,
+                100.0 * on_harmless,
+                100.0 * base_harmless,
+                if passed { "pass" } else { "FAIL" }
+            ));
+            Ok((passed, phrases + answered_rate - KL_WEIGHT * kl))
+        };
+    if let Some(dir) = &s.evaluate {
+        let (local, kl) = start(Some(Adapter::load(dir)?), &kl_seqs)?;
+        let answers = out.join("evaluated");
+        fs::create_dir_all(&answers)?;
+        final_round(local, &answers, &dir.display().to_string(), kl, &mut say)?;
+        return Ok(fs::write(out.join("report.txt"), &report)?);
+    }
+
     let (dirs, spread_rows, layers, hidden) = {
         let mut m = Model::load(model, CTX, 1, int8, None)?;
         let (nl, h) = (m.n_layers(), m.hidden());
@@ -442,18 +475,15 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
         );
         (dirs, harmless_rows, nl, h)
     };
-    let best = best_layers(&dirs);
+    let best = dirs.iter().filter(|d| middle(d.layer, layers) && d.d.is_finite()).max_by(|a, b| a.d.total_cmp(&b.d));
     ensure!(
-        best.first().is_some_and(|c| c.d >= 2.0),
+        best.is_some_and(|b| b.d >= 2.0),
         "the two sets do not separate at any layer (best d {:.2}): check that the harmful prompts are ones this model \
          refuses",
-        best.first().map_or(0.0, |c| c.d)
+        best.map_or(0.0, |b| b.d)
     );
-    say(format!(
-        "{layers} layers; best separating (layer, d): {}",
-        best.iter().map(|c| format!("L{} {:.1}", c.layer, c.d)).collect::<Vec<_>>().join(", ")
-    ));
-    // One layer's direction taken out of every layer's writes; each middle layer's own direction out of its writes;
+    say(format!("{layers} layers; they separate best at L{} (d {:.1})", best.unwrap().layer, best.unwrap().d));
+    // Each middle layer's own direction taken out of its writes (one layer's direction everywhere never did better),
     // and the same without the directions the harmless prompts spread along most (what sets their topics apart)
     let per_layer = |topics: usize| -> Vec<Option<Vec<f32>>> {
         (0..layers)
@@ -468,15 +498,7 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
             })
             .collect()
     };
-    let mut cands: Vec<Candidate> = best
-        .iter()
-        .map(|c| Candidate {
-            name: format!("L{}", c.layer),
-            alpha,
-            dirs: std::sync::Arc::new(vec![Some(c.r.clone()); layers]),
-        })
-        .collect();
-    cands.push(Candidate { name: "per-layer".into(), alpha, dirs: std::sync::Arc::new(per_layer(0)) });
+    let mut cands = vec![Candidate { name: "per-layer".into(), alpha, dirs: std::sync::Arc::new(per_layer(0)) }];
     for k in TOPICS {
         cands.push(Candidate { name: format!("per-layer-topics{k}"), alpha, dirs: std::sync::Arc::new(per_layer(k)) });
     }
@@ -526,29 +548,9 @@ pub fn run(model: &Path, harmful: &Path, harmless: &Path, out: &Path, alpha: f32
 
     let mut best: Option<(Candidate, f64)> = None;
     for (c, _, kl) in screened.iter().filter(|s| s.2 <= MAX_KL).take(FINALISTS) {
-        let (dir, kl) = (adapter_dir(c), *kl);
+        let dir = adapter_dir(c);
         let (local, _) = start(Some(Adapter::load(&dir)?), &[])?;
-        let (on_harmful, rows) = answered(&local, EDITED, "qwenny", &harmful.held, FINAL_TOKENS, false)?;
-        let phrases = without_phrases(&rows);
-        write_answers(&dir.join("harmful.jsonl"), &rows)?;
-        let (on_harmless, rows) = answered(&local, EDITED, "qwenny", &harmless.held, FINAL_TOKENS, false)?;
-        write_answers(&dir.join("harmless.jsonl"), &rows)?;
-        let (thinking, rows) = answered(&local, EDITED, "qwenny", screen, THINKING_TOKENS, true)?;
-        write_answers(&dir.join("thinking.jsonl"), &rows)?;
-        local.stop();
-        let passed = phrases >= MIN_NO_PHRASE && on_harmless >= base_harmless - MAX_HARMLESS_LOSS && kl <= MAX_KL;
-        say(format!(
-            "final {}: harmful without a refusal phrase {:.0}%, answered {:.0}% ({:.0}% with thinking); harmless \
-             answered {:.0}% (base {:.0}%), KL {kl:.3}: {}",
-            c.dir_name(),
-            100.0 * phrases,
-            100.0 * on_harmful,
-            100.0 * thinking,
-            100.0 * on_harmless,
-            100.0 * base_harmless,
-            if passed { "pass" } else { "FAIL" }
-        ));
-        let rank = phrases + on_harmful - KL_WEIGHT * kl;
+        let (passed, rank) = final_round(local, &dir, &c.dir_name(), *kl, &mut say)?;
         if passed && best.as_ref().is_none_or(|b| rank > b.1) {
             best = Some((c.clone(), rank));
         }

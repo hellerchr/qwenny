@@ -87,7 +87,9 @@ research commands (not checks):
   qwenny capture <prompts.jsonl> <out.safetensors>   residual activations per prompt and layer (--last=K suffix rows)
   qwenny bake-direction <direction.safetensors> <out_adapter_dir>   abliteration adapter from a direction (--alpha=1.0)
   qwenny abliterate <harmful.jsonl> <harmless.jsonl> <out dir>   find the refusal direction, test each candidate layer on
-                                                held-out prompts, write the adapter that passes (--alpha=1.0)";
+                                                held-out prompts, write the adapter that passes (--alpha=1.0;
+                                                --evaluate=<adapter dir>: measure that adapter the same way;
+                                                --thinking: also measure and rank the finalists with thinking on)";
 
 /// --stats: log speculative decoding per request
 static SPEC_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -219,7 +221,7 @@ fn tilde(p: &str) -> String {
 }
 
 /// Options that take no value; every other `--key` takes one (`--key=value` or `--key value`).
-const SWITCHES: [&str; 3] = ["bf16", "packed", "stats"];
+const SWITCHES: [&str; 4] = ["bf16", "packed", "stats", "thinking"];
 
 /// Options, switches and positional arguments (after the command) of every command, checked before anything runs.
 /// Every command takes --model (a directory or a Hugging Face id; default Qwen/Qwen3.5-4B).
@@ -238,7 +240,7 @@ fn strict(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>, std::ops::
         "layercheck" => (vec!["model", "layer", "limit"], bf16, 1..=1),
         "capture" => (with(&LOAD, &["last"]), bf16, 2..=2),
         "bake-direction" => (vec!["model", "alpha"], vec![], 2..=2),
-        "abliterate" => (vec!["model", "cache-mem", "alpha"], vec!["bf16"], 3..=3),
+        "abliterate" => (vec!["model", "cache-mem", "alpha", "evaluate"], vec!["bf16", "thinking"], 3..=3),
         "mtpcheck" => (with(&GPU, &[]), bf16, 1..=1),
         "adaptercheck" => (with(&GPU, &["adapter", "limit"]), bf16, 1..=1),
         "tokcheck" | "datacheck" => (vec!["model"], vec![], 2..=2),
@@ -442,7 +444,15 @@ fn main() -> Result<()> {
         "capture" => checks::capture(&opts, m, a[0], a[1]),
         "bake-direction" => lora::bake_direction(&model, p(0), p(1), opts.get("alpha", 1.0f32)?),
         #[cfg(has_cuda)]
-        "abliterate" => abliterate::run(&model, p(0), p(1), p(2), opts.get("alpha", 1.0f32)?, opts.int8),
+        "abliterate" => {
+            let settings = abliterate::Settings {
+                alpha: opts.get("alpha", 1.0f32)?,
+                int8: opts.int8,
+                thinking: opts.switch("thinking"),
+                evaluate: opts.path("evaluate"),
+            };
+            abliterate::run(&model, p(0), p(1), p(2), &settings)
+        }
         "mtpcheck" => checks::mtpcheck(&opts, m, a[0]),
         "adaptercheck" => checks::adaptercheck(&opts, m, a[0]),
         "tokcheck" => checks::tokcheck(m, a[0], a[1]),
