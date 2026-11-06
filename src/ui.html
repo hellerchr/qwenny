@@ -101,6 +101,30 @@
   .newkey code { word-break: break-all; color: var(--fg); }
   .amsg { font-size: 13px; color: var(--muted); min-height: 1.4em; margin: 0; }
   .amsg.bad { color: var(--danger); } .amsg.good { color: var(--ok); }
+  /* the model's files: a closed section at the end of the settings */
+  #aform details.dl { border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
+  details.dl > summary { cursor: pointer; color: var(--muted); font-size: 13.5px; list-style: none; display: flex;
+                         align-items: center; gap: 8px; }
+  details.dl > summary::-webkit-details-marker { display: none; }
+  details.dl > summary svg.i { width: 14px; height: 14px; transition: transform .15s; }
+  details.dl[open] > summary svg.i { transform: rotate(90deg); }
+  details.dl > div { display: flex; flex-direction: column; gap: 12px; }
+  details.dl > summary:hover { color: var(--fg); }
+  details.dl[open] > summary { margin-bottom: 12px; }
+  .dlset { display: flex; flex-direction: column; gap: 8px; }
+  .dlset + .dlset { border-top: 1px solid var(--line); padding-top: 12px; }
+  .dlhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .dlname { font-weight: 600; font-size: 14px; word-break: break-all; color: var(--fg); text-decoration: none; }
+  a.dlname:hover { color: var(--accent); }
+  .dlhead .grow { flex: 1; }
+  a.btn { display: inline-flex; align-items: center; text-decoration: none; color: inherit; font-size: 13.5px; }
+  .dlfiles summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .dlfiles ul { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
+  .dlfiles li { display: flex; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .dlfiles li a { flex: 1; min-width: 0; color: var(--fg); font-family: var(--mono); font-size: 12.5px;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: none; }
+  .dlfiles li a:hover { color: var(--accent); }
+  .dlfiles li span { color: var(--muted); font-variant-numeric: tabular-nums; }
   @media (max-width: 640px) { .kv { grid-template-columns: 1fr auto; } .kv > span { grid-column: 1 / -1; } }
 
   /* decide */
@@ -224,6 +248,11 @@
     background: color-mix(in srgb, var(--accent) 10%, transparent); }
   #thinking svg.i { width: 14px; height: 14px; }
   main { flex: 1; overflow-y: auto; scrollbar-gutter: stable both-edges; }  /* centred like the header */
+  /* text scrolling up under the header fades out instead of being cut at the edge */
+  main::before { content: ""; position: sticky; top: 0; z-index: 1; display: block; height: 22px; margin-bottom: -22px;
+                 background: linear-gradient(var(--bg), color-mix(in srgb, var(--bg) 70%, transparent) 45%, transparent);
+                 pointer-events: none; opacity: 0; transition: opacity .15s; }
+  main.scrolled::before { opacity: 1; }
   #log { width: var(--col); margin: 0 auto; padding: 8px 0 24px; }
   .empty { color: var(--muted); text-align: center; margin-top: 18vh; font-size: 14px; }
   .msg { margin: 18px 0; }
@@ -994,8 +1023,49 @@ async function loadAdmin(fresh) {
               out);
   }
   pw.append(pmsg);
-  box.replaceChildren(connect, keys, pw);
+  box.replaceChildren(connect, keys, pw, downloads());
 }
+const bytes = (n) => { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1000 && i < 4) { n /= 1000; i++; }
+                       return (i ? n.toFixed(n < 10 ? 1 : 0) : n) + " " + u[i]; };
+// the served model's files (GET /download): each directory as one .tar, or file by file; listed when opened
+function downloads() {
+  const d = el("details", "dl"), body = el("div");
+  const sum = el("summary", null, "Download the model");
+  sum.insertAdjacentHTML("afterbegin", icon("chevron"));
+  d.append(sum, body);
+  d.ontoggle = async () => {
+    if (!d.open || body.childElementCount) return;
+    let sets;
+    try { const r = await fetch("/download"); if (!r.ok) throw new Error(await r.text() || r.statusText); sets = await r.json(); }
+    catch (e) { body.append(el("p", "amsg bad", e.message)); return; }
+    body.append(el("p", "shint", "The files this server loads, each directory as one .tar: unpacked, it is the directory as " +
+                                  "the server has it, for qwenny, Transformers or vLLM."));
+    sets.forEach((s, i) => {
+      const total = s.files.reduce((a, f) => a + f.size, 0), set = el("div", "dlset"), head = el("div", "dlhead");
+      const tar = el("a", "btn primary", `Download ${s.stem}.tar`);
+      tar.href = `/download/${i}`; tar.setAttribute("download", "");
+      // a model from Hugging Face is named by its id, linked there; else by the name it is served as
+      const name = el(s.hub ? "a" : "b", "dlname", s.hub || s.label);
+      if (s.hub) { name.href = "https://huggingface.co/" + s.hub; name.target = "_blank"; name.rel = "noopener"; name.title = "On Hugging Face"; }
+      head.append(name, el("span", "shint", `${s.files.length} files, ${bytes(total)}`), el("div", "grow"), tar);
+      set.append(head);
+      const fl = el("details", "dlfiles"), ul = el("ul");
+      fl.append(el("summary", null, "Single files"), ul);
+      for (const f of s.files) {
+        const li = el("li"), a = el("a", null, f.name);
+        a.href = `/download/${i}/${encodeURIComponent(f.name)}`; a.setAttribute("download", ""); a.title = f.name;
+        li.append(a, el("span", null, bytes(f.size)));
+        ul.append(li);
+      }
+      set.append(fl);
+      body.append(set);
+    });
+  };
+  return d;
+}
+// the fade under the header shows once its pane is scrolled
+for (const m of document.querySelectorAll("main"))
+  m.addEventListener("scroll", () => m.classList.toggle("scrolled", m.scrollTop > 0), { passive: true });
 const settings = $("settings");
 $("gear").onclick = () => { settings.showModal(); loadAdmin(); };
 $("sclose").onclick = () => settings.close();

@@ -5,6 +5,7 @@
 //! decision request (crate::decide) is prefilled like a chat request, then reads the logits at its last position.
 use crate::auth::{self, Auth};
 use crate::chat::{Chat, OutputParser, Piece, ToolCall, split_stray_think};
+use crate::download;
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{self, Params, Rng};
 use crate::sessions::{self, Held, Image, SNAP_FROM, Store};
@@ -898,6 +899,8 @@ pub struct App {
     artifacts: Mutex<VecDeque<(String, String)>>,
     /// the admin, API keys and API access mode (auth.rs)
     pub auth: Arc<Auth>,
+    /// the served model's directory and the adapter's, for the page's download (download.rs)
+    pub downloads: Vec<crate::download::Dir>,
 }
 
 /// Artifacts kept in memory (the page posts each one it opens; they are gone after a restart).
@@ -1219,6 +1222,8 @@ pub struct ServeOpts {
     pub db: std::path::PathBuf,
     /// no --ctx: the engine is loaded at the model's native context and lowered to what one session can hold
     pub fit_ctx: bool,
+    /// what the page offers for download: the model's directory, then the adapter's
+    pub downloads: Vec<crate::download::Dir>,
 }
 
 /// The value of cookie `name` in a request's headers
@@ -1446,6 +1451,7 @@ impl Local {
             presets: json!([]),
             artifacts: Mutex::default(),
             auth: Arc::new(Auth::open(&db)?),
+            downloads: vec![],
         });
         Ok(Self { app, engine, db })
     }
@@ -1506,38 +1512,56 @@ pub fn serve(
         presets: opts.presets.clone(),
         artifacts: Mutex::default(),
         auth: auth.clone(),
+        downloads: opts.downloads,
     });
     // the base model first (the page shows the first), then the adapter
     let mut names = vec![opts.name.clone()];
     if let AdapterUse::Named(a) = &opts.adapter {
         names.push(a.clone());
     }
-    let router = Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/decisions", post(crate::decide::decisions))
-        .route("/v1/decisions/presets", get(|State(app): State<Arc<App>>| async move { AxJson(app.presets.clone()) }))
-        .route(
-            "/v1/models",
-            get(move || {
-                let data: Vec<Json> =
-                    names.iter().map(|n| json!({"id": n, "object": "model", "owned_by": "qwenny"})).collect();
-                async move { AxJson(json!({"object": "list", "data": data})) }
-            }),
-        )
-        .route("/health", get(|| async { "ok" }))
-        .route("/auth/login", post(auth_login))
-        .route("/auth/logout", post(auth_logout))
-        .route("/auth/state", get(auth_state))
-        .route("/auth/setup", post(auth_setup))
-        .route("/auth/require-key", post(auth_require_key))
-        .route("/auth/keys", post(auth_new_key))
-        .route("/auth/keys/{id}", axum::routing::delete(auth_revoke))
-        .route("/auth/password", post(auth_password))
-        .route("/auth/password-remove", post(auth_password_remove))
-        .route("/", get(|| async { Html(include_str!("ui.html")) }))
-        .route("/login", get(|| async { Html(include_str!("login.html")) }))
-        .route("/v1/artifacts", post(put_artifact))
-        .route("/artifacts/{id}", get(get_artifact));
+    let router =
+        Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/decisions", post(crate::decide::decisions))
+            .route(
+                "/v1/decisions/presets",
+                get(|State(app): State<Arc<App>>| async move { AxJson(app.presets.clone()) }),
+            )
+            .route(
+                "/v1/models",
+                get(move || {
+                    let data: Vec<Json> =
+                        names.iter().map(|n| json!({"id": n, "object": "model", "owned_by": "qwenny"})).collect();
+                    async move { AxJson(json!({"object": "list", "data": data})) }
+                }),
+            )
+            .route("/health", get(|| async { "ok" }))
+            .route("/auth/login", post(auth_login))
+            .route("/auth/logout", post(auth_logout))
+            .route("/auth/state", get(auth_state))
+            .route("/auth/setup", post(auth_setup))
+            .route("/auth/require-key", post(auth_require_key))
+            .route("/auth/keys", post(auth_new_key))
+            .route("/auth/keys/{id}", axum::routing::delete(auth_revoke))
+            .route("/auth/password", post(auth_password))
+            .route("/auth/password-remove", post(auth_password_remove))
+            .route("/", get(|| async { Html(include_str!("ui.html")) }))
+            .route("/login", get(|| async { Html(include_str!("login.html")) }))
+            .route("/download", get(|State(app): State<Arc<App>>| async move { download::list(&app.downloads) }))
+            .route(
+                "/download/{i}",
+                get(|State(app): State<Arc<App>>, Path(i): Path<usize>| async move {
+                    download::get(&app.downloads, i, None)
+                }),
+            )
+            .route(
+                "/download/{i}/{file}",
+                get(|State(app): State<Arc<App>>, Path((i, f)): Path<(usize, String)>| async move {
+                    download::get(&app.downloads, i, Some(&f))
+                }),
+            )
+            .route("/v1/artifacts", post(put_artifact))
+            .route("/artifacts/{id}", get(get_artifact));
     let router = router.layer(axum::middleware::from_fn_with_state(app.clone(), gate)).with_state(app);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
@@ -1750,6 +1774,7 @@ mod tests {
             presets: json!([]),
             artifacts: Mutex::default(),
             auth: Arc::new(Auth::open(&db).unwrap()),
+            downloads: vec![],
         });
         // the scripted engine only takes the argmax: greedy, and no presence penalty (Qwen's default would sample)
         body["temperature"] = json!(0);
@@ -1803,6 +1828,7 @@ mod tests {
             presets: json!([]),
             artifacts: Mutex::default(),
             auth: Arc::new(Auth::open(&db).unwrap()),
+            downloads: vec![],
         });
         let body = json!({"messages": [{"role": "user", "content": "Count."}], "temperature": 0, "presence_penalty": 0,
                           "chat_template_kwargs": {"enable_thinking": false}});

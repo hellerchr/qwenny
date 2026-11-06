@@ -8,6 +8,7 @@ mod cli;
 #[cfg(has_cuda)]
 mod cuda;
 mod decide;
+mod download;
 mod draft_vocab;
 mod engine;
 mod hub;
@@ -488,6 +489,12 @@ impl Opts {
     /// --adapter=[<name>=]<dir>[,<dir>...]: the name it is served under (None: applied to the one served model) and
     /// the adapter, its dirs composed (lora::Adapter::compose)
     fn adapter(&self) -> Result<Option<(Option<String>, lora::Adapter)>> {
+        let Some((name, dirs)) = self.adapter_dirs()? else { return Ok(None) };
+        Ok(Some((name, lora::Adapter::compose_dirs(&dirs)?)))
+    }
+
+    /// --adapter: its name if given, and its directories
+    fn adapter_dirs(&self) -> Result<Option<(Option<String>, Vec<PathBuf>)>> {
         let Some(v) = self.given("adapter") else { return Ok(None) };
         // a leading <name>= only when it is not itself a path or a comma-list
         let (name, rest) = match v.split_once('=') {
@@ -502,7 +509,7 @@ impl Opts {
             .map(|d| std::fs::canonicalize(cli::tilde(d)).with_context(|| format!("--adapter: {d}")))
             .collect::<Result<_>>()?;
         ensure!(!dirs.is_empty(), "--adapter: no directory given");
-        Ok(Some((name, lora::Adapter::compose_dirs(&dirs)?)))
+        Ok(Some((name, dirs)))
     }
 
     #[cfg(has_cuda)]
@@ -586,13 +593,19 @@ fn serve(o: &Opts) -> Result<()> {
     let so = server::ServeOpts {
         host: o.get("host")?,
         port: o.get("port")?,
-        name: base,
+        name: base.clone(),
         adapter: adapter_use,
         drafts: o.opt("drafts")?,
         sessions: o.opt("slots")?,
         presets: serde_json::Value::Array(presets),
         db: o.path("db").unwrap_or_else(auth::default_path),
         fit_ctx: !o.has("ctx"),
+        downloads: std::iter::once(download::Dir::new(&base, &model))
+            .chain(o.adapter_dirs()?.into_iter().flat_map(|(n, dirs)| {
+                let n = n.unwrap_or_else(|| format!("{base}'s adapter"));
+                dirs.into_iter().map(move |d| download::Dir::new(&n, &d))
+            }))
+            .collect(),
     };
     server::serve(move || engine::load(&model, ctx, slots, int8, adapter.as_ref()), chat, so)
 }

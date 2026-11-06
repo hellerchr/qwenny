@@ -112,7 +112,9 @@ decisions endpoint) and Access. HTML and SVG blocks in a reply open in a sandbox
 **Access**: by default the server is open, the web page and the API alike. The page's Access tab shows the connection
 details to copy (base URL, model, API key, examples), creates and revokes API keys, can require a key for the API
 (`Authorization: Bearer <key>`), and can set a password for the page. If you forget the password, run
-`qwenny password` on the server.
+`qwenny password` on the server. At its foot, "Download the model" offers the served model's directory and the
+adapter's as one `.tar` each, or file by file (`GET /download`, `/download/<i>`, `/download/<i>/<file>`; behind the
+page's password).
 
 **Decisions**: `POST /v1/decisions` scores options instead of generating text: one prefill, then a softmax over the
 labels' tokens at the answer position.
@@ -223,6 +225,7 @@ src/main.rs, src/cli.rs         command line: the commands and their options; pa
 src/engine.rs                   the engine interface of both backends
 src/server.rs, src/sessions.rs  API server, scheduling, speculative decoding; slots and host swap
 src/auth.rs                     the page's password and the API keys (SQLite)
+src/download.rs                 the page's download of the served model's files (streamed .tar)
 src/chat.rs, src/decide.rs      chat template and tool calls; decisions
 src/sample.rs                   sampling parameters, host reference sampler
 src/checkpoint.rs, src/hub.rs   weight loading and formats; Hugging Face downloads
