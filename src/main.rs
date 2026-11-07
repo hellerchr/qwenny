@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 /// --stats: log speculative decoding per request
 static SPEC_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// --cache-mem: GiB of device memory the slots' caches take at most
-#[cfg(has_cuda)]
 static CACHE_MEM_GIB: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
 /// A command's `run` on CUDA builds; elsewhere an error, the command having no other backend yet
@@ -540,7 +539,6 @@ fn main() -> Result<()> {
     };
     if let Some(gib) = o.opt::<f64>("cache-mem")? {
         ensure!(gib > 0.0, "--cache-mem=<GiB of device memory>, e.g. 4");
-        #[cfg(has_cuda)]
         CACHE_MEM_GIB.set(gib).ok();
     }
     // MLX would run f32 matrix products in TF32 (10-bit mantissas): off, they stay f32

@@ -264,6 +264,8 @@ area() {
             samplecheck --model=$W4A16 --backend=mlx
             if RUSTFLAGS="--cfg has_metal" cargo check --features mlx --target-dir target/metal-check 2>&1 | grep -q '^error'; then
                 fail "Metal code does not type-check"; else ok "Metal code type-checks"; fi
+            # a real server: its caches' device memory (admission, the context) and replies over HTTP
+            serve --model=$W4A16 --slots=4 --ctx=32768 --backend=mlx
             backend_diff --model=Qwen/Qwen3.5-4B --bf16
             backend_diff --model=Qwen/Qwen3.5-4B
             backend_diff --model=$W4A16 ;;
@@ -287,7 +289,7 @@ areas_of() {
         kernels/*|src/cuda/*) echo qwen-infer ;;
         src/sample.rs|src/sessions.rs|src/checks.rs|src/server.rs) echo qwen-infer mlx ;;
         tools/make_reference*.py|tools/make_tokref.py|tools/tokref-*.json) echo chat qwen-infer ;;
-        tools/serve_check.py) echo qwen-infer ;;
+        tools/serve_check.py|tools/qwenny_client.py) echo qwen-infer mlx ;;
     esac
 }
 

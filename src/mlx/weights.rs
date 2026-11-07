@@ -87,11 +87,12 @@ impl Dims {
     }
 }
 
-/// x W^T for W [out][in], dense in f16 or in MLX's affine quantized layout.
+/// x W^T for W [out][in], dense in f16 or in MLX's affine quantized layout. `packed`: int4 in metal::pack_verify's
+/// layout instead (on an M5, for its tensor units; the same values, permuted).
 #[derive(Clone)]
 pub enum Linear {
     Dense(Array),
-    Quant { w: Array, scales: Array, biases: Array, group: i32, bits: i32 },
+    Quant { w: Array, scales: Array, biases: Array, group: i32, bits: i32, packed: bool },
 }
 
 impl Linear {
@@ -106,13 +107,24 @@ impl Linear {
             (rep(&q.scales), rep(&q.offsets), 128)
         };
         let (rows, groups) = (q.rows as i32, (q.cols / group) as i32);
-        Ok(Linear::Quant {
-            w: Array::from_slice(&q.q, &[rows, (q.cols * q.bits / 32) as i32]),
-            scales: Array::from_slice(&scales, &[rows, groups]).as_dtype(Dtype::Float16)?,
-            biases: Array::from_slice(&offsets, &[rows, groups]).as_dtype(Dtype::Float16)?,
-            group: group as i32,
-            bits: q.bits as i32,
-        })
+        let w = Array::from_slice(&q.q, &[rows, (q.cols * q.bits / 32) as i32]);
+        let scales = Array::from_slice(&scales, &[rows, groups]).as_dtype(Dtype::Float16)?;
+        let biases = Array::from_slice(&offsets, &[rows, groups]).as_dtype(Dtype::Float16)?;
+        // the large int4 matrices, in the one layout their verify products read (a second copy cost more end to end)
+        #[cfg(has_metal)]
+        if q.bits == 4
+            && q.rows >= 4096
+            && q.rows.is_multiple_of(128)
+            && q.cols.is_multiple_of(256)
+            && [64, 128].contains(&group)
+            && super::metal::m5()
+        {
+            let [w, scales, biases] = super::metal::pack_verify(&[w, scales, biases])?;
+            mlx_rs::transforms::eval([&w, &scales, &biases])?;
+            mlx_rs::memory::clear_cache()?;
+            return Ok(Linear::Quant { w, scales, biases, group: group as i32, bits: 4, packed: true });
+        }
+        Ok(Linear::Quant { w, scales, biases, group: group as i32, bits: q.bits as i32, packed: false })
     }
 
     pub(super) fn arrays(&self) -> Vec<&Array> {
@@ -125,6 +137,7 @@ impl Linear {
     pub fn spec(&self) -> Spec {
         match self {
             Linear::Dense(_) => Spec::Dense,
+            Linear::Quant { group, packed: true, .. } => Spec::Packed { group: *group },
             Linear::Quant { group, bits, .. } => Spec::Quant { group: *group, bits: *bits, draft: false },
         }
     }
@@ -142,29 +155,42 @@ impl Linear {
         self.spec().for_draft().apply(&self.owned(), x)
     }
 
+    /// Rows `ids`, row-major (also from a packed matrix: the draft head's rows are ordinary weights)
     fn select_rows(&self, ids: &[u32]) -> MResult<Self> {
         let idx = Array::from_slice(ids, &[ids.len() as i32]).as_dtype(Dtype::Int32)?;
         Ok(match self {
             Linear::Dense(w) => Linear::Dense(w.take_axis(&idx, 0)?),
-            Linear::Quant { w, scales, biases, group, bits } => Linear::Quant {
-                w: w.take_axis(&idx, 0)?,
-                scales: scales.take_axis(&idx, 0)?,
-                biases: biases.take_axis(&idx, 0)?,
-                group: *group,
-                bits: *bits,
-            },
+            #[cfg(has_metal)]
+            Linear::Quant { group, bits, packed: true, .. } => {
+                let [w, scales, biases] = super::metal::packed_rows(&self.owned(), ids)?;
+                Linear::Quant { w, scales, biases, group: *group, bits: *bits, packed: false }
+            }
+            Linear::Quant { w, scales, biases, group, bits, packed } => {
+                assert!(!packed, "packed weights are Metal's");
+                Linear::Quant {
+                    w: w.take_axis(&idx, 0)?,
+                    scales: scales.take_axis(&idx, 0)?,
+                    biases: biases.take_axis(&idx, 0)?,
+                    group: *group,
+                    bits: *bits,
+                    packed: false,
+                }
+            }
         })
     }
 
     fn append(&mut self, tail: &Self) -> MResult<()> {
         match (self, tail) {
             (Linear::Dense(a), Linear::Dense(b)) => *a = ops::concatenate(&[&*a, b], 0)?,
-            (Linear::Quant { w, scales, biases, .. }, Linear::Quant { w: tw, scales: ts, biases: tb, .. }) => {
+            (
+                Linear::Quant { w, scales, biases, packed: false, .. },
+                Linear::Quant { w: tw, scales: ts, biases: tb, .. },
+            ) => {
                 *w = ops::concatenate(&[&*w, tw], 0)?;
                 *scales = ops::concatenate(&[&*scales, ts], 0)?;
                 *biases = ops::concatenate(&[&*biases, tb], 0)?;
             }
-            _ => unreachable!("draft rows keep the source matrix's format"),
+            _ => unreachable!("draft rows keep the source matrix's format, row-major"),
         }
         Ok(())
     }
@@ -173,12 +199,15 @@ impl Linear {
         use mlx_rs::ops::indexing::TryIndexMutOp;
         match (self, tile) {
             (Linear::Dense(a), Linear::Dense(b)) => a.try_index_mut((at..at + 16, ..), b)?,
-            (Linear::Quant { w, scales, biases, .. }, Linear::Quant { w: tw, scales: ts, biases: tb, .. }) => {
+            (
+                Linear::Quant { w, scales, biases, packed: false, .. },
+                Linear::Quant { w: tw, scales: ts, biases: tb, .. },
+            ) => {
                 w.try_index_mut((at..at + 16, ..), tw)?;
                 scales.try_index_mut((at..at + 16, ..), ts)?;
                 biases.try_index_mut((at..at + 16, ..), tb)?;
             }
-            _ => unreachable!("draft rows keep the source matrix's format"),
+            _ => unreachable!("draft rows keep the source matrix's format, row-major"),
         }
         Ok(())
     }
@@ -194,6 +223,11 @@ pub enum Spec {
         #[cfg_attr(not(has_metal), expect(dead_code))]
         draft: bool,
     },
+    /// int4 in metal::pack_verify's layout (M5)
+    Packed {
+        #[cfg_attr(not(has_metal), expect(dead_code))]
+        group: i32,
+    },
 }
 
 impl Spec {
@@ -201,12 +235,13 @@ impl Spec {
         match self {
             Spec::Dense => self,
             Spec::Quant { group, bits, .. } => Spec::Quant { group, bits, draft: true },
+            Spec::Packed { .. } => self,
         }
     }
     fn n(self) -> usize {
         match self {
             Spec::Dense => 1,
-            Spec::Quant { .. } => 3,
+            Spec::Quant { .. } | Spec::Packed { .. } => 3,
         }
     }
 
@@ -215,6 +250,18 @@ impl Spec {
     fn apply_take<'a>(self, a: &'a [Array], x: &Array) -> MResult<(Array, &'a [Array])> {
         let y = match self {
             Spec::Dense => ops::matmul(x, ops::transpose(&a[0])?),
+            // Measured on an M5 Pro (27B, Swift 1.5): +24 % served decode over the sg8 verify products. More rows
+            // than the tensor-unit tile has (prompt chunks, batched steps) take the row-major arrays back.
+            #[cfg(has_metal)]
+            Spec::Packed { group } if (1..=8).contains(&x.shape()[0]) => super::metal::verify_nax(x, a, group),
+            #[cfg(has_metal)]
+            Spec::Packed { group } => {
+                return Spec::Quant { group, bits: 4, draft: false }
+                    .apply_take(&super::metal::unpack_verify(&a[..3])?, x)
+                    .map(|(y, _)| (y, &a[3..]));
+            }
+            #[cfg(not(has_metal))]
+            Spec::Packed { .. } => unreachable!("packed weights are Metal's"),
             // Prefill (large M): MLX's quantized_matmul is weight-bandwidth-bound and barely amortizes the int4
             // weight read across the step's tokens, so a step of 2,048 is only ~3x a single decode. Dequantize the
             // weight to f16 once and run a dense (compute-bound) matmul instead; the f16 weight is transient, read
@@ -725,6 +772,12 @@ impl Weights {
         // Short prompts vary in length: tracing each length causes seconds of cold compilation.
         // Keep decode shapes compiled, but run short prompt stages directly.
         let small = if prefill { h.shape()[0] == FULL_CHUNK } else { !prompt };
+        // Decode and verify steps on an M5: the GPU starts on every four layers while the next are built (measured
+        // on an M5 Pro; part of the packed products' gain)
+        #[cfg(has_metal)]
+        let flush = !prompt && !prefill && super::metal::m5();
+        #[cfg(not(has_metal))]
+        let flush = false;
         let mut pending = std::collections::VecDeque::<Array>::new();
         for at in self.positions() {
             if pending.len() == 2 {
@@ -734,6 +787,8 @@ impl Weights {
             if prefill {
                 m.submit(&h)?;
                 pending.push_back(h.clone());
+            } else if flush && (at.li + 1) % 4 == 0 {
+                mlx_rs::transforms::async_eval([&h])?;
             }
         }
         Ok(h)
@@ -828,6 +883,9 @@ pub fn swiglu(a: &Array, b: &Array) -> MResult<Array> {
     ops::multiply(nn::silu(a.as_dtype(Dtype::Float32)?)?, b.as_dtype(Dtype::Float32)?)?.as_dtype(Dtype::Float16)
 }
 
+/// The allocator's cache of freed buffers at most
+pub const CACHE_LIMIT: usize = if cfg!(has_metal) { 256 << 20 } else { 2 << 30 };
+
 /// Once per process, before MLX's first operation. Changing prompt shapes must not trip the graph-cache warning, and freed buffers
 /// must not accumulate without a bound.
 pub fn init() -> MResult<()> {
@@ -840,8 +898,7 @@ pub fn init() -> MResult<()> {
                 unsafe { std::env::set_var(k, v) };
             }
         }
-        let cache = if cfg!(has_metal) { 256 << 20 } else { 2 << 30 };
-        r = mlx_rs::memory::set_cache_limit(cache).map(|_| ());
+        r = mlx_rs::memory::set_cache_limit(CACHE_LIMIT).map(|_| ());
     });
     r
 }

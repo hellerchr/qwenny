@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode speed through a running server, on 8 prompts (code, prose, math, structured output, a long quote) with fixed
+"""Decode speed through a running server, on 9 prompts (code, prose, math, structured output, a long quote) with fixed
 seeds. Start a fresh server per run when comparing builds: the draft head learns as it serves.
 
 One stream (default): each prompt streamed, tokens per second from the first streamed token to the end of the reply
@@ -25,6 +25,10 @@ PROMPTS = {
     "code": "Write a complete Python implementation of a red-black tree with insert, delete and search, "
             "with docstrings.",
     "rust": "Implement an LRU cache in Rust with generics, a doubly linked list over a slab, and unit tests.",
+    "typescript": "Implement a strict TypeScript LRUCache<K, V> with a positive capacity, optional TTL, and an "
+                  "injected clock for deterministic tests. Include get, set, delete, clear and size; get refreshes "
+                  "recency, expired entries are removed, and updating a key must not evict an unrelated entry. "
+                  "Use no any types. Include a complete Vitest suite covering eviction, expiry and updates.",
     "prose": "Write a long, detailed essay about the history of the printing press and its effects on European "
              "society.",
     "story": "Write a short story about a lighthouse keeper who discovers a message in a bottle.",

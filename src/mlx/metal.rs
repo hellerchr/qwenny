@@ -1,4 +1,5 @@
-//! Metal custom operations for skinny verify products. All reductions accumulate in f32.
+//! Metal custom operations for skinny verify products, the draft head and DeltaNet; on M5 also tensor-unit verify
+//! products. All reductions accumulate in f32.
 use super::weights::MResult;
 use mlx_rs::{Array, Dtype, Stream, error::Exception};
 use mlx_sys as sys;
@@ -20,6 +21,9 @@ impl Drop for Kernel {
 }
 impl Kernel {
     fn new_named(name: &CStr, inputs: &[&CStr], outputs: &[&CStr], source: &str) -> Self {
+        Self::with_header(name, inputs, outputs, source, c"#include <metal_simdgroup_matrix>\n")
+    }
+    fn with_header(name: &CStr, inputs: &[&CStr], outputs: &[&CStr], source: &str, header: &CStr) -> Self {
         let source = CString::new(source).unwrap();
         let mut names: Vec<_> = inputs.iter().map(|n| n.as_ptr()).collect();
         let mut out: Vec<_> = outputs.iter().map(|n| n.as_ptr()).collect();
@@ -27,15 +31,8 @@ impl Kernel {
         unsafe {
             let ins = sys::mlx_vector_string_new_data(names.as_mut_ptr(), names.len());
             let outs = sys::mlx_vector_string_new_data(out.as_mut_ptr(), out.len());
-            let k = sys::mlx_fast_metal_kernel_new(
-                name.as_ptr(),
-                ins,
-                outs,
-                source.as_ptr(),
-                c"#include <metal_simdgroup_matrix>\n".as_ptr(),
-                true,
-                false,
-            );
+            let k =
+                sys::mlx_fast_metal_kernel_new(name.as_ptr(), ins, outs, source.as_ptr(), header.as_ptr(), true, false);
             sys::mlx_vector_string_free(ins);
             sys::mlx_vector_string_free(outs);
             Kernel(k)
@@ -145,6 +142,115 @@ fn verify_geometry(x: &Array, a: &[Array], sg8: bool, nt: i32, s: i32) -> MResul
             Dtype::Float32,
         )?;
         Ok(results.remove(0))
+    })
+}
+
+/// The GPU is an M5's (Metal 4 tensor units): only then are the tensor-unit kernels compiled
+pub fn m5() -> bool {
+    static M5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M5.get_or_init(|| {
+        // SAFETY: the device name is copied before the owning handles are freed.
+        unsafe {
+            let dev = sys::mlx_device_new_type(sys::mlx_device_type__MLX_GPU, 0);
+            let mut info = sys::mlx_device_info_new();
+            let mut name = std::ptr::null();
+            let ok = sys::mlx_device_info_get(&mut info, dev) == 0
+                && sys::mlx_device_info_get_string(&mut name, info, c"device_name".as_ptr()) == 0
+                && !name.is_null()
+                && CStr::from_ptr(name).to_bytes().starts_with(b"Apple M5");
+            sys::mlx_device_info_free(info);
+            sys::mlx_device_free(dev);
+            ok
+        }
+    })
+}
+
+/// The GPU's recommended working set (less than the machine's unified memory)
+pub fn recommended_memory() -> MResult<usize> {
+    // SAFETY: the size is copied out; the owning handles are freed on success and on error.
+    unsafe {
+        let dev = sys::mlx_device_new_type(sys::mlx_device_type__MLX_GPU, 0);
+        let mut info = sys::mlx_device_info_new();
+        let mut size = 0;
+        let r = check(sys::mlx_device_info_get(&mut info, dev), "device info").and_then(|_| {
+            check(
+                sys::mlx_device_info_get_size(&mut size, info, c"max_recommended_working_set_size".as_ptr()),
+                "device memory",
+            )
+        });
+        sys::mlx_device_info_free(info);
+        sys::mlx_device_free(dev);
+        r.map(|_| size)
+    }
+}
+
+/// int4 codes [N][K/8] and their scales and biases [N][K/group] in verify_nax's layout: tiles of 128 rows, in each the
+/// codes of a 64-wide block of K for all its rows together, and per group the 128 rows' scales (biases) together. A
+/// permutation: no stored value changes.
+pub fn pack_verify(a: &[Array]) -> MResult<[Array; 3]> {
+    let (n, k, groups) = (a[0].shape()[0], a[0].shape()[1] * 8, a[1].shape()[1]);
+    let affine = |v: &Array| v.reshape(&[n / 128, 128, groups])?.transpose_axes(&[0, 2, 1])?.contiguous();
+    Ok([
+        a[0].reshape(&[n / 128, 128, k / 64, 8])?.transpose_axes(&[0, 2, 1, 3])?.contiguous()?,
+        affine(&a[1])?,
+        affine(&a[2])?,
+    ])
+}
+
+/// pack_verify's inverse: the row-major arrays (for products of more rows than verify_nax takes)
+pub fn unpack_verify(a: &[Array]) -> MResult<[Array; 3]> {
+    let (tiles, blocks, groups) = (a[0].shape()[0], a[0].shape()[1], a[1].shape()[1]);
+    let affine = |v: &Array| v.transpose_axes(&[0, 2, 1])?.reshape(&[tiles * 128, groups]);
+    Ok([a[0].transpose_axes(&[0, 2, 1, 3])?.reshape(&[tiles * 128, blocks * 8])?, affine(&a[1])?, affine(&a[2])?])
+}
+
+/// Rows `ids` of a pack_verify'd matrix, row-major (the draft head's rows), without unpacking the rest
+pub fn packed_rows(a: &[Array], ids: &[u32]) -> MResult<[Array; 3]> {
+    let (blocks, groups) = (a[0].shape()[1] as u32, a[1].shape()[1] as u32);
+    let at = |count: u32| {
+        let v: Vec<u32> =
+            ids.iter().flat_map(|&id| (0..count).map(move |g| ((id / 128) * count + g) * 128 + id % 128)).collect();
+        Array::from_slice(&v, &[v.len() as i32])
+    };
+    let (codes, affine, rows) = (at(blocks), at(groups), ids.len() as i32);
+    Ok([
+        a[0].reshape(&[-1, 8])?.take_axis(&codes, 0)?.reshape(&[rows, blocks as i32 * 8])?,
+        a[1].reshape(&[-1])?.take_axis(&affine, 0)?.reshape(&[rows, groups as i32])?,
+        a[2].reshape(&[-1])?.take_axis(&affine, 0)?.reshape(&[rows, groups as i32])?,
+    ])
+}
+
+thread_local! { static NAX: RefCell<Option<Kernel>> = const { RefCell::new(None) }; }
+
+/// x W^T for 1 to 8 rows of x [M][K] f16 on an M5's tensor units, W pack_verify'd int4 with the checkpoint's affine
+/// scales and biases (groups of 64 or 128): f16 products of the codes, accumulated in f32, scaled in f32. Out f32.
+pub fn verify_nax(x: &Array, a: &[Array], group: i32) -> MResult<Array> {
+    let (m, k, n) = (x.shape()[0], x.shape()[1], a[1].shape()[0] * 128);
+    let (tiles, groups) = (n / 128, k / group);
+    // K splits so that about 512 threadgroups run, summed after; two halves of a split's groups in small matrices
+    let split = (1..=groups).rev().find(|d| groups % d == 0 && tiles * d <= 512).unwrap_or(1);
+    let parts = if tiles < 256 && (groups / split) % 2 == 0 { 2 } else { 1 };
+    NAX.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let kernel = cell.get_or_insert_with(|| {
+            Kernel::with_header(
+                c"qwenny_verify_nax",
+                &[c"X", c"W", c"SC", c"BI"],
+                &[c"OUT"],
+                include_str!("verify_nax.metal"),
+                c"#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace mpp::tensor_ops;\n",
+            )
+        });
+        let mut out = kernel.apply_many(
+            &[x.clone(), a[0].clone(), a[1].clone(), a[2].clone()],
+            &[&[split, m, n]],
+            [256 * parts * tiles, split, 1],
+            [256 * parts, 1, 1],
+            &[(c"K", k), (c"N", n), (c"GS", group), (c"KSPLIT", split), (c"PARTS", parts)],
+            Dtype::Float32,
+        )?;
+        let y = out.remove(0);
+        if split == 1 { y.reshape(&[m, n]) } else { mlx_rs::ops::sum_axis(y, 0, false) }
     })
 }
 
@@ -319,6 +425,63 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "M5 only (Metal 4 tensor units): verify_nax and the packed layout"]
+    fn verify_nax_matches_affine_reference() -> anyhow::Result<()> {
+        mlx_rs::with_device(mlx_rs::Device::gpu(), || {
+            use mlx_rs::ops;
+            super::super::weights::init()?;
+            anyhow::ensure!(m5(), "not an M5");
+            let shapes: [(usize, usize, usize, usize); 7] = [
+                (1, 128, 512, 64),
+                (2, 128, 512, 64),
+                (5, 256, 1024, 128),
+                (8, 384, 5120, 128),
+                (5, 34816, 5120, 128),
+                (5, 5120, 17408, 128),
+                (5, 248320, 5120, 128),
+            ];
+            for (m, n, k, group) in shapes {
+                let xv: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i * 17 % 101) as f32 - 50.0) / 53.0)).collect();
+                let q: Vec<u32> =
+                    (0..n * k / 8).map(|i| (i as u32).wrapping_mul(7919).wrapping_add(0x1949abcd)).collect();
+                let sc: Vec<f16> = (0..n * k / group).map(|i| f16::from_f32((i % 11 + 1) as f32 / 97.0)).collect();
+                let bi: Vec<f16> = sc.iter().map(|s| f16::from_f32(-8.0 * s.to_f32())).collect();
+                let x = Array::from_slice(&xv, &[m as i32, k as i32]);
+                let a = [
+                    Array::from_slice(&q, &[n as i32, (k / 8) as i32]),
+                    Array::from_slice(&sc, &[n as i32, (k / group) as i32]),
+                    Array::from_slice(&bi, &[n as i32, (k / group) as i32]),
+                ];
+                let packed = pack_verify(&a)?;
+                let ids = [0, 127, n as u32 - 1, 0];
+                let idx = Array::from_slice(&ids, &[4]);
+                let same = |x: &Array, y: &Array| -> anyhow::Result<bool> {
+                    let e = ops::all(ops::eq(x, y)?, None)?;
+                    e.eval()?;
+                    Ok(e.item_exact::<bool>())
+                };
+                for ((src, rows), back) in a.iter().zip(packed_rows(&packed, &ids)?).zip(unpack_verify(&packed)?) {
+                    anyhow::ensure!(same(&src.take_axis(&idx, 0)?, &rows)?, "packed rows changed stored values");
+                    anyhow::ensure!(same(src, &back)?, "the packed layout changed stored values");
+                }
+                let w = ops::dequantize(
+                    &a[0],
+                    &a[1].as_dtype(Dtype::Float32)?,
+                    Some(&a[2].as_dtype(Dtype::Float32)?),
+                    group as i32,
+                    4,
+                )?;
+                let want = ops::matmul(x.as_dtype(Dtype::Float32)?, w.transpose()?)?;
+                let err = ops::max(ops::abs(ops::subtract(&verify_nax(&x, &packed, group as i32)?, &want)?)?, None)?;
+                err.eval()?;
+                let err = err.item_exact::<f32>();
+                anyhow::ensure!(err < 2e-4, "verify_nax {m}x{n}x{k} group {group}: max error {err}");
+            }
+            Ok(())
+        })
     }
 
     #[test]

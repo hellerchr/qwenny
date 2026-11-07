@@ -83,8 +83,17 @@ target/release/qwenny serve --backend=mlx --model=<model-directory> --ctx=8192 -
 MLX caches int8 attention keys/values with f32 scales, f32 DeltaNet state, and the MTP's own KV. The adaptive
 vocabulary uses the existing int4 output weights and saves ids/scores under `~/.cache/qwenny/draft-heads/` (or
 `$XDG_CACHE_HOME/qwenny/draft-heads/`). It grows on demand from the checkpoint's list to at most 65,536 rows.
-Cross-request saved sessions/prefix reuse, adapters and training are not implemented on MLX yet. `--ctx` limits
-context but KV allocation grows on demand; long-context performance must be measured separately.
+Cross-request saved sessions/prefix reuse, adapters and training are not implemented on MLX yet. The KV cache grows
+on demand; the slots share the device memory left after loading (the GPU's recommended working set, less 2 GiB of
+workspace) by what they hold, counting their KV, DeltaNet state and attention temporaries over the whole prefix.
+Without `--ctx` the context is the longest one session fits in it (on a 48 GiB M5 Pro, the 27B's full 262,144);
+a request starts when its prompt fits next to the running ones. Long-context speed must be measured separately.
+
+On an M5 the large int4 matrices are kept in a tile layout for the GPU's tensor units (`src/mlx/verify_nax.metal`; the
+checkpoint's codes and scales, permuted, with f32 accumulation): decode and verify steps of up to 8 rows read them
+there, and the GPU starts on every four layers while the next are built. Swift 1.5 (27B) on an M5 Pro, 16 GPU cores:
+31.1 tok/s served (`tools/decode_bench.py`, eight prompts, 512 tokens, sampled with thinking), against 25.1 with the
+older Metal products. Other Macs keep those (their geometry was measured on an M2 Pro).
 
 ## Server
 
@@ -96,7 +105,8 @@ context, or the longest one session can hold on the GPU if that is less), `--slo
 `--adapter=[<name>=]<dir>` (a LoRA served beside the base model under `<name>`; default the directory's name, or its
 parent's for `qwenny train`'s `runs/<data>-N/adapter`).
 `--cache-mem=<GiB>` (serve, bench and the checks) caps the device memory of the slots' caches; by default they take
-what is free after loading, less 512 MiB for CUDA graphs and the driver (a GPU shared with other work: set it).
+what is free after loading, less 512 MiB for CUDA graphs and the driver (MLX: see above; a GPU shared with other work:
+set it).
 
 **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`. Request fields: `model`,
 `messages`,
@@ -257,12 +267,14 @@ scripts/lint.sh                 cargo fmt --check and clippy with warnings as er
 ## Acknowledgements
 
 The int4 kernels are based on [Marlin](https://github.com/IST-DASLab/marlin) (IST Austria, Apache License 2.0),
-extended with zero points and an argmax epilogue. Swift 1.5's int4 checkpoint and draft vocabulary were prepared with
+extended with zero points and an argmax epilogue. The M5 tensor-unit products (`src/mlx/verify_nax.metal`) are adapted
+from [oMLX](https://github.com/jundot/omlx)'s packed linear layers (Apache License 2.0). Swift 1.5's int4 checkpoint and draft vocabulary were prepared with
 [HyperQwen](https://github.com/syv-ai/HyperQwen).
 
 ## License
 
-No license has been chosen yet. `kernels/marlin.cuh` keeps Marlin's Apache 2.0 notice.
+No license has been chosen yet. `kernels/marlin.cuh` keeps Marlin's Apache 2.0 notice, `src/mlx/verify_nax.metal`
+oMLX's.
 
 ## Linting
 

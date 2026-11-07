@@ -9,6 +9,7 @@
 //! restart replays the accepted tokens from the checkpoint (delta::token, the same operations as the step's own).
 #[cfg(not(has_metal))]
 use super::delta::{self, CH, pad_rows, repeat};
+use super::memory::{Budget, WORKSPACE_RESERVE};
 use super::weights::{self as w, CONV_K, Fused, HD, LK_HEADS, LKD, LVD, Layer, MResult, NKV, ROT, THETA, Weights};
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{kept_dist, sample_row, sample_row_q};
@@ -109,6 +110,8 @@ pub struct Model {
     w: Weights,
     slots: usize,
     max_ctx: usize,
+    /// device memory for the slots' caches
+    budget: Budget,
     /// per slot, per attention layer
     kv: Vec<Vec<Kv>>,
     cap: Vec<usize>,
@@ -148,8 +151,18 @@ impl Model {
         ensure!(max_ctx > 0 && slots > 0, "context and slots must be positive");
         w::init()?;
         let w = Weights::load(dir, int8)?;
-        let (_, n_delta) = w.counts();
+        let (n_attn, n_delta) = w.counts();
         let d = w.d;
+        // what the device has left for the caches after the weights, the step's workspace and the allocator's cache
+        let limit = mlx_rs::memory::memory_limit()?;
+        #[cfg(has_metal)]
+        let limit = limit.min(super::metal::recommended_memory()?);
+        let resident = mlx_rs::memory::active_memory()?;
+        let room = limit.saturating_sub(resident + WORKSPACE_RESERVE + w::CACHE_LIMIT);
+        let room = crate::CACHE_MEM_GIB.get().map_or(room, |&gib| room.min((gib * 1073741824.0) as usize));
+        let budget = Budget::new(d, n_attn + usize::from(w.mtp.is_some()), n_delta, KEEP, room);
+        let gib = |b: usize| b as f64 / 1073741824.0;
+        eprintln!("MLX: weights {:.1} GiB, {:.1} GiB for the slots' caches", gib(resident), gib(room));
         let zero_state = ops::zeros::<f32>(&[d.lv_heads, LVD, LKD])?;
         let zero_hist = ops::zeros::<f32>(&[CONV_K - 1, d.conv_width()])?;
         let delta =
@@ -159,6 +172,7 @@ impl Model {
             w,
             slots,
             max_ctx,
+            budget,
             kv: (0..slots).map(|_| Vec::new()).collect(),
             cap: vec![0; slots],
             delta,
@@ -196,6 +210,13 @@ impl Model {
         let cap = end.next_multiple_of(KV_CHUNK).min(self.max_ctx);
         ensure!(end <= cap, "position {end} beyond the context of {}", self.max_ctx);
         let more = cap - self.cap[slot];
+        let grow = self.budget.slot_bytes(cap) - self.budget.slot_bytes(self.cap[slot]);
+        ensure!(
+            grow <= self.cache_room().unwrap_or(0),
+            "slot {slot} at {end} tokens: the cache is full ({:.1} GiB of device memory for the caches; --cache-mem, \
+             --ctx or --slots)",
+            self.budget.room as f64 / 1073741824.0
+        );
         let q = || ops::zeros::<i8>(&[NKV, more as i32, HD]);
         let s = || ops::zeros::<f32>(&[NKV, more as i32, 1]);
         if self.cap[slot] == 0 {
@@ -605,6 +626,15 @@ impl Engine for Model {
     }
     fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+    fn cache_room(&self) -> Option<usize> {
+        Some(self.budget.room.saturating_sub(self.cap.iter().map(|&c| self.budget.slot_bytes(c)).sum()))
+    }
+    fn slot_bytes(&self, len: usize) -> usize {
+        self.budget.slot_bytes(len)
+    }
+    fn limit_ctx(&mut self, ctx: usize) {
+        self.max_ctx = self.max_ctx.min(ctx.max(64));
     }
     fn max_tok(&self) -> usize {
         MAX_TOK

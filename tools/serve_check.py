@@ -162,6 +162,7 @@ def main():
     p.add_argument("--slots", type=int, default=4)
     p.add_argument("--ctx", type=int, default=32768)
     p.add_argument("--bf16", action="store_true")
+    p.add_argument("--backend", help="cuda or mlx (default: the binary's)")
     a = p.parse_args()
 
     cases = [thinking_answers, thinking_off_answers, low_effort_answers, stream_matches, seed_repeats, length_limit,
@@ -169,7 +170,8 @@ def main():
              too_long_is_refused]
     failed = 0
     try:
-        with server(a.bin, a.model, f"--slots={a.slots}", f"--ctx={a.ctx}", *(["--bf16"] if a.bf16 else [])) as c:
+        flags = (["--bf16"] if a.bf16 else []) + ([f"--backend={a.backend}"] if a.backend else [])
+        with server(a.bin, a.model, f"--slots={a.slots}", f"--ctx={a.ctx}", *flags) as c:
             c.get("/")  # the web page
             model = json.loads(c.get("/v1/models"))["data"][0]["id"]
             print(f"OK    server up, model {model!r}", flush=True)

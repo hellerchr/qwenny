@@ -9,7 +9,7 @@ use crate::download;
 use crate::engine::{DraftSampling, Engine, Tok};
 use crate::sample::{self, Params, Rng};
 use crate::sessions::{self, Held, Image, SNAP_FROM, Store};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Json as AxJson, Router,
     extract::{Path, State},
@@ -1405,6 +1405,23 @@ fn start_engine(
             if fit_ctx && m.cache_room().is_some() {
                 let c = sessions::fitting_ctx(&*m, m.max_ctx());
                 m.limit_ctx(c);
+            }
+            // Store::new checks the same for the engines that save slots
+            if let Some(room) = m.cache_room().filter(|_| !m.can_save()) {
+                let (gib, ctx) = (|b: usize| b as f64 / 1073741824.0, m.max_ctx());
+                ensure!(
+                    m.slot_bytes(ctx) <= room,
+                    "a session of {ctx} tokens does not fit: {:.1} GiB in a slot, the device has {:.1} GiB for the \
+                     caches: --ctx={} at most (or leave --ctx out)",
+                    gib(m.slot_bytes(ctx)),
+                    gib(room),
+                    sessions::fitting_ctx(&*m, ctx)
+                );
+                eprintln!(
+                    "cache: up to {} sessions sharing {:.1} GiB of device memory; one session up to {ctx} tokens",
+                    m.slots(),
+                    gib(room)
+                );
             }
             let capacity = m.draft_capacity().min(m.spec_tok().saturating_sub(1)).min(m.max_out().saturating_sub(1));
             let mtp = mtp_depth(m.has_draft(), m.draft_tokens(), capacity, drafts);
